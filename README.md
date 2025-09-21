@@ -66,10 +66,13 @@ If you have downloaded and processed all the data, the file structure would be l
 TODO: add an image
 
 
-## 2. Run training
+## 2. Start Pre-training
 You can use `python train.py -h` to see the help message. To pretrain on the above three datasets, run:
-```
+```bash
 CUDA_VISIBLE_DEVICES=x python train.py --config pretrain -s EXPERIMENT_NAME
 ```
-
-
+To pretrain on all the datasets mentioned in paper, run:
+```bash
+CUDA_VISIBLE_DEVICES=x python train.py --config pretrain_extra -s EXPERIMENT_NAME
+```
+This will save the log to `./logs/E2VLA/EXPERIMENT_NAME` and save the checkpoints to `./checkpoints/E2VLA/EXPERIMENT_NAME`.
