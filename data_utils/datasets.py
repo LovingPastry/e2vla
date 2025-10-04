@@ -24,11 +24,11 @@ from data_utils.dataset_base import DataConfig, H5DatasetMapBase
 # valid_ee_mask:        (nee,)
 
 # NOTE:
-# To means number of image observations
-# ncam means number of cameras
-# nee means number of end-effectors
-# nhist means number of historical actions (including current, therefore nhist always >= 1)
-# Ta means number of feature actions
+# To -> number of image observations
+# ncam -> number of cameras
+# nee -> number of end-effectors
+# nhist -> number of historical actions (including current, therefore nhist always >= 1)
+# Ta -> number of future actions
 
 
 class Libero(H5DatasetMapBase):
@@ -194,10 +194,10 @@ class Droid(H5DatasetMapBase):
         try:
             out = super().__getitem__(i)
         except Exception as e:
-            # This occasionally fails, I don't know why
+            # This occasionally fails when reading video files, I don't know why
             print("[INFO] Error when getitem {}".format(i))
             traceback.print_exc()
-            print("[INFO] Retry loading another index")
+            print("[INFO] Retry another index")
             out = super().__getitem__((i+1)%len(self))
             
         out = self.adjust_ee_pose(out)

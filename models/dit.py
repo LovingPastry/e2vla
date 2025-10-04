@@ -29,7 +29,7 @@ class DiTBlock(nn.Module):
         )
         self.ffn = FFN(
             hdim, 
-            hidden_dim=4*hdim, 
+            hidden_dim=2*hdim, 
             use_adaln=use_adaln
         )
     

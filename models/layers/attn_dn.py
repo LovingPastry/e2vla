@@ -169,7 +169,8 @@ class SelfAttentionLayer(CrossAttentionLayer):
 
 class FFWCrossAttentionLayers(nn.Module):
     def __init__(self, embed_dim, num_heads, num_layers, dropout=0.0, use_adaln=False,
-                 proj_opt=ProjOpt.Q_KV, bias=False, qk_norm=False, pe_type="rope"):
+                 proj_opt=ProjOpt.Q_KV, bias=False, qk_norm=False, pe_type="rope",
+                 ffn_expansion: int = 4):
         super().__init__()
         self.num_layers = num_layers
         self.attn_layers = nn.ModuleList()
@@ -191,7 +192,7 @@ class FFWCrossAttentionLayers(nn.Module):
             self.ffn_layers.append(
                 FFN(
                     embed_dim=embed_dim, 
-                    hidden_dim=4*embed_dim, 
+                    hidden_dim=embed_dim*ffn_expansion, 
                     dropout=dropout, 
                     use_adaln=use_adaln
                 )
@@ -235,7 +236,8 @@ class FFWCrossAttentionLayers(nn.Module):
 
 class FFWSelfAttentionLayers(nn.Module):
     def __init__(self, embed_dim, num_heads, num_layers, dropout=0, use_adaln=False, 
-                 proj_opt=ProjOpt.QKV, bias=False, qk_norm=False, pe_type="rope"):
+                 proj_opt=ProjOpt.QKV, bias=False, qk_norm=False, pe_type="rope",
+                 ffn_expansion: int = 4):
         super().__init__()
         self.num_layers = num_layers
         self.attn_layers = nn.ModuleList()
@@ -257,7 +259,7 @@ class FFWSelfAttentionLayers(nn.Module):
             self.ffn_layers.append(
                 FFN(
                     embed_dim=embed_dim, 
-                    hidden_dim=4*embed_dim, 
+                    hidden_dim=embed_dim*ffn_expansion, 
                     dropout=dropout, 
                     use_adaln=use_adaln
                 )

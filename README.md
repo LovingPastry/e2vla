@@ -65,6 +65,12 @@ Codes under refactoring
 If you have downloaded and processed all the data, the file structure would be like this: 
 TODO: add an image
 
+## (1.5) Data Visualization
+Visualize the processed data is recommended before training. Run:
+```bash
+python datavis.py {DATASET_NAME}
+```
+to visualize the specified dataset. Run `python datavis.py -l` to list all the available datasets.
 
 ## 2. Start Pre-training
 You can use `python train.py -h` to see the help message. To pretrain on the above three datasets, run:
@@ -76,3 +82,7 @@ To pretrain on all the datasets mentioned in paper, run:
 CUDA_VISIBLE_DEVICES=x python train.py --config pretrain_extra -s EXPERIMENT_NAME
 ```
 This will save the log to `./logs/E2VLA/EXPERIMENT_NAME` and save the checkpoints to `./checkpoints/E2VLA/EXPERIMENT_NAME`.
+
+# Fine-tune and Evaluation on LIBERO
+## 1. Dataset Preparation
+First download the [LIBERO dataset](https://huggingface.co/datasets/yifengzhu-hf/LIBERO-datasets) to anywhere and then make a symbolink to 

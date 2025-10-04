@@ -184,6 +184,7 @@ def main(args):
     )
     setup_log_level("WARNING")
     
+    controller.set_config("Libero")
     runtime_config = controller.get_config()
     # runtime_config["camera_names"] = runtime_config["camera_names"][::-1]
     # controller.set_config(runtime_config)
@@ -239,7 +240,8 @@ def main(args):
             sample_state_gaps = runtime_config["sample_state_gaps"]
 
             a_idx = 0
-            controller.set_ensemble_nums(4)
+            controller.set_ensemble_nums(args.ensemble)
+            # controller.set_ensemble_nums(4)
             # controller.set_ensemble_nums(0)  # disables ensemble
             controller.set_prompt(prompt_text)
             controller.add_obs_frame(obs_libero2ours(obs, time=a_idx, env=env))
@@ -265,7 +267,8 @@ def main(args):
                 else:
                     query_data = {"ee_pose": future_ee_poses, "gripper": future_grippers}
 
-                for s_id in range(3):
+                # for s_id in range(3):
+                for s_id in range(args.substep):
                     action = action_ours2libero(
                         future_ee_poses=query_data["ee_pose"][s_id],
                         future_grippers=query_data["gripper"][s_id],
@@ -346,6 +349,8 @@ if __name__ == "__main__":
     parser.add_argument("--ns_host", type=str, default="localhost")
     parser.add_argument("--ns_port", type=int, default=9090)
     #####
+    parser.add_argument("--substep", type=int, default=3)
+    parser.add_argument("--ensemble", type=int, default=4)
     parser.add_argument("--save", action="store_true", default=False)
     parser.add_argument("--video", action="store_true", default=False)
     args = parser.parse_args()

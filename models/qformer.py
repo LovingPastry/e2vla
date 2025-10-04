@@ -10,8 +10,8 @@ class QBlockITM(nn.Module):
         super().__init__()
         self.self_attn_text = SelfAttentionLayer(hdim, num_heads, bias=True, qk_norm=True)
         self.cross_attn_vision = CrossAttentionLayer(hdim, num_heads, bias=True, qk_norm=True)
-        self.ffn_query = FFN(hdim, 4*hdim)
-        self.ffn_text = FFN(hdim, 4*hdim)
+        self.ffn_query = FFN(hdim, 2*hdim)
+        self.ffn_text = FFN(hdim, 2*hdim)
     
     def forward(
         self, 

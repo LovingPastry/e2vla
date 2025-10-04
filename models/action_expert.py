@@ -28,7 +28,8 @@ class ContextEncoder(nn.Module):
         self.proj_pe = simple_mlp([2, hdim, hdim], ln=True)  # for normalized coordinates
 
         self.main_cam_embed = nn.Parameter(torch.zeros(hdim))
-        self.pre_attn = DiT(hdim, num_heads, num_layers//2, use_adaln=False, pe_type="prope")
+        self.pre_attn = DiT(hdim, num_heads, num_layers//2, use_adaln=False, 
+                            pe_type="prope")  # actually, it is not a DiT but self-cross attention module
         self.qformer = QFormerITM(hdim, num_heads, num_layers=1, num_queries=64)
         self.post_attn = FFWSelfAttentionLayers(hdim, num_heads, num_layers//2, use_adaln=False,
                                                 bias=True, qk_norm=True)

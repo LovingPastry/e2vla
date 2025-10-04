@@ -177,6 +177,7 @@ def count_parameters():
     # model = vla_tiny()
     # model = vla_small()
     model = vla_base()
+    print(model)
 
     modules = [
         model
