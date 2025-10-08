@@ -24,7 +24,7 @@ Codes under refactoring
     ```bash
     pip install "lerobot==0.1.0"
     ```
-  * The initial downloads of video files may be incomplete (test at 2025/04). We need to download the full video files and place them at `VIDEO_DOWNLOAD_PATH`. TODO: upload scripts to fix this.
+  * The initial downloads of video files may be incomplete (test at 2025/04). We need to download the full video files and place them at `VIDEO_DOWNLOAD_PATH`. **TODO:** upload scripts to fix this.
   
 * Maniskill
   
@@ -83,6 +83,53 @@ CUDA_VISIBLE_DEVICES=x python train.py --config pretrain_extra -s EXPERIMENT_NAM
 ```
 This will save the log to `./logs/E2VLA/EXPERIMENT_NAME` and save the checkpoints to `./checkpoints/E2VLA/EXPERIMENT_NAME`.
 
+**TODO:** upload self collected datasets.
+
 # Fine-tune and Evaluation on LIBERO
 ## 1. Dataset Preparation
-First download the [LIBERO dataset](https://huggingface.co/datasets/yifengzhu-hf/LIBERO-datasets) to anywhere and then make a symbolink to 
+First download the [LIBERO dataset](https://huggingface.co/datasets/yifengzhu-hf/LIBERO-datasets) to anywhere and then make a symbolink to `./data_raw/libero`. Then run 
+```bash
+conda activate libero
+python data_prepare/process_libero.py \
+  --libero_task_suite libero_spatial \
+  --libero_raw_data_dir ./data_raw/libero \
+  --libero_target_dir ./data_converted/libero \
+  --skip_saved \
+  --visualize
+```
+Change the libero_spatial to [libero_object, libero_goal, libero_10] for finetuning and evaluation on other task-suites.
+
+## 2. Fine-tuning
+For example, if we wnat to fine-tune on libero-10 from pretrained models:
+```bash
+CUDA_VISIBLE_DEVICES=x python train.py \
+  --config finetune_libero_10 \
+  --pretrained_ckpt ./checkpoints/E2VLA/PRETRAIN_EXP_NAME/ckpt_xxxxxxx.pt \
+  -s FINETUNE_EXPERIMENT_NAME
+```
+This will load the config and the pre-trained weights. The fine-tuned weights are saved to `./checkpoints/E2VLA/FINETUNE_EXPERIMENT_NAME/`. We save the weights every 10k iterations by default.
+
+## 3. Evaluation
+* First we need to launch the pyro4 naming server (something like roscore). Open a separate terminal and run:
+  ```bash
+  pyro4-ns
+  ```
+  By default the naming server runs on `localhost:9090`.
+
+* Launch planning service of your fine-tuned model:
+  ```bash
+  CUDA_VISIBLE_DEVICES=x python -m infer_utils.remote_service \
+    --ckpt ./checkpoints/E2VLA/FINETUNE_EXPERIMENT_NAME/ckpt_xxxxxxx.pt \
+    --uri CUSTOM_URI_NAME
+  ```
+
+* Start evaluation in simulation:
+  ```bash
+  python -m examples.libero.eval \
+    --task_suite libero_10 \
+    --uri CUSTOM_URI_NAME \
+    --save --video
+  ```
+
+# Fine-tune on Own Data
+

@@ -350,7 +350,7 @@ if __name__ == "__main__":
     parser.add_argument("--ns_port", type=int, default=9090)
     #####
     parser.add_argument("--substep", type=int, default=3)
-    parser.add_argument("--ensemble", type=int, default=4)
+    parser.add_argument("--ensemble", type=int, default=3)
     parser.add_argument("--save", action="store_true", default=False)
     parser.add_argument("--video", action="store_true", default=False)
     args = parser.parse_args()
