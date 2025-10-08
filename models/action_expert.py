@@ -19,11 +19,11 @@ class ContextEncoder(nn.Module):
     def __init__(self, hdim: int, num_heads: int, num_layers: int):
         super().__init__()
         self.proj_v = nn.ModuleList([
-            simple_mlp([768, hdim*4, hdim], ln=True),  # for dinov2 vision embeds
-            simple_mlp([768, hdim*4, hdim], ln=True),  # for siglip vision embeds
+            simple_mlp([768, hdim, hdim], ln=True),  # for dinov2 vision embeds
+            simple_mlp([768, hdim, hdim], ln=True),  # for siglip vision embeds
         ])
         self.proj_l = nn.ModuleList([
-            simple_mlp([768, hdim*4, hdim], ln=True)  # for siglip language embeds
+            simple_mlp([768, hdim, hdim], ln=True)  # for siglip language embeds
         ])
         self.proj_pe = simple_mlp([2, hdim, hdim], ln=True)  # for normalized coordinates
 
@@ -32,7 +32,7 @@ class ContextEncoder(nn.Module):
                             pe_type="prope")  # actually, it is not a DiT but self-cross attention module
         self.qformer = QFormerITM(hdim, num_heads, num_layers=1, num_queries=64)
         self.post_attn = FFWSelfAttentionLayers(hdim, num_heads, num_layers//2, use_adaln=False,
-                                                bias=True, qk_norm=True)
+                                                bias=True, qk_norm=True, ffn_expansion=2)
         self.reset_parameters()
 
     def reset_parameters(self):
