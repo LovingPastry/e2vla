@@ -241,8 +241,6 @@ def main(args):
 
             a_idx = 0
             controller.set_ensemble_nums(args.ensemble)
-            # controller.set_ensemble_nums(4)
-            # controller.set_ensemble_nums(0)  # disables ensemble
             controller.set_prompt(prompt_text)
             controller.add_obs_frame(obs_libero2ours(obs, time=a_idx, env=env))
             print("[INFO] prompt_text = {}".format(prompt_text))

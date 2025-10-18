@@ -1,6 +1,11 @@
 # e2vla
 
-Codes under refactoring
+Project under refactoring
+
+Checkpoints, evaluation results and videos have been uploaded to google drive:
+* Checkpoints: [link](https://drive.google.com/drive/folders/1rMpj7ry4YObLciNdPjY9DiZ-JpT7uG_q?usp=sharing)
+* LIBERO scores: [link](https://drive.google.com/drive/folders/1RxZPSohDQVi2vH6zYSujVJxuPdOwt29y?usp=sharing)
+* LIBERO videos: [link](https://drive.google.com/drive/folders/1bcp7wB13i3HoRLd2Xe1sHtqVVuSzkGRj?usp=sharing)
 
 
 # Dependency
@@ -63,7 +68,109 @@ Codes under refactoring
   * Although we install "metaworld==2.0.0", it is actually version 3.
 
 If you have downloaded and processed all the data, the file structure would be like this: 
-TODO: add an image
+```
+data_raw
+├── droid_1.0.1
+│   ├── README.md
+│   ├── data
+│   │   ├── chunk-000
+│   │   ├── chunk-001
+│   │   └── ...
+│   ├── meta
+│   │   ├── episodes.jsonl
+│   │   ├── episodes_stats.jsonl
+│   │   ├── info.json
+│   │   └── tasks.jsonl
+│   └── videos
+│       ├── chunk-000
+│       ├── chunk-001
+│       └── ...
+├── libero
+│   ├── datasets
+│   ├── libero_10
+│   │   ├── KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it_demo.hdf5
+│   │   ├── KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it_demo.hdf5
+│   │   └── ...
+│   ├── libero_90
+│   │   ├── KITCHEN_SCENE10_close_the_top_drawer_of_the_cabinet_and_put_the_black_bowl_on_top_of_it_demo.hdf5
+│   │   ├── KITCHEN_SCENE10_close_the_top_drawer_of_the_cabinet_demo.hdf5
+│   │   └── ...
+│   ├── libero_goal
+│   │   ├── open_the_middle_drawer_of_the_cabinet_demo.hdf5
+│   │   ├── open_the_top_drawer_and_put_the_bowl_inside_demo.hdf5
+│   │   └── ...
+│   ├── libero_object
+│   │   ├── pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5
+│   │   ├── pick_up_the_bbq_sauce_and_place_it_in_the_basket_demo.hdf5
+│   │   └── ...
+│   └── ...
+└── maniskill
+    └── 0.1.0
+        ├── dataset_info.json
+        ├── features.json
+        ├── maniskill_dataset_converted_externally_to_rlds-train.tfrecord-00000-of-01024
+        ├── maniskill_dataset_converted_externally_to_rlds-train.tfrecord-00001-of-01024
+        └── ...
+
+data_converted
+├── drawer
+│   ├── 0000.h5
+│   ├── 0001.h5
+│   └── ...
+├── droid
+│   ├── data
+│   │   ├── chunk-000
+│   │   ├── chunk-001
+│   │   └── ...
+│   └── videos
+│       ├── chunk-000
+│       ├── chunk-001
+│       └── ...
+├── libero
+│   ├── libero_10_no_noops
+│   │   ├── KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it
+│   │   ├── KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it
+│   │   └── ...
+│   ├── libero_90_no_noops (not used in fine-tuning)
+│   │   ├── KITCHEN_SCENE10_close_the_top_drawer_of_the_cabinet
+│   │   ├── KITCHEN_SCENE10_close_the_top_drawer_of_the_cabinet_and_put_the_black_bowl_on_top_of_it
+│   │   └── ...
+│   ├── libero_goal_no_noops
+│   │   ├── open_the_middle_drawer_of_the_cabinet
+│   │   ├── open_the_top_drawer_and_put_the_bowl_inside
+│   │   └── ...
+│   ├── libero_object_no_noops
+│   │   ├── pick_up_the_alphabet_soup_and_place_it_in_the_basket
+│   │   ├── pick_up_the_bbq_sauce_and_place_it_in_the_basket
+│   │   └── ...
+│   └── libero_spatial_no_noops
+│       ├── pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate
+│       ├── pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate
+│       └── ...
+├── maniskill
+│   └── 0.1.0
+│       ├── 00000.h5
+│       ├── 00001.h5
+│       └── ...
+├── metaworld
+│   ├── assembly-v3
+│   │   ├── 0000.h5
+│   │   ├── 0001.h5
+│   │   └── ...
+│   ├── basketball-v3
+│   │   ├── 0000.h5
+│   │   ├── 0001.h5
+│   │   └── ...
+│   └── ...
+├── oven
+│   ├── 0000.h5
+│   ├── 0001.h5
+│   └── ...
+└── pick-place-can
+    ├── 0000.h5
+    ├── 0001.h5
+    └── ...
+```
 
 ## (1.5) Data Visualization
 Visualize the processed data is recommended before training. Run:
@@ -83,7 +190,7 @@ CUDA_VISIBLE_DEVICES=x python train.py --config pretrain_extra -s EXPERIMENT_NAM
 ```
 This will save the log to `./logs/E2VLA/EXPERIMENT_NAME` and save the checkpoints to `./checkpoints/E2VLA/EXPERIMENT_NAME`.
 
-**TODO:** upload self collected datasets.
+We have uploaded two checkpoints [here](https://drive.google.com/drive/folders/1rMpj7ry4YObLciNdPjY9DiZ-JpT7uG_q?usp=sharing).
 
 # Fine-tune and Evaluation on LIBERO
 ## 1. Dataset Preparation
@@ -109,6 +216,8 @@ CUDA_VISIBLE_DEVICES=x python train.py \
 ```
 This will load the config and the pre-trained weights. The fine-tuned weights are saved to `./checkpoints/E2VLA/FINETUNE_EXPERIMENT_NAME/`. We save the weights every 10k iterations by default.
 
+Finetuned checkpoints can be found [here](https://drive.google.com/drive/folders/1rMpj7ry4YObLciNdPjY9DiZ-JpT7uG_q?usp=sharing).
+
 ## 3. Evaluation
 * First we need to launch the pyro4 naming server (something like roscore). Open a separate terminal and run:
   ```bash
@@ -130,6 +239,9 @@ This will load the config and the pre-trained weights. The fine-tuned weights ar
     --uri CUSTOM_URI_NAME \
     --save --video
   ```
+  The results are saved to `./eval_results/TASK_SUITE/URI/`, and the videos are saved to `./eval_videos/TASK_SUITE/URI/`
+
+Evaluation results and videos using our fine-tuned checkpoints can be found [here](https://drive.google.com/drive/folders/1RxZPSohDQVi2vH6zYSujVJxuPdOwt29y?usp=sharing) and [here](https://drive.google.com/drive/folders/1bcp7wB13i3HoRLd2Xe1sHtqVVuSzkGRj?usp=sharing).
 
 # Fine-tune on Own Data
 
