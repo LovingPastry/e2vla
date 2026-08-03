@@ -7,6 +7,9 @@ from typing import Union, Optional
 
 Array = Union[np.ndarray, torch.Tensor]
 
+# RealSense D435 color stream, vertical field of view in degrees (datasheet: 69.4 x 42.5).
+D435_COLOR_VFOV_DEG = 42.5
+
 
 class PinholeCamera(object):
     """Intrinsic parameters of a pinhole camera model.
@@ -65,6 +68,28 @@ class PinholeCamera(object):
     @classmethod
     def default(cls):
         return cls(width=640, height=480, fx=540, fy=540, cx=320, cy=240)
+
+    @classmethod
+    def realsense_d435(cls, width: int, height: int):
+        """Nominal RealSense D435 *color* intrinsics, for datasets that ship no K.
+
+        Datasheet FOV for the color stream is 69.4 deg x 42.5 deg. Both of the common
+        modes (1280x720 at 16:9 and 640x480 at 4:3) keep the full sensor height and
+        crop horizontally, so the *vertical* FOV is the invariant to model from:
+
+            f = 0.5 * height / tan(vfov / 2)
+
+        That gives f ~= 617 at 480p and ~= 926 at 720p, which matches what a real D435
+        reports (fx ~= 615-620 at 640x480). Square pixels, so fx == fy.
+
+        This is a plausible stand-in, NOT a calibration: it is only self-consistent
+        because training and inference both go through here. Principal point is the
+        image centre (a real unit is off by a pixel or two); the repo's own
+        `get_camera_intrinsic_matrix` uses the same W/2, H/2 convention.
+        """
+        f = 0.5 * height / np.tan(np.deg2rad(D435_COLOR_VFOV_DEG) / 2)
+        return cls(width=width, height=height,
+                   fx=f, fy=f, cx=width / 2, cy=height / 2)
 
     def pixel_to_norm_camera_plane(self, uv: Array) -> Array:
         if isinstance(uv, np.ndarray):
@@ -281,8 +306,8 @@ class OpenglCamera(object):
 class Frame(object):
     def __init__(
         self, 
-        camera: Union[PinholeCamera, OpenglCamera], 
-        color: Array, 
+        camera: Optional[Union[PinholeCamera, OpenglCamera]],
+        color: Array,
         depth: Optional[Array] = None, 
         seg: Optional[dict] = None, 
         wcT: Optional[Array] = None,
@@ -293,7 +318,9 @@ class Frame(object):
     ):
         """
         Arguments:
-        - camera: Camera instance
+        - camera: Camera instance, or None if the source carries no intrinsics --
+          callers that need K must then fall back (see `h5io.default_intrinsics`);
+          anything metric (`pc_camera`, `pc_world`, `_pointcloud`) requires a real one.
         - color: (H, W, 3 or 4) for rgb or rgba image
         - depth: (H, W, [1]) for depth image
         - seg: segmentation information
@@ -345,6 +372,9 @@ class Frame(object):
     @classmethod
     def from_dict(cls, data: dict):
         try:
+            if data.get("camera") is None:
+                # no intrinsics in this source; the caller fills K in from the fallback
+                return cls(None, **data["data"])
             cam_cls = PinholeCamera if data["model"] == "pinhole" else OpenglCamera
             camera = cam_cls.from_dict(data["camera"])
             return cls(camera, **data["data"])

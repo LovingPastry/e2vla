@@ -4,7 +4,7 @@ import h5py
 import numpy as np
 from einops import rearrange
 from typing import List, Dict
-from .perception import Frame
+from .perception import Frame, PinholeCamera, D435_COLOR_VFOV_DEG
 from .vid_dec import decode_video_frames_torchcodec
 
 
@@ -17,6 +17,7 @@ def jpeg_decode(array: np.ndarray):
 
 
 _WARNED_IDENTITY_EXTRINSICS = set()
+_WARNED_DEFAULT_INTRINSICS = set()
 
 
 def identity_extrinsics(num_frames: int):
@@ -55,8 +56,33 @@ def _warn_identity_extrinsics(source: str):
               "trajectory overlay is meaningless.".format(source))
 
 
+def default_intrinsics(height: int, width: int):
+    """(3, 3) nominal RealSense D435 color K, the no-intrinsics fallback.
+
+    `gen_norm_xy_map` turns K into the per-pixel normalized-plane coordinates that feed
+    `ContextEncoder.proj_pe`, so a missing K cannot simply be skipped -- there is no
+    "identity" for intrinsics the way there is for extrinsics. A fabricated-but-fixed K
+    is fine there: the model only ever sees a constant coordinate grid and learns it as
+    a 2D positional encoding. What it is NOT fine for is anything metric -- projecting
+    3D points into the image, unprojecting depth, or comparing scale across cameras.
+    Two cameras with genuinely different FOVs both getting this K makes them look
+    identical to the geometry, so give real per-camera values as soon as you have them.
+    """
+    return PinholeCamera.realsense_d435(width=width, height=height).K.astype(np.float32)
+
+
+def _warn_default_intrinsics(source: str):
+    """Warn once per source, same reasoning as `_warn_identity_extrinsics`."""
+    if source not in _WARNED_DEFAULT_INTRINSICS:
+        _WARNED_DEFAULT_INTRINSICS.add(source)
+        print("[WARN] no camera intrinsics found in {}, falling back to nominal "
+              "RealSense D435 color K (vfov={} deg). Fine as a positional encoding, "
+              "but every metric use -- projection, unprojection, cross-camera FOV -- "
+              "is fabricated.".format(source, D435_COLOR_VFOV_DEG))
+
+
 def gather_frames(
-    traj: List[dict], 
+    traj: List[dict],
     cam_name: str, 
     indices,
     compress: bool,
@@ -101,9 +127,18 @@ def gather_frames(
     else:
         cam_poses = np.stack(cam_poses, axis=0)  # (T, 4, 4)
 
+    camera = getattr(cam, "camera", None)
+    if camera is None:
+        # `cam.color` is still (H, W, C) -- `rgbs` may be jpeg bytes when compress=True
+        H, W = cam.color.shape[:2]
+        _warn_default_intrinsics("frame dict, camera '{}'".format(cam_name))
+        K = default_intrinsics(H, W)
+    else:
+        K = np.asarray(camera.K, dtype=np.float32)
+
     outputs = {
         "rgb": rgbs,
-        "K": cam.camera.K.astype(np.float32), 
+        "K": K,
         "pose": cam_poses,
     }
 
@@ -219,9 +254,11 @@ def slice_encoded_frames(
 ):
 
     sampled: Dict[str, np.ndarray] = {}
-    sampled["K"] = camera_group["K"][:]  # (3, 3)
-    if sampled["K"].ndim == 3:
-        sampled["K"] = sampled["K"][0]
+    if "K" in camera_group:
+        sampled["K"] = camera_group["K"][:]  # (3, 3)
+        if sampled["K"].ndim == 3:
+            sampled["K"] = sampled["K"][0]
+    # else: filled in after the loop, once the decoded image size is known
 
     for k in camera_group.keys():
         if k == "K":
@@ -258,6 +295,12 @@ def slice_encoded_frames(
             # raw data format
             # sampled[k] = dset[ind_clipped]
             sampled[k] = slice_dset(dset, indices)
+
+    if "K" not in sampled:
+        # decoded frames are (T, C, H, W) here, whatever the on-disk encoding was
+        H, W = sampled["rgb"].shape[-2:]
+        _warn_default_intrinsics("h5 group '{}'".format(camera_group.name))
+        sampled["K"] = default_intrinsics(H, W)
 
     if "pose" not in sampled:
         _warn_identity_extrinsics("h5 group '{}'".format(camera_group.name))

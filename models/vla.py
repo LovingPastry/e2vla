@@ -72,33 +72,35 @@ class VLA(nn.Module):
     ):
         """
         Args:
-            obs_rgbs: (B, To, ncam, 3, H, W)
-            obs_masks: (B, To, ncam, H, W)
-            obs_norm_xys: (B, To, ncam, 2, H, W), coordinates in normalized camera plane
-            obs_extrinsics: (B, To, ncam, 4, 4), ^{world}_{camera} T
-            prompt_text: (B, Lang, E) or None, language instruction
+            obs_rgbs: (B, To, ncam, 3, H, W)，观测 RGB 图像
+            obs_masks: (B, To, ncam, H, W)，观测掩码
+            obs_norm_xys: (B, To, ncam, 2, H, W)，归一化相机平面上的坐标
+                * 即逐像素的 ((u,v) - (cx,cy)) / (fx,fy)，等价于把像素反投影到 z=1 平面
+                * 与外参一起用于构造 Plücker 射线位置编码
+            obs_extrinsics: (B, To, ncam, 4, 4)，相机外参 ^{world}_{camera} T
+            prompt_text: (B, Lang, E) 或 None，语言指令
 
-            current_ee_pose: (B, Nee, 4, 4), ^{world}_{ee} T
-            history_ee_states: (B, nhist, Nee, 4*4+1), in world frame,
-                * 4x4 is the flattened transformation matrix, 
-                * 1 is gripper openness, range [0 (close), 1 (open)]
-            gt_future_ee_states: (B, Ta, Nee, 4*4+1), ground truth future actions, in world frame
-                * 4x4 is the flattened transformation matrix, 
-                * 1 is gripper openness, range [0 (close), 1 (open)]
-                * Note: if `inference` is True, we only derive prediction actions shape from gt_future_ee_states
-            valid_ee_mask: (B, Nee), only compute loss on these end-effectors
-            inference: if True, returns the predicted trajectory, otherwise returns loss and metrics for logging
-            fp16: if True, use bfloat16
-        
+            current_ee_pose: (B, Nee, 4, 4)，当前末端位姿 ^{world}_{ee} T
+            history_ee_states: (B, nhist, Nee, 4*4+1)，世界坐标系下的历史末端状态
+                * 4x4 为展平后的变换矩阵
+                * 1 为夹爪开合度，范围 [0（闭合），1（张开）]
+            gt_future_ee_states: (B, Ta, Nee, 4*4+1)，世界坐标系下的真值未来动作
+                * 4x4 为展平后的变换矩阵
+                * 1 为夹爪开合度，范围 [0（闭合），1（张开）]
+                * 注意：当 `inference` 为 True 时，仅用它来推断预测动作的形状
+            valid_ee_mask: (B, Nee)，只在这些末端执行器上计算损失
+            inference: 为 True 时返回预测轨迹，否则返回损失和用于记录的指标
+            fp16: 为 True 时使用 bfloat16
+
         Returns
         -------
-        (if inference is True)
+        （当 inference 为 True 时）
             pred_future_ee_states (Tensor): (B, Ta, Nee, 4*4+1)
-                * 4x4 is the flattened transformation matrix, 
-                * 1 is gripper openness, range [0 (close), 1 (open)]
-        (else)
-            loss (Tensor): scalar tensor
-            metrics (Dict[str, Tensor]): metrics for logging
+                * 4x4 为展平后的变换矩阵
+                * 1 为夹爪开合度，范围 [0（闭合），1（张开）]
+        （否则）
+            loss (Tensor): 标量张量
+            metrics (Dict[str, Tensor]): 用于记录的指标
         """
         vl_obs, vl_feature = self.vlm(
             obs_rgbs=obs_rgbs,
@@ -109,13 +111,6 @@ class VLA(nn.Module):
             prompt_text=prompt_text,
             fp16=fp16
         )
-
-        # ### select the latest frame for higher execution frequency of action expert
-        # obs_rgbs = obs_rgbs[:, -1:]             # (B, To=1, ncam, 3, H, W)
-        # if obs_masks is not None:
-        #     obs_masks = obs_masks[:, -1:]       # (B, To=1, ncam, H, W)
-        # obs_norm_xys = obs_norm_xys[:, -1:]     # (B, To=1, ncam, 2, H, W)
-        # obs_extrinsics = obs_extrinsics[:, -1:] # (B, To=1, ncam, 4, 4)
 
         return self.actor(
             vl_obs=vl_obs,
