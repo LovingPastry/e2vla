@@ -1,21 +1,21 @@
 # e2vla
 
-Project under refactoring
+项目重构中。
 
-Checkpoints, evaluation results and videos have been uploaded to google drive:
+Checkpoint、评测结果和视频已上传至 Google Drive:
 * Checkpoints: [link](https://drive.google.com/drive/folders/1rMpj7ry4YObLciNdPjY9DiZ-JpT7uG_q?usp=sharing)
 * LIBERO scores: [link](https://drive.google.com/drive/folders/1RxZPSohDQVi2vH6zYSujVJxuPdOwt29y?usp=sharing)
 * LIBERO videos: [link](https://drive.google.com/drive/folders/1bcp7wB13i3HoRLd2Xe1sHtqVVuSzkGRj?usp=sharing)
 
 
-# Dependency
+# 依赖
 
 
-# Pretrain
-## 1. Dataset Preparation
+# 预训练
+## 1. 数据准备
 * Droid
-  
-  We use the processed data from [cadence/droid_1.0.1](https://huggingface.co/datasets/cadene/droid_1.0.1) as it has camera extrinsic attached. Download it to anywhere you like, and make a symbolic link to it as `./data_raw/droid_1.0.1`. Then run:
+
+  我们使用 [cadence/droid_1.0.1](https://huggingface.co/datasets/cadene/droid_1.0.1) 处理好的数据,因为它带有相机外参。下载到任意位置,然后软链接到 `./data_raw/droid_1.0.1`,再运行:
   ```bash
   conda activate lerobot
   python data_prepare/process_droid.py \
@@ -24,22 +24,22 @@ Checkpoints, evaluation results and videos have been uploaded to google drive:
     --output_root ./data_converted/droid \
     --skip_saved
   ```
-  **Note:**
-  * This requires [lerobot](https://github.com/huggingface/lerobot) installed. We use version 0.1.0. You may need to create a new conda environment (e.g. named `lerobot`) and install the package via:
+  **注意:**
+  * 需要安装 [lerobot](https://github.com/huggingface/lerobot),我们使用 0.1.0 版本。可能需要新建一个 conda 环境(例如叫 `lerobot`)来安装:
     ```bash
     pip install "lerobot==0.1.0"
     ```
-  * The initial downloads of video files may be incomplete (test at 2025/04). We need to download the full video files and place them at `VIDEO_DOWNLOAD_PATH`. **TODO:** upload scripts to fix this.
-  
+  * 初次下载的视频文件可能不完整(2025/04 测试)。需要下载完整视频文件并放到 `VIDEO_DOWNLOAD_PATH`。**TODO:** 上传修复脚本。
+
 * Maniskill
-  
-  First download the [data](https://www.tensorflow.org/datasets/catalog/maniskill_dataset_converted_externally_to_rlds) to anywhere you like, e.g.:
+
+  先把 [数据](https://www.tensorflow.org/datasets/catalog/maniskill_dataset_converted_externally_to_rlds) 下载到任意位置,例如:
   ```bash
   mkdir -p ANYWHERE/maniskill
   gsutil -m cp -r gs://gresearch/robotics/maniskill_dataset_converted_externally_to_rlds/0.1.0 ANYWHERE/maniskill
   ln -s ANYWHERE/maniskill ./data_raw/maniskill
   ```
-  Then run:
+  然后运行:
   ```bash
   conda activate tensorflow
   python data_prepare/process_maniskill.py \
@@ -47,16 +47,16 @@ Checkpoints, evaluation results and videos have been uploaded to google drive:
     --output_root ./data_converted/maniskill/0.1.0 \
     --visualize
   ```
-  Note:
-  * This requires [tensorflow](https://www.tensorflow.org/install) installed. You may need to create a new conda environment (e.g. named `tensorflow`) to install it and run the above command to generate data.
-  
+  注意:
+  * 需要安装 [tensorflow](https://www.tensorflow.org/install)。可能需要新建一个 conda 环境(例如叫 `tensorflow`)来安装并运行上述命令生成数据。
+
 * Metaworld
-  
-  This doesn't require downloading extra data. However, you may still need to create a new conda environment (e.g. named `metaworld-v3`) and then install the [metaworld](https://github.com/Farama-Foundation/Metaworld) package via:
+
+  不需要额外下载数据。但可能仍需新建一个 conda 环境(例如叫 `metaworld-v3`),然后安装 [metaworld](https://github.com/Farama-Foundation/Metaworld):
   ```bash
   pip install "metaworld==2.0.0"
   ```
-  Then run:
+  然后运行:
   ```bash
   conda activate metaworld-v3
   python data_prepare/process_metaworld.py \
@@ -64,10 +64,10 @@ Checkpoints, evaluation results and videos have been uploaded to google drive:
     --visualize \
     --skip_saved
   ```
-  Note:
-  * Although we install "metaworld==2.0.0", it is actually version 3.
+  注意:
+  * 虽然装的是 "metaworld==2.0.0",实际版本是 3。
 
-If you have downloaded and processed all the data, the file structure would be like this: 
+如果所有数据都已下载并处理完毕,文件结构应该是这样:
 ```
 data_raw
 ├── droid_1.0.1
@@ -172,29 +172,29 @@ data_converted
     └── ...
 ```
 
-## (1.5) Data Visualization
-Visualize the processed data is recommended before training. Run:
+## (1.5) 数据可视化
+建议在训练前先可视化处理好的数据。运行:
 ```bash
 python datavis.py {DATASET_NAME}
 ```
-to visualize the specified dataset. Run `python datavis.py -l` to list all the available datasets.
+来可视化指定数据集。运行 `python datavis.py -l` 列出所有可用数据集。
 
-## 2. Start Pre-training
-You can use `python train.py -h` to see the help message. To pretrain on the above three datasets, run:
+## 2. 开始预训练
+可以用 `python train.py -h` 查看帮助信息。在上述三个数据集上预训练:
 ```bash
 CUDA_VISIBLE_DEVICES=x python train.py --config pretrain -s EXPERIMENT_NAME
 ```
-To pretrain on all the datasets mentioned in paper, run:
+在论文提到的所有数据集上预训练:
 ```bash
 CUDA_VISIBLE_DEVICES=x python train.py --config pretrain_extra -s EXPERIMENT_NAME
 ```
-This will save the log to `./logs/E2VLA/EXPERIMENT_NAME` and save the checkpoints to `./checkpoints/E2VLA/EXPERIMENT_NAME`.
+日志保存到 `./logs/E2VLA/EXPERIMENT_NAME`,checkpoint 保存到 `./checkpoints/E2VLA/EXPERIMENT_NAME`。
 
-We have uploaded two checkpoints [here](https://drive.google.com/drive/folders/1rMpj7ry4YObLciNdPjY9DiZ-JpT7uG_q?usp=sharing).
+我们上传了两个 checkpoint,见 [这里](https://drive.google.com/drive/folders/1rMpj7ry4YObLciNdPjY9DiZ-JpT7uG_q?usp=sharing)。
 
-# Fine-tune and Evaluation on LIBERO
-## 1. Dataset Preparation
-First download the [LIBERO dataset](https://huggingface.co/datasets/yifengzhu-hf/LIBERO-datasets) to anywhere and then make a symbolink to `./data_raw/libero`. Then run 
+# 在 LIBERO 上微调与评测
+## 1. 数据准备
+先把 [LIBERO 数据集](https://huggingface.co/datasets/yifengzhu-hf/LIBERO-datasets) 下载到任意位置,软链接到 `./data_raw/libero`,然后运行:
 ```bash
 conda activate libero
 python data_prepare/process_libero.py \
@@ -204,164 +204,128 @@ python data_prepare/process_libero.py \
   --skip_saved \
   --visualize
 ```
-Change the libero_spatial to [libero_object, libero_goal, libero_10] for finetuning and evaluation on other task-suites.
+把 libero_spatial 换成 [libero_object, libero_goal, libero_10] 可在其他 task-suite 上微调和评测。
 
-## 2. Fine-tuning
-For example, if we wnat to fine-tune on libero-10 from pretrained models:
+## 2. 微调
+例如,要从预训练模型出发在 libero-10 上微调:
 ```bash
 CUDA_VISIBLE_DEVICES=x python train.py \
   --config finetune_libero_10 \
   --pretrained_ckpt ./checkpoints/E2VLA/PRETRAIN_EXP_NAME/ckpt_xxxxxxx.pt \
   -s FINETUNE_EXPERIMENT_NAME
 ```
-This will load the config and the pre-trained weights. The fine-tuned weights are saved to `./checkpoints/E2VLA/FINETUNE_EXPERIMENT_NAME/`. We save the weights every 10k iterations by default.
+这会加载配置和预训练权重。微调后的权重保存到 `./checkpoints/E2VLA/FINETUNE_EXPERIMENT_NAME/`,默认每 10k 步保存一次。
 
-Finetuned checkpoints can be found [here](https://drive.google.com/drive/folders/1rMpj7ry4YObLciNdPjY9DiZ-JpT7uG_q?usp=sharing).
+微调好的 checkpoint 见 [这里](https://drive.google.com/drive/folders/1rMpj7ry4YObLciNdPjY9DiZ-JpT7uG_q?usp=sharing)。
 
-## 3. Evaluation
-* First we need to launch the pyro4 naming server (something like roscore). Open a separate terminal and run:
+## 3. 评测
+* 首先启动 pyro4 命名服务(类似 roscore)。新开一个终端运行:
   ```bash
   pyro4-ns
   ```
-  By default the naming server runs on `localhost:9090`.
+  默认命名服务跑在 `localhost:9090`。
 
-* Launch planning service of your fine-tuned model:
+* 启动微调模型的规划服务:
   ```bash
   CUDA_VISIBLE_DEVICES=x python -m infer_utils.remote_service \
     --ckpt ./checkpoints/E2VLA/FINETUNE_EXPERIMENT_NAME/ckpt_xxxxxxx.pt \
     --uri CUSTOM_URI_NAME
   ```
 
-* Start evaluation in simulation:
+* 在仿真中开始评测:
   ```bash
   python -m examples.libero.eval \
     --task_suite libero_10 \
     --uri CUSTOM_URI_NAME \
     --save --video
   ```
-  The results are saved to `./eval_results/TASK_SUITE/URI/`, and the videos are saved to `./eval_videos/TASK_SUITE/URI/`
+  结果保存到 `./eval_results/TASK_SUITE/URI/`,视频保存到 `./eval_videos/TASK_SUITE/URI/`。
 
-Evaluation results and videos using our fine-tuned checkpoints can be found [here](https://drive.google.com/drive/folders/1RxZPSohDQVi2vH6zYSujVJxuPdOwt29y?usp=sharing) and [here](https://drive.google.com/drive/folders/1bcp7wB13i3HoRLd2Xe1sHtqVVuSzkGRj?usp=sharing).
+用我们微调 checkpoint 得到的评测结果和视频见 [这里](https://drive.google.com/drive/folders/1RxZPSohDQVi2vH6zYSujVJxuPdOwt29y?usp=sharing) 和 [这里](https://drive.google.com/drive/folders/1bcp7wB13i3HoRLd2Xe1sHtqVVuSzkGRj?usp=sharing)。
 
-# Fine-tune on Own Data
+# 用自己的数据微调
 
-This section covers fine-tuning on a real robot from a small number of demonstrations
-(order 50-100 episodes, single robot, single task).
+本节介绍如何用少量真机演示数据微调(约 50-100 条 episode,单机器人、单任务)。
 
-**Starting from a pretrained checkpoint is recommended, but it is not a hard
-requirement** — single-task behaviour cloning from scratch on 50-100 demonstrations is
-standard practice (Diffusion Policy, ACT), at comparable model sizes. Treat it as an
-empirical question and, if you can afford two 20k-step runs, measure it.
+**推荐从预训练 checkpoint 出发,但这不是硬性要求** —— 在 50-100 条演示上做单任务行为克隆是标准做法(Diffusion Policy、ACT 都是这个量级的模型和数据)。把它当成一个实验问题:如果能跑两次 20k 步,直接测一下。
 
-What the pretrained checkpoint buys you here, concretely: 60% of the trainable
-parameters live in the `ContextEncoder`, whose job is to fuse multiple camera views via
-PRoPE and compress them through the QFormer bottleneck. Learning to exploit relative
-camera geometry is the most data-hungry part of this architecture and the part that
-transfers best — more so than the diffusion head itself. The pretraining mixture is
-DROID-weighted (real Franka data with calibrated extrinsics), so a similar 7-DoF arm
-with a third-person + wrist camera is close-domain.
+预训练 checkpoint 具体带来什么:可训练参数的 60% 在 `ContextEncoder` 里,它的职责是通过 PRoPE 融合多路相机视角,再经 QFormer 瓶颈压缩。学会利用相对相机几何是这个架构中最吃数据的部分,也是迁移性最好的部分 —— 比扩散头本身更值得迁移。预训练数据配比以 DROID 为主(带标定外参的真实 Franka 数据),所以一台类似的 7-DoF 机械臂 + 第三人称相机 + 腕部相机属于近域。
 
-Where pretrained init helps least: if your control frequency, gripper convention, or
-camera arrangement differ substantially from the pretraining data, much of the prior
-does not apply, and from-scratch with more iterations may be competitive.
+预训练收益最小的情况:如果你的控制频率、夹爪约定或相机布置与预训练数据差别很大,大部分先验就用不上了,从头训 + 增加迭代步数可能同样有竞争力。
 
-Note that the vision backbones are frozen pretrained weights in either case, so
-"from scratch" never means "from random visual features".
+注意视觉 backbone 在两种情况下都是冻结的预训练权重,所以"从头训"从来不意味着"从随机视觉特征开始"。
 
-## 0. Prerequisites
+## 0. 前置条件
 
-**Calibrated camera extrinsics are mandatory, and their absence fails silently.**
-The context encoder uses PRoPE, which consumes `^{world}_{cam}T`, and the action space
-itself is defined in the camera frame (`space_ee2cam`). Note that PRoPE and RoPE are
-both parameter-free, so switching `pe_type` does *not* change the `state_dict` — a
-checkpoint would still "load successfully" while the positional encoding means
-something entirely different. Symptom: training simply does not converge. Calibrate
-your cameras before recording.
+**标定好的相机外参是必需的,而且缺了会静默失败。** Context encoder 使用 PRoPE,它消费 `^{world}_{cam}T`,而且动作空间本身就定义在相机系下(`space_ee2cam`)。注意 PRoPE 和 RoPE 都是无参数的,所以切换 `pe_type` **不会**改变 `state_dict` —— checkpoint 依然会"加载成功",但位置编码的含义已经完全变了。症状:训练就是不收敛。录数据前先标定相机。
 
-You need, for every frame:
+每一帧你需要有:
 
-| Quantity | Shape | Notes |
+| 量 | 形状 | 说明 |
 | --- | --- | --- |
-| End-effector pose | `(4, 4)` | `^{world}_{ee}T`, homogeneous |
-| Gripper openness | scalar | normalised to `[0, 1]`, 0 = closed, 1 = open |
-| RGB per camera | `(H, W, 3)` | uint8 |
-| Camera extrinsic | `(4, 4)` | `^{world}_{cam}T`, per frame (wrist cameras move) |
-| Camera intrinsic | `(3, 3)` | pinhole `K`, constant per episode |
-| Timestamp | scalar | seconds, monotonically increasing |
+| 末端位姿 | `(4, 4)` | `^{world}_{ee}T`,齐次矩阵 |
+| 夹爪开合度 | 标量 | 归一化到 `[0, 1]`,0 = 闭合,1 = 张开 |
+| 每路相机 RGB | `(H, W, 3)` | uint8 |
+| 相机外参 | `(4, 4)` | `^{world}_{cam}T`,逐帧(腕部相机会动) |
+| 相机内参 | `(3, 3)` | 针孔 `K`,每条 episode 内固定 |
+| 时间戳 | 标量 | 秒,单调递增 |
 
-The world frame is arbitrary but must be *consistent within an episode* — the model
-only ever uses poses relative to camera 0, so the origin never leaks into the network.
+世界系可以任意选取,但必须在**一条 episode 内保持一致** —— 模型只使用相对 camera 0 的位姿,原点不会泄漏进网络。
 
-## 1. Convert your recordings to HDF5
+## 1. 把录制数据转成 HDF5
 
-One `.h5` file per episode, under `./data_converted/real_robot/`. Use
-`data_prepare/process_libero.py` as the reference implementation. The layout, as
-consumed by `DataSampler.sample_hdf5`:
+一条 episode 一个 `.h5` 文件,放在 `./data_converted/real_robot/` 下。参考实现见 `data_prepare/process_libero.py`。`DataSampler.sample_hdf5` 消费的布局如下:
 
 ```
 episode_0001.h5
 ├── ee_pose            (T, 4, 4)  float32   ^{world}_{ee} T
-├── gripper            (T,)       float32   [0 (closed), 1 (open)]
-├── timestamp          (T,)       float32   seconds
-├── ee_pose_desired    (T, 4, 4)  float32   optional: commanded pose (see note)
-├── gripper_desired    (T,)       float32   optional: commanded gripper
-├── exterior/                               <- group name = camera_names[0]
-│   ├── rgb            (T, 3, H, W) uint8, or a vlen list of JPEG bytes
+├── gripper            (T,)       float32   [0 (闭合), 1 (张开)]
+├── timestamp          (T,)       float32   秒
+├── ee_pose_desired    (T, 4, 4)  float32   可选: 指令位姿(见下方说明)
+├── gripper_desired    (T,)       float32   可选: 指令夹爪
+├── exterior/                               <- 组名 = camera_names[0]
+│   ├── rgb            (T, 3, H, W) uint8, 或 JPEG 字节的 vlen list
 │   ├── pose           (T, 4, 4)  float32   ^{world}_{cam} T
 │   └── K              (3, 3)     float32
-└── wrist/                                  <- group name = camera_names[1]
-    ├── rgb, pose, K   (same as above)
+└── wrist/                                  <- 组名 = camera_names[1]
+    ├── rgb, pose, K   (同上)
 └── .attrs["prompt_text"] = "pick up the red block"
 ```
 
-Notes:
-- `ee_pose_desired` / `gripper_desired` are optional. If present they are used as the
-  supervision target instead of the *achieved* pose, which is usually what you want on
-  a real robot: the achieved pose lags the command, so training on it teaches the
-  policy to under-shoot. Record your controller setpoints if you can.
-- `prompt_text` is an HDF5 attribute, not a dataset. Multiple attributes whose name
-  contains `prompt_text` are sampled from at random, which is a cheap way to add
-  language augmentation. A single task still needs one, since the frozen SigLIP text
-  encoder always runs.
-- Images may be stored raw or JPEG-encoded; `transform_image` in
-  `data_prepare/process_libero.py` shows both paths.
+说明:
+- `ee_pose_desired` / `gripper_desired` 是可选的。如果存在,监督目标会用它们而不是**实际达到**的位姿 —— 这通常是真机上想要的行为:实际位姿滞后于指令,拿它训练等于教策略欠调。有条件的话请记录控制器 setpoint。
+- `prompt_text` 是 HDF5 attribute,不是 dataset。名字里含 `prompt_text` 的多个 attribute 会被随机采样,这是加语言增强的廉价做法。单任务也需要至少一个,因为冻结的 SigLIP text encoder 总是会跑。
+- 图像可以存原始数据或 JPEG 编码;`data_prepare/process_libero.py` 里的 `transform_image` 两条路径都有示例。
 
-Verify the conversion *before* training — this catches extrinsic and gripper-convention
-mistakes that are otherwise invisible in the loss:
+**训练前务必验证转换结果** —— 这能抓到外参和夹爪约定的错误,这类错误在 loss 上是完全看不出来的:
 
 ```bash
-python datavis.py -l                # list converted datasets
-python datavis.py RealRobot         # overlays the ee axes and future trajectory
+python datavis.py -l                # 列出已转换的数据集
+python datavis.py RealRobot         # 叠加显示末端坐标轴和未来轨迹
 ```
 
-If the projected end-effector axes do not land on the real gripper in the overlay, your
-extrinsics or intrinsics are wrong. Fix that first; nothing downstream will work.
+如果叠加图里投影出的末端坐标轴没有落在真实夹爪上,说明外参或内参错了。先修这个,后面所有东西都不会work。
 
-## 2. Declare the dataset
+## 2. 声明数据集
 
-Edit the four `TODO` fields in `RealRobot` in `data_utils/datasets.py`:
+编辑 `data_utils/datasets.py` 里 `RealRobot` 的四个 `TODO` 字段:
 
 ```python
 class RealRobot(H5DatasetMapBase):
     config = DataConfig(
-        sample_dt=1.0 / 15,                      # 1 / control_hz, wall-clock seconds
-        record_dt=None,                          # None -> infer from `timestamp`
-        camera_names=("exterior", "wrist"),      # third-person FIRST
-        ee_indices=(0,),                         # single arm
+        sample_dt=1.0 / 15,                      # 1 / control_hz, 真实墙钟秒数
+        record_dt=None,                          # None -> 从 `timestamp` 推断
+        camera_names=("exterior", "wrist"),      # 第三人称相机放第一个
+        ee_indices=(0,),                         # 单臂
         output_image_hw=(256, 256),
     )
 ```
 
-`camera_names[0]` is not cosmetic: it defines the reference frame for the entire action
-representation (`main_cam_embed` tags its tokens, `space_ee2cam` expresses every action
-in its coordinates). Put the third-person camera first, matching the pretraining
-datasets (LIBERO `agentview` then `eye_in_hand`; DROID `exterior` then `wrist`).
+`camera_names[0]` 不是无关紧要的顺序问题:它定义了整个动作表示的参考系(`main_cam_embed` 标记它的 token,`space_ee2cam` 把每个动作都表达在它的坐标系下)。把第三人称相机放第一个,与预训练数据保持一致(LIBERO 是 `agentview` 然后 `eye_in_hand`;DROID 是 `exterior` 然后 `wrist`)。
 
-`sample_dt` must be the real wall-clock period. It sets how far ahead the predicted
-chunk reaches: `sample_dt * sample_state_gaps * num_future_states` seconds — 2.13 s at
-the defaults.
+`sample_dt` 必须是真实的墙钟周期。它决定预测的 chunk 往前覆盖多久:`sample_dt * sample_state_gaps * num_future_states` 秒 —— 默认配置下是 2.13 秒。
 
-## 3. Fine-tune
+## 3. 微调
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train.py \
@@ -370,30 +334,75 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
   -s MY_ROBOT_EXP
 ```
 
-The `finetune_real` preset differs from the LIBERO ones in ways that all follow from the
-smaller dataset: 20k iterations instead of 70k, `max_lr=5e-5` instead of `1e-4`,
-`grad_clip=1.0`, `bs=16`, and EMA enabled from iteration 1k. `sample_multiplex=1000`
-inflates the episode list so an "epoch" is a usable length.
+`finetune_real` 预设与 LIBERO 那几个的差别都源于数据量更小:20k 步而不是 70k,`max_lr=5e-5` 而不是 `1e-4`,开启 `grad_clip=1.0`,`bs=16`,EMA 从第 1k 步开启。`sample_multiplex=1000` 把 episode 列表膨胀,让一个 "epoch" 有可用的长度。此外它默认 `lora_rank=16`,见下一节。
 
-Checkpoint loading behaviour:
-- `--pretrained_ckpt` loads **weights only** by default (`pretrained_weights_only=True`).
-  Fine-tuning is a new optimisation problem: `current_iters` resets to 0 and the LR
-  re-warms from zero, so inheriting the pretrain run's Adam moments would make the first
-  updates larger than intended. Pass `--pretrained_weights_only False` for the old
-  behaviour.
-- Loading is **strict** by default and reports exactly which tensors mismatch. If you
-  see a shape mismatch under `context_encoder.proj_*` or `context_encoder.post_attn`,
-  the checkpoint predates the `compact model` commit (122.4M vs the current 102.3M
-  params). Either use a current checkpoint or pass `--pretrained_strict False` to load
-  the compatible subset — the rest is then trained from scratch, which is stated loudly
-  in the log rather than happening silently.
-- `-c EXP_NAME` (resume) always restores the full optimiser state, unaffected by these
-  flags.
+Checkpoint 加载行为:
+- `--pretrained_ckpt` 默认**只加载权重**(`pretrained_weights_only=True`)。微调是一个新的优化问题:`current_iters` 归零、LR 从零重新 warmup,继承预训练的 Adam 动量会让最初几步的更新大于预期。传 `--pretrained_weights_only False` 恢复旧行为。
+- 加载默认是 **strict** 的,并会准确报告哪些张量不匹配。如果看到 `context_encoder.proj_*` 或 `context_encoder.post_attn` 下的 shape mismatch,说明这个 checkpoint 早于 `compact model` 那次提交(122.4M vs 现在的 102.3M 参数)。要么换一个当前版本的 checkpoint,要么传 `--pretrained_strict False` 只加载兼容的那部分 —— 剩下的部分会从随机初始化开始训,而且这件事会在日志里大声说明,不会静默发生。
+- `-c EXP_NAME`(续训)总是恢复完整的优化器状态,不受上述 flag 影响。
 
-## 4. Deploy
+## 3.5 LoRA 微调(小数据集的默认方案)
 
-Same three-process setup as LIBERO, but your client feeds real observations instead of a
-simulator. Start the nameserver and the policy server:
+在 `ContextEncoder` 上做 LoRA,DiffusionHead 保持全量训练。这是 `finetune_real` 的默认设置(`lora_rank=16`),理由很直接:ContextEncoder 占了 60% 的参数,而它学的是多视角几何融合 —— 这部分正好是从预训练里迁移得最好、也最不该被 70 条 episode 重新塑造的部分;DiffusionHead 才是需要拟合你这个任务动作分布的部分。
+
+`vla_base` 上的实际参数量:
+
+| 配置 | ContextEncoder 可训练 | DiffusionHead | 合计 |
+| --- | ---: | ---: | ---: |
+| `lora_rank=0`(全量,历史默认) | 60.95M | 41.39M | **102.34M** |
+| `lora_rank=8` | 1.09M | 41.39M | 42.48M |
+| **`lora_rank=16`(默认)** | **2.00M** | 41.39M | **43.39M** |
+| `lora_rank=32` | 3.82M | 41.39M | 45.21M |
+
+用法就是一个开关:
+
+```bash
+# LoRA (finetune_real 的默认行为,不需要额外传参)
+python train.py --config finetune_real --pretrained_ckpt PRETRAIN.pt -s EXP
+
+# 换 rank
+python train.py --config finetune_real --lora_rank 8  --pretrained_ckpt PRETRAIN.pt -s EXP_R8
+
+# 退回全量微调所有 102M 参数
+python train.py --config finetune_real --lora_rank 0  --pretrained_ckpt PRETRAIN.pt -s EXP_DENSE
+```
+
+也可以给 LIBERO 预设加 `--lora_rank 16`,这四个 arm(0/8/16/32)天然构成一组消融。
+
+### 具体训练了什么
+
+LoRA 注入 `ContextEncoder` 中所有注意力投影(`to_q`/`to_k`/`to_v` 及其融合形式 `to_qkv` 等)。融合投影的秩按矩阵个数放大(`to_qkv` → `3r`),所以**每个单独的投影拿到的秩都是 `r`**。
+
+除 LoRA 因子外,还保持可训练的有:**LayerNorm 的 affine 参数、所有 bias、`qformer.queries`、`main_cam_embed`**。这是标准的 "LoRA + norm/bias tuning" 配方 —— 它们几乎不花参数(合计 <1M),但能吸收低秩更新自己适应得很慢的分布偏移。其余部分(FFN、`proj_v`/`proj_l`/`proj_pe`)全部冻结。
+
+注意 `replace_with_lora_linear` 本身只冻结它包裹的那些 Linear,剩下的是 `setup_lora` 显式冻的 —— 否则 FFN 那几十 M 参数会照常训练,那就不是 LoRA 了。
+
+### 加载顺序是有约束的,不能颠倒
+
+`LoraLinear` 会把 `...to_q.weight` 改名成 `...to_q.lin.weight`,所以 state_dict 的布局取决于有没有注入 LoRA:
+
+| 场景 | 正确顺序 |
+| --- | --- |
+| 从预训练 ckpt 微调 | 先 `load_state_dict`(官方 ckpt 是纯净的,精确匹配),**再**注入 LoRA |
+| 续训 `-c` | **先**注入 LoRA,再 `load_state_dict`(ckpt 里已经有 LoRA key) |
+| 部署 | 注入 → 加载 → EMA `copy_to` → **最后** merge |
+
+这些顺序在 `train.py` 和 `infer_utils/planner.py` 里已经写死了,正常使用不需要操心。需要知道的是:
+
+- 顺序错了会抛 `RuntimeError` 并列出所有不匹配的 key,**不会静默地只加载一半**。
+- Checkpoint 里存了 `lora_rank` 字段。续训时如果它和当前 config 不一致,会直接报错而不是加载失败。
+- **`lora_rank > 0` 时必须传 `--pretrained_ckpt`**,否则直接拒绝运行:LoRA 冻结的基座权重如果本身是随机初始化的,等于 60% 的参数被永久卡在初始化状态。
+- 部署时的 merge 必须在 EMA `copy_to` **之后**:EMA 的 shadow 参数就是 LoRA 因子本身,先 merge 会把 EMA 权重丢掉。
+
+### 部署时的开销:零
+
+`infer_utils/planner.py` 的 `load_model` 会自动读取 checkpoint 里的 `lora_rank`,注入、加载、然后调用 `merge_lora_linear` 把 `A @ B` 折进基座权重。merge 之后模型退回成一个普通的 `ActionExpert`,没有任何 `LoraLinear` 残留,推理没有额外算子和显存开销。整条链路(训练态输出 vs 部署态 merge 后输出)的数值漂移在 float32 下约 `1e-6`。
+
+> 关于数值:LoRA 注入时 `B` 是零初始化的,所以 `lin(x) + (x @ A) @ B` 在函数意义上与 `lin(x)` 完全等价。但端到端测下来 context 输出会有约 `1e-6` 的漂移 —— 这不是逻辑错误:`lin(x) + 0` 会分配一个新张量,落在不同地址,可能走不同的 matmul/SDPA kernel 分块路径。已验证:把线程数钉到 1 时漂移显著减小,参数逐位相同,每个 `LoraLinear` 的输出与其基座 `Linear` 逐位相同。作为尺度参考,训练跑在 bfloat16 下,其 eps(~8e-3)比这个漂移大约 4000 倍。
+
+## 4. 部署
+
+和 LIBERO 一样的三进程结构,只是客户端喂的是真实观测而不是仿真器。启动命名服务和策略服务:
 
 ```bash
 pyro4-ns
@@ -402,31 +411,26 @@ CUDA_VISIBLE_DEVICES=0 python -m infer_utils.remote_service \
   --uri MY_ROBOT --ensemble 3
 ```
 
-Add `--ema` only if the run actually had EMA enabled (`finetune_real` does).
+只有在训练确实开了 EMA 时才加 `--ema`(`finetune_real` 是开的)。LoRA 不需要额外参数,`lora_rank` 从 checkpoint 里读。
 
-Your control loop then mirrors `examples/libero/eval.py`:
+你的控制循环参照 `examples/libero/eval.py`:
 
 ```python
 controller = get_shm_proxy("MY_ROBOT", ns_host="localhost", ns_port=9090)
-controller.set_config("RealRobot")     # keyed by the dataset class name
-controller.reset()                     # REQUIRED between episodes
+controller.set_config("RealRobot")     # 按数据集类名索引
+controller.reset()                     # 每条 episode 之间必须调用
 controller.set_prompt("pick up the red block")
 
 while not done:
-    controller.add_obs_frame(obs_frame)          # see TrajPlanner.add_obs_frame
+    controller.add_obs_frame(obs_frame)          # 见 TrajPlanner.add_obs_frame
     future_ee_poses, future_grippers, future_time, _ = controller.get_action()
     future_ee_poses  = future_ee_poses[:, 0]     # ee_indices == (0,)
     future_grippers  = future_grippers[:, 0]
     future_ee_poses, future_grippers = controller.ensemble_traj(
         future_ee_poses, future_grippers, future_time)
-    # execute the first few waypoints, then re-plan
+    # 执行前几个 waypoint, 然后重新规划
 ```
 
-`controller.reset()` between episodes is not optional: the ensembler keys on timestamps,
-which restart for a new episode, so stale chunks would otherwise be blended into the
-first actions of the next one.
+episode 之间的 `controller.reset()` 不是可选的:ensembler 是按时间戳索引的,而新 episode 的时间戳会重新从 0 开始,不 reset 的话上一条 episode 的残留 chunk 会被混进新 episode 的最初几个动作里。
 
-`obs_frame` uses the same schema as the HDF5 conversion — see the docstring of
-`TrajPlanner.add_obs_frame` for the exact dict layout, and `obs_libero2ours` in
-`examples/libero/eval.py` for a worked example.
-
+`obs_frame` 使用与 HDF5 转换相同的 schema —— 精确的 dict 布局见 `TrajPlanner.add_obs_frame` 的 docstring,完整示例见 `examples/libero/eval.py` 里的 `obs_libero2ours`。

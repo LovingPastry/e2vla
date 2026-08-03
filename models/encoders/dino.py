@@ -4,66 +4,90 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import nn, Tensor
 from torchvision.transforms import v2
-from transformers import Dinov2WithRegistersModel, BitImageProcessor
 
 
 class Dinov2Encoder(nn.Module):
-    REPO_ID = "facebook/dinov2-with-registers-base"
+    """Frozen DINOv2 (ViT-B/14 + 4 register tokens), loaded through ``torch.hub``.
+
+    This is the same network as the HuggingFace ``facebook/dinov2-with-registers-base``
+    checkpoint this class used to load -- that repo is a conversion of the upstream
+    ``dinov2_vitb14_reg`` weights -- but it goes to the original source instead of the
+    HF hub. Two consequences worth knowing:
+
+    * ``HF_ENDPOINT`` (the mirror set in ``envars.py``) does NOT apply. torch.hub pulls
+      the code from GitHub and the weights from ``dl.fbaipublicfiles.com``. Behind a
+      firewall, set ``DINOV2_HUB_SOURCE=local`` and ``DINOV2_HUB_REPO=/path/to/dinov2``
+      after cloning the repo yourself, and pre-place the ``.pth`` under ``$TORCH_HOME``.
+    * The upstream implementation uses xformers' memory-efficient attention when it is
+      installed and a plain matmul+softmax otherwise; it does not go through PyTorch
+      SDPA. Without xformers this is somewhat slower than the HF path was, but the
+      encoder is frozen and runs under ``no_grad``, so it only costs forward time.
+
+    Preprocessing constants are inlined rather than read from a processor config: the
+    old code overrode the processor's resize-then-center-crop with a direct resize to
+    ``crop_size`` anyway, and DINOv2 uses standard ImageNet statistics.
+    """
+
+    HUB_REPO = os.environ.get("DINOV2_HUB_REPO", "facebookresearch/dinov2")
+    HUB_SOURCE = os.environ.get("DINOV2_HUB_SOURCE", "github")
+    HUB_MODEL = os.environ.get("DINOV2_HUB_MODEL", "dinov2_vitb14_reg")
+
+    # ImageNet-1k statistics, what DINOv2 was trained with
+    IMAGE_MEAN = (0.485, 0.456, 0.406)
+    IMAGE_STD = (0.229, 0.224, 0.225)
+    INPUT_SIZE = (224, 224)  # 224 / 14 -> a 16x16 patch grid
 
     def __init__(self):
         super().__init__()
 
-        run_fp16 = torch.cuda.is_bf16_supported()
-        self.dino = Dinov2WithRegistersModel.from_pretrained(
-            self.REPO_ID,
-            attn_implementation="sdpa",
-            torch_dtype=torch.bfloat16 if run_fp16 else torch.float32,
-        )
+        run_fp16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        self.dtype = torch.bfloat16 if run_fp16 else torch.float32
 
-        image_processor = BitImageProcessor.from_pretrained(
-            self.REPO_ID,
-            use_fast=True
+        self.dino = torch.hub.load(
+            self.HUB_REPO,
+            self.HUB_MODEL,
+            source=self.HUB_SOURCE,
+            pretrained=True,
+            trust_repo=True,  # skip the interactive prompt; ignored when source="local"
         )
-        self.image_processor = image_processor
-        
-        self.num_regs = self.dino.embeddings.register_tokens.shape[1]  # (1, N_reg, C)
+        self.dino = self.dino.to(self.dtype).eval()
+
+        self.num_regs = self.dino.num_register_tokens  # 4 for the *_reg variants
         self.image_tform = v2.Compose([
-            v2.Resize(
-                size=(image_processor.crop_size["height"], image_processor.crop_size["width"]),
-                interpolation=v2.InterpolationMode.BICUBIC),
-            v2.Normalize(
-                mean=image_processor.image_mean, 
-                std=image_processor.image_std
-            ),
+            v2.Resize(size=self.INPUT_SIZE, interpolation=v2.InterpolationMode.BICUBIC),
+            v2.Normalize(mean=list(self.IMAGE_MEAN), std=list(self.IMAGE_STD)),
         ])
-    
+
     @property
     def input_size(self):
-        return (
-            self.image_processor.crop_size["height"],
-            self.image_processor.crop_size["width"]
-        )  # for dinov2-base, it is (224, 224)
-    
+        return self.INPUT_SIZE
+
     @property
     def output_size(self):
-        return (16, 16)
-    
+        return (
+            self.INPUT_SIZE[0] // self.patch_size,
+            self.INPUT_SIZE[1] // self.patch_size,
+        )  # (16, 16)
+
     @property
     def patch_size(self):
-        return self.dino.config.patch_size  # 14
-    
+        return self.dino.patch_size  # 14
+
     def encode_images(self, rgb: Tensor):
+        """Args: rgb (B, 3, H, W) float in [0, 1]. Returns (patch tokens, CLS token)."""
         pixel_values: Tensor = self.image_tform(rgb)
+        # Unlike HF, the upstream module does not cast its input for you: the patch-embed
+        # conv would raise on an fp32 input against bf16 weights.
+        pixel_values = pixel_values.to(self.dtype)
 
-        outputs = self.dino(
-            pixel_values=pixel_values,
-            output_attentions=False,
-            output_hidden_states=False,
-        )
+        # forward_features already splits off the CLS and register tokens, so no manual
+        # `x[:, 1 + num_regs:]` slice is needed. `x_norm_clstoken` is the post-LayerNorm
+        # CLS token, which is exactly what HF returned as `pooler_output` -- Dinov2Model
+        # has no learned pooler.
+        outputs = self.dino.forward_features(pixel_values)
 
-        x: Tensor = outputs["last_hidden_state"]  # (B, 1 + N_reg + N_patch, C)
-        gx: Tensor = outputs["pooler_output"]  # (B, C)
-        x_patchtokens = x[:, 1 + self.num_regs:]  # (B, N_patch, C)
+        x_patchtokens: Tensor = outputs["x_norm_patchtokens"]  # (B, N_patch, C)
+        gx: Tensor = outputs["x_norm_clstoken"]  # (B, C)
         return x_patchtokens, gx
 
 
