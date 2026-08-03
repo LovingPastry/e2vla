@@ -10,12 +10,29 @@ from .dit import DiT
 from .qformer import QFormerITM
 from .layers.utils import simple_mlp
 from .layers.utils import concat_mask
-from .layers.pe import SinusoidalPosEmb
+from .layers.pe import SinusoidalPosEmb, se3_inverse
 from .layers.attn_dn import FFWSelfAttentionLayers, init_xncoder
 from .layers.rot_transforms import matrix_to_rotation_6d, rotation_6d_to_matrix
 
 
 class ContextEncoder(nn.Module):
+    """Frozen VLM features -> a short, fixed-length context for the diffusion head.
+
+    Pipeline: project both vision backbones into hdim and sum -> add the 2D coordinate
+    PE -> `pre_attn` (self-attn over all cameras' patches, cross-attn to language, with
+    camera-pose PRoPE) -> QFormer compresses Ncam*Lv patches to 64 queries -> `post_attn`.
+
+    The compression is not optional: with Ncam cameras at Lv patches each, feeding the
+    raw tokens to every denoising step of the head would dominate inference cost.
+
+    Three positional encodings do three different jobs here:
+      * `proj_pe(norm_xy)` -- additive, absolute position on the image plane.
+        zero-initialised so it does not perturb the frozen features early in training.
+      * PRoPE(extrinsics)  -- multiplicative, applied inside attention; makes attention
+        between two patches depend on the *relative* pose of their cameras.
+      * `main_cam_embed`   -- marks camera 0, the frame actions are expressed in.
+    """
+
     def __init__(self, hdim: int, num_heads: int, num_layers: int):
         super().__init__()
         self.proj_v = nn.ModuleList([
@@ -37,7 +54,9 @@ class ContextEncoder(nn.Module):
 
     def reset_parameters(self):
         init_xncoder(self.post_attn.num_layers, self.post_attn)
+        # zero both weight and bias, otherwise pe2d is a random constant offset at init
         nn.init.zeros_(self.proj_pe[-1].weight)
+        nn.init.zeros_(self.proj_pe[-1].bias)
 
     def forward(
         self,
@@ -69,10 +88,12 @@ class ContextEncoder(nn.Module):
             context: (B, Ncam*Lt, hdim)
             context_mask: (B, Ncam*Lt)
         """
-        B, T, Ncam, _, H, W = vl_obs["rgb"].shape
+        batch_size, _, num_cam, _, _, _ = vl_obs["rgb"].shape
         obs_extrinsics = vl_obs["extrinsics"]  # (B, To, Ncam, 4, 4)
 
-        # get relative camera extrinsic referring to camera 0 at the latest timestep
+        # Rebase every camera pose onto camera 0 at the latest timestep. PRoPE only ever
+        # uses relative poses, so the absolute world origin must not leak in -- otherwise
+        # the model overfits to each dataset's arbitrary world frame.
         cam0_extr_ref = torch.inverse(obs_extrinsics[:, -1:, 0:1]) @ obs_extrinsics  # (B, To, Ncam, 4, 4)
         x_v: Tensor = self.proj_v[0](vl_feature["vision_embeds"][0]) + \
                       self.proj_v[1](vl_feature["vision_embeds"][1])  # (B, Ncam, Lv, C)
@@ -81,12 +102,25 @@ class ContextEncoder(nn.Module):
         mask_v = vl_feature["vision_mask"]  # (B, Ncam, Lv)
         mask_l = vl_feature["lang_mask"]  # (B, La)
 
-        # camera pose as positional encoding
-        extrinsic_pe = cam0_extr_ref[:, -1]  # (B, Ncam, 4, 4), select the latest frame
-        extrinsic_pe = extrinsic_pe[:, :, None, :, :].expand(B, Ncam, x_v.shape[-2], 4, 4)
-        extrinsic_pe = rearrange(extrinsic_pe, "b n l r c -> b (n l) r c")
+        # camera pose as multiplicative positional encoding (PRoPE)
+        num_patch = x_v.shape[-2]
+        extrinsic_wcT = cam0_extr_ref[:, -1]  # (B, Ncam, 4, 4), select the latest frame
+        # Invert once here, on (B, Ncam, 4, 4). PRoPE needs the inverse for every query
+        # token in every layer; inverting after the expand would redo the same Ncam
+        # matrices Lv times per layer. se3_inverse is the analytic rigid-transform
+        # inverse -- valid because cam0_extr_ref is a product of rigid transforms.
+        extrinsic_cwT = se3_inverse(extrinsic_wcT)  # (B, Ncam, 4, 4)
 
-        # get the latest frame and projection
+        def expand_to_tokens(extr: Tensor):
+            """(B, Ncam, 4, 4) -> (B, Ncam*Lv, 4, 4): every patch inherits its camera's
+            pose. `expand` keeps this a view, so no Lv-fold memory blowup."""
+            extr = extr[:, :, None, :, :].expand(batch_size, num_cam, num_patch, 4, 4)
+            return rearrange(extr, "b n l r c -> b (n l) r c")
+
+        extrinsic_pe = expand_to_tokens(extrinsic_wcT)
+        extrinsic_pe_inv = expand_to_tokens(extrinsic_cwT)
+
+        # flatten cameras into the token axis: attention runs over all views jointly
         x_v = rearrange(x_v, "b n l c -> b (n l) c")
         pe2d = rearrange(self.proj_pe(norm_xy_ds), "b n l c -> b (n l) c")
         if mask_v is not None:
@@ -94,21 +128,25 @@ class ContextEncoder(nn.Module):
 
         # SA before qformer
         with torch.autocast(
-            x_v.device.type, 
+            x_v.device.type,
             torch.bfloat16 if fp16 else torch.float32
         ):
             x_v: Tensor = self.pre_attn(
-                x=x_v + pe2d,  # add positional encoding
-                x_pe=extrinsic_pe, 
+                x=x_v + pe2d,  # additive 2D positional encoding
+                x_pe=extrinsic_pe,
                 x_mask=mask_v,
                 conds=[x_l],
                 cond_masks=[mask_l],
-                films=None
+                films=None,
+                x_pe_inv=extrinsic_pe_inv
             )
 
+        # tag camera 0's tokens: actions live in its frame, so the head must be able to
+        # tell which view defines "forward". clone() because pre_attn's output may be a
+        # view and the next line writes in place.
         x_v = x_v.clone()
-        L = x_v.shape[1] // Ncam
-        x_v[:, :L] = x_v[:, :L] + self.main_cam_embed  # the first camera as main camera
+        num_patch_flat = x_v.shape[1] // num_cam
+        x_v[:, :num_patch_flat] = x_v[:, :num_patch_flat] + self.main_cam_embed
 
         with torch.autocast(
             x_v.device.type, 
@@ -132,17 +170,29 @@ class ContextEncoder(nn.Module):
 
 
 class DiffusionHead(nn.Module):
-    """
-    - Input: image observations and noisy action at `t`
-    - Output: noisy action at `t-1`
+    """DDIM epsilon predictor over a chunk of camera-frame end-effector actions.
+
+    - Input: the encoded observation context and the noisy action chunk at step `t`
+    - Output: the predicted noise, from which the scheduler derives step `t-1`
+
+    Two different "times" run through this module; keep them apart:
+      * `timestep`     -- the denoising step, a global condition driving adaLN/FiLM
+      * chunk position -- where an action sits inside the horizon, an additive
+                          sinusoidal embedding (`traj_time_embed`)
+
+    NOTE on the history encoder: `hist_enc` is built for `action_dim - 1` inputs and is
+    fed `history[..., :action_dim-1]`, i.e. the t3r6 pose delta only. Gripper openness
+    (the last channel) is deliberately withheld from history so the model cannot simply
+    copy the previous gripper command; it has to read openness off the wrist camera.
     """
 
-    def __init__(self, hdim: int, num_heads: int, act_dim: int, num_layers: int):
+    def __init__(self, hdim: int, num_heads: int, action_dim: int, num_layers: int):
         super().__init__()
-        self.act_dim = act_dim
+        self.action_dim = action_dim
         self.num_layers = num_layers
-        self.hist_enc = simple_mlp([act_dim-1, hdim, hdim], ln=True)
-        self.traj_enc = simple_mlp([act_dim, hdim, hdim], ln=True)
+        # module attribute names are load-bearing: they are the checkpoint state_dict keys
+        self.hist_enc = simple_mlp([action_dim-1, hdim, hdim], ln=True)
+        self.traj_enc = simple_mlp([action_dim, hdim, hdim], ln=True)
         self.abs_pos_enc = simple_mlp([3, hdim, hdim], ln=True)
         self.traj_time_embed = SinusoidalPosEmb(hdim)
         self.denoising_time_embed = nn.Sequential(
@@ -154,20 +204,36 @@ class DiffusionHead(nn.Module):
         self.traj_context_attn = DiT(hdim, num_heads, num_layers, use_adaln=True)
 
         ### final mlp
-        self.act_head = simple_mlp([hdim, hdim, act_dim], ln=True)
+        self.act_head = simple_mlp([hdim, hdim, action_dim], ln=True)
         self.reset_parameters()
-    
+
     def reset_parameters(self):
+        # Zero both weight AND bias. A zeroed weight with a random bias still injects a
+        # constant offset, which defeats the point of starting these branches at zero:
+        # `abs_pos_enc` must not perturb the features at init, and `act_head` must
+        # predict exactly zero noise at init.
         nn.init.zeros_(self.abs_pos_enc[-1].weight)
+        nn.init.zeros_(self.abs_pos_enc[-1].bias)
         nn.init.zeros_(self.act_head[-1].weight)
-    
+        nn.init.zeros_(self.act_head[-1].bias)
+
     def pos_rel2abs(self, cur_wcT: Tensor, cur_weT: Tensor, t3r6: Tensor):
-        """
+        """Relative action encoding -> absolute ee position in the camera frame.
+
+        Actions are stored as a delta from the *current* ee pose, expressed in the
+        camera's orientation (see `space_ee2cam`). That representation is translation
+        invariant, which is what we want to predict, but it carries no information
+        about where in the workspace the arm actually is. This recovers the absolute
+        position so it can be fed back as an additional positional encoding.
+
+        Mirrors `space_cam2ee`, but stops in the camera frame instead of going all the
+        way back to world: ^{cam}T_{ee} = (^{world}T_{cam})^-1 @ ^{world}T_{ee} @ delta
+
         Args:
             cur_wcT (Tensor): (B, 4, 4), ^{world} T _{cam}
             cur_weT (Tensor): (B, 4, 4), ^{world} T _{ee}
-            t3r6 (Tensor): (B, T, 9)
-        
+            t3r6 (Tensor): (B, T, 9), 3 translation + 6D rotation, camera-relative
+
         Returns:
             traj_cet (Tensor), traj ee pos in camera frame, shape (B, T, 3)
         """
@@ -187,66 +253,77 @@ class DiffusionHead(nn.Module):
         return traj_cet
 
     def forward(
-        self, 
-        denoise_timestep: Tensor, 
-        trajectory: Tensor, 
-        cur_wcT: Tensor, 
-        cur_weT: Tensor, 
-        history: Tensor, 
+        self,
+        timestep: Tensor,
+        noisy_actions: Tensor,
+        cur_wcT: Tensor,
+        cur_weT: Tensor,
+        history: Tensor,
         conds: List[Tensor],
         cond_masks: Optional[List[Optional[Tensor]]],
         fp16: bool
     ):
-        """
+        """One denoising step.
+
+        History and the noisy action chunk are concatenated into a single sequence so
+        self-attention can relate the two; only the action segment is read out at the
+        end. History acts as clean, always-available conditioning.
+
         Args:
-            denoise_timestep: (B,), denoising time step
-            trajectory: (B, Ta, act_dim)
-            cur_wcT: (B, 4, 4)
-            cur_weT: (B, 4, 4)
-            history: (B, nhist, act_dim)
-            conds: [(B, Lc, hdim)]
-            cond_masks: [(B, Lc)]
-            films: [(B, hdim)]
-            fp16 (bool): use bfloat16
+            timestep: (B,), denoising step (NOT the position within the chunk)
+            noisy_actions: (B, Ta, action_dim), the noisy action chunk
+            cur_wcT: (B, 4, 4), ^{world} T _{cam}
+            cur_weT: (B, 4, 4), ^{world} T _{ee}
+            history: (B, nhist, action_dim), past actions in the same encoding
+            conds: [(B, Lc, hdim)], observation context from ContextEncoder
+            cond_masks: [(B, Lc)] or [None]
+            fp16 (bool): use bfloat16 autocast for the attention stack
 
         Returns:
-            action_epsilon: (B, Ta, act_dim)
+            pred_noise: (B, Ta, action_dim)
         """
-        denoise_time_embed = self.denoising_time_embed(denoise_timestep)  # (B, hdim)
-        film = denoise_time_embed
+        time_embed = self.denoising_time_embed(timestep)  # (B, hdim)
+        film = time_embed
 
-        # noisy trajectory add temporal positional embeddings
-        B, nhist, _ = history.shape
-        B, Ta, _ = trajectory.shape
-        hist_feats = self.hist_enc(history[:, :, :self.act_dim-1])  # (B, nhist, hdim)
-        traj_feats = self.traj_enc(trajectory[:, :, :self.act_dim])  # (B, Ta, hdim)
+        batch_size, history_horizon, _ = history.shape
+        batch_size, action_horizon, _ = noisy_actions.shape
+        # gripper openness is intentionally dropped from history (see class docstring)
+        history_feats = self.hist_enc(history[:, :, :self.action_dim-1])  # (B, nhist, hdim)
+        action_feats = self.traj_enc(noisy_actions[:, :, :self.action_dim])  # (B, Ta, hdim)
 
-        full_traj_feats = torch.cat([hist_feats, traj_feats], dim=1)  # (B, nhist+Ta, hdim)
-        full_traj_time_pe = self.traj_time_embed(torch.arange(nhist + Ta).to(traj_feats))
-        full_traj_feats = full_traj_feats + full_traj_time_pe[None].expand(B, -1, -1)  # (B, nhist+Ta, hdim)
+        # additive sinusoidal PE over position within [history ; chunk]
+        seq_feats = torch.cat([history_feats, action_feats], dim=1)  # (B, nhist+Ta, hdim)
+        seq_pos_pe = self.traj_time_embed(
+            torch.arange(history_horizon + action_horizon).to(action_feats))
+        seq_feats = seq_feats + seq_pos_pe[None].expand(batch_size, -1, -1)
 
-        # get absolute pos under camera, add additional positional encoding
+        # absolute ee position in the camera frame as an extra positional encoding.
+        # no_grad wraps only the geometry: the actions are the variable being denoised,
+        # so this is treated as a coordinate lookup, not a differentiable path. The
+        # abs_pos_enc call itself stays outside so its weights still get gradients.
         with torch.no_grad():
-            full_traj_t3r6 = torch.cat([history[..., :9], trajectory[..., :9]], dim=1)  # (B, nhist+Ta, 9)
-            abs_pos = self.pos_rel2abs(cur_wcT, cur_weT, full_traj_t3r6)
-        full_traj_feats = full_traj_feats + self.abs_pos_enc(abs_pos)
+            seq_t3r6 = torch.cat(
+                [history[..., :9], noisy_actions[..., :9]], dim=1)  # (B, nhist+Ta, 9)
+            abs_pos = self.pos_rel2abs(cur_wcT, cur_weT, seq_t3r6)
+        seq_feats = seq_feats + self.abs_pos_enc(abs_pos)
 
         with torch.autocast(
-            denoise_time_embed.device.type, 
+            time_embed.device.type,
             torch.bfloat16 if fp16 else torch.float32
         ):
-            full_traj_feats = self.traj_context_attn(
-                x=full_traj_feats, 
-                x_pe=None, 
+            seq_feats = self.traj_context_attn(
+                x=seq_feats,
+                x_pe=None,
                 x_mask=None,
                 conds=conds,
-                cond_masks=cond_masks, 
+                cond_masks=cond_masks,
                 films=[film]*len(conds)
             )
 
-        traj_feats = full_traj_feats[:, nhist:nhist+Ta]  # (B, Ta, hdim)
-        action = self.act_head(traj_feats)
-        return action
+        # drop the history segment; only the chunk is supervised
+        action_feats = seq_feats[:, history_horizon:history_horizon+action_horizon]
+        pred_noise = self.act_head(action_feats)
+        return pred_noise
 
 
 class ActionExpert(nn.Module):
@@ -261,7 +338,8 @@ class ActionExpert(nn.Module):
     ):
         super().__init__()
         self.context_encoder = ContextEncoder(hdim, num_heads, num_layers=num_context_layers)
-        self.dp_head = DiffusionHead(hdim, num_heads, self.act_dim, num_layers=num_diffusion_layers)
+        self.dp_head = DiffusionHead(hdim, num_heads, self.action_dim,
+                                     num_layers=num_diffusion_layers)
 
         self.noise_scheduler = DDIMScheduler(
             num_train_timesteps=diffusion_timesteps,
@@ -277,42 +355,48 @@ class ActionExpert(nn.Module):
         self.inference_scheduler = self.noise_scheduler
 
     @property
-    def act_dim(self):
-        """dimension of action defined in camera frame"""
+    def action_dim(self):
+        """Action layout in the camera frame: 3 translation + 6D rotation + 1 openness."""
         return 10
 
     def iterative_denoise(
-        self, 
-        traj_shape: Tuple[int, int, int],
+        self,
+        actions_shape: Tuple[int, int, int],
         fixed_inputs: Dict[str, Tensor],
         initial_noise: Optional[Tensor] = None
     ):
-        """
+        """Full DDIM reverse loop, from pure noise to an action chunk.
+
+        `fixed_inputs` is everything that does not change across denoising steps (the
+        observation context, the current camera/ee poses, the action history); it is
+        computed once by `forward` and splatted into the head each step.
+
         Args:
-            trajectory_shape: (B, Ta, act_dim)
-            fixed_inputs: inputs for diffusion head
-            initial_noise: (B, Ta, act_dim) or None
+            actions_shape: (B, Ta, action_dim)
+            fixed_inputs: keyword arguments forwarded to `dp_head`
+            initial_noise: (B, Ta, action_dim), sampled if None
 
         Returns:
-            trajectory: (B, Ta, act_dim)
+            actions: (B, Ta, action_dim)
         """
         if initial_noise is None:
-            B, Ta, _ = traj_shape
+            batch_size, action_horizon, _ = actions_shape
             device = next(iter(fixed_inputs.values())).device
-            initial_noise = torch.randn(B, Ta, self.act_dim, device=device)
-        
+            initial_noise = torch.randn(batch_size, action_horizon, self.action_dim,
+                                        device=device)
+
         self.inference_scheduler.set_timesteps(self.inference_timesteps)
-        trajectory = initial_noise
+        actions = initial_noise
         for t in self.inference_scheduler.timesteps:
-            out = self.dp_head(
-                t * torch.ones(trajectory.shape[0], device=trajectory.device), 
-                trajectory,
+            pred_noise = self.dp_head(
+                t * torch.ones(actions.shape[0], device=actions.device),
+                actions,
                 **fixed_inputs
             )
-            trajectory = self.inference_scheduler.step(
-                out[..., :self.act_dim], t, trajectory[..., :self.act_dim]
+            actions = self.inference_scheduler.step(
+                pred_noise[..., :self.action_dim], t, actions[..., :self.action_dim]
             ).prev_sample
-        return trajectory
+        return actions
 
     def forward(
         self, 
@@ -364,41 +448,49 @@ class ActionExpert(nn.Module):
             loss (Tensor): scalar tensor
             metrics (Dict[str, Tensor]): metrics for logging
         """
+        # camera 0 at the latest timestep is the reference frame for the whole action
+        # representation -- ContextEncoder builds its PRoPE relative to the same camera
         latest_cam_poses = vl_obs["extrinsics"][:, -1]  # (B, Ncam, 4, 4)
         current_cam_pose = latest_cam_poses[:, 0]  # first camera, (B, 4, 4)
-        
+
         # patch features as current observation context in diffusion
         cond, cond_mask = self.context_encoder(
             vl_obs=vl_obs,
             vl_feature=vl_feature,
             fp16=fp16,
         )
-        
+
+        # Flatten (B, Nee) -> B' by keeping only the valid end-effectors. Each valid ee
+        # becomes an independent sample sharing its batch element's observation context.
+        # `batch_index` maps flat position -> original batch index; boolean masking with
+        # valid_ee_mask walks (B, Nee) in row-major order, so the two orders agree.
         valid_ee_per_batch = valid_ee_mask.sum(dim=-1)  # (B,)
-        sel_index = torch.cat([torch.empty(n, dtype=torch.long).fill_(b) 
-                               for b, n in enumerate(valid_ee_per_batch.tolist())]
-                              ).to(valid_ee_mask.device)
-        B_expand = len(sel_index)  # B'
-        
+        batch_index = torch.cat([torch.empty(n, dtype=torch.long).fill_(b)
+                                 for b, n in enumerate(valid_ee_per_batch.tolist())]
+                                ).to(valid_ee_mask.device)
+        flat_batch_size = len(batch_index)  # B'
+
+        # (B, nhist, Nee, 17) -> (B, Nee, nhist, 17) so the ee axis is maskable
         history_action = states2action(
-            current_cam_pose[sel_index], 
-            current_ee_pose[valid_ee_mask], 
+            current_cam_pose[batch_index],
+            current_ee_pose[valid_ee_mask],
             history_ee_states.transpose(1, 2)[valid_ee_mask]
         )  # (B', nhist, 10)
 
-        B, Ta, Nee, _ = gt_future_ee_states.shape
+        batch_size, action_horizon, num_ee, _ = gt_future_ee_states.shape
         if not inference:
             gt_future_action = states2action(
-                current_cam_pose[sel_index], 
-                current_ee_pose[valid_ee_mask], 
+                current_cam_pose[batch_index],
+                current_ee_pose[valid_ee_mask],
                 gt_future_ee_states.transpose(1, 2)[valid_ee_mask]
             )  # (B', Ta, 10)
 
+        # everything the denoiser needs that is constant across denoising steps
         fixed_inputs = dict(
-            history=history_action,  # history in camera 0, shape (B', nhist, act_dim)
-            conds=[cond[sel_index]],
-            cond_masks=[cond_mask[sel_index] if cond_mask is not None else cond_mask],
-            cur_wcT=current_cam_pose[sel_index],      # (B', 4, 4) 
+            history=history_action,  # history in camera 0, shape (B', nhist, action_dim)
+            conds=[cond[batch_index]],
+            cond_masks=[cond_mask[batch_index] if cond_mask is not None else cond_mask],
+            cur_wcT=current_cam_pose[batch_index],    # (B', 4, 4)
             cur_weT=current_ee_pose[valid_ee_mask],   # (B', 4, 4)
             fp16=fp16
         )
@@ -406,59 +498,61 @@ class ActionExpert(nn.Module):
         ###################### Inference ######################
         if inference:
             pred_actions = self.iterative_denoise(
-                traj_shape=(B_expand, Ta, self.act_dim),
+                actions_shape=(flat_batch_size, action_horizon, self.action_dim),
                 fixed_inputs=fixed_inputs
-            )  # (B', Ta, act_dim)
+            )  # (B', Ta, action_dim)
             pred_future_ee_states = action2states(
-                current_cam_pose[sel_index],    # (B', 4, 4)
+                current_cam_pose[batch_index],  # (B', 4, 4)
                 current_ee_pose[valid_ee_mask], # (B', 4, 4)
-                pred_actions  # (B', Ta, act_dim)
+                pred_actions  # (B', Ta, action_dim)
             )  # (B', Ta, 4*4+1)
-            
-            # put the predition back
-            pred_future_ee_states_full = pred_future_ee_states.new_zeros(B, Nee, Ta, 4*4+1)
+
+            # scatter B' back to (B, Nee); invalid slots stay identity pose / zero gripper
+            pred_future_ee_states_full = pred_future_ee_states.new_zeros(
+                batch_size, num_ee, action_horizon, 4*4+1)
             pred_future_ee_states_full[..., :16] = torch.eye(4).ravel().to(pred_future_ee_states)
             pred_future_ee_states_full[valid_ee_mask] = pred_future_ee_states
             return pred_future_ee_states_full.transpose(1, 2).contiguous()  # (B, Ta, Nee, 17)
 
         ###################### Training ######################
         # sample noise
-        noise = torch.randn(B_expand, Ta, self.act_dim, 
+        noise = torch.randn(flat_batch_size, action_horizon, self.action_dim,
                             device=gt_future_ee_states.device)
 
         # sample a random timestep
         timesteps = torch.randint(
             0,
             self.noise_scheduler.config.num_train_timesteps,
-            size=(B_expand,), 
+            size=(flat_batch_size,),
             device=noise.device
         )
 
-        # add noise to the clean trajectory
-        noisy_trajectory = self.noise_scheduler.add_noise(
+        # forward diffusion, then a single denoising step (not the full loop)
+        noisy_actions = self.noise_scheduler.add_noise(
             gt_future_action, noise,
             timesteps
         )
 
-        # one step denoising
-        pred = self.dp_head(timesteps, noisy_trajectory, **fixed_inputs)
+        pred_noise = self.dp_head(timesteps, noisy_actions, **fixed_inputs)
         target = get_target(gt_future_action, noise, timesteps, self.noise_scheduler)
         
         # # drop too aggresive actions
-        # debug_gt_ee_pose = gt_future_ee_states.transpose(1, 2)[valid_ee_mask][..., :16].reshape(B_expand, -1, 4, 4)
+        # debug_gt_ee_pose = gt_future_ee_states.transpose(1, 2)[valid_ee_mask][..., :16].reshape(flat_batch_size, -1, 4, 4)
         # debug_gt_ee_pos = debug_gt_ee_pose[..., :3, 3]  # (B', Ta, 3)
         # delta_norm = (debug_gt_ee_pos[:, 1:] - debug_gt_ee_pos[:, :-1]).norm(dim=-1)
         # debug_mask = delta_norm < 0.2  # (B', Ta-1)
         # debug_mask[..., 1:-1] = debug_mask[..., 1:-1] & debug_mask[..., :-2] & debug_mask[..., 2:]
         # debug_mask = torch.cat([debug_mask[:, 0:1], debug_mask], dim=-1)  # (B', Ta)
-        # # filter 
-        # pred = pred[debug_mask]
+        # # filter
+        # pred_noise = pred_noise[debug_mask]
         # target = target[debug_mask]
 
-        # loss calculation
-        pos_loss = F.l1_loss(pred[..., 0:3], target[..., 0:3], reduction="mean")
-        rot_loss = F.l1_loss(pred[..., 3:9], target[..., 3:9], reduction="mean")
-        openness_loss = F.l1_loss(pred[..., 9:10], target[..., 9:10], reduction="mean")
+        # Loss is split per action channel only so the three terms can be weighted and
+        # logged separately -- with prediction_type="epsilon" all three slices are parts
+        # of the same standard normal, so the weights are pure loss shaping.
+        pos_loss = F.l1_loss(pred_noise[..., 0:3], target[..., 0:3], reduction="mean")
+        rot_loss = F.l1_loss(pred_noise[..., 3:9], target[..., 3:9], reduction="mean")
+        openness_loss = F.l1_loss(pred_noise[..., 9:10], target[..., 9:10], reduction="mean")
 
         total_loss = 30 * pos_loss + 10 * rot_loss + 10 * openness_loss
         metrics = {
@@ -471,14 +565,29 @@ class ActionExpert(nn.Module):
 
 
 def space_ee2cam(cur_wcT: Tensor, cur_weT: Tensor, fut_weT: Tensor):
-    """
+    """World-frame future ee poses -> the camera-relative action the model predicts.
+
+    This is the encoding side of the action representation, and the exact inverse of
+    `space_cam2ee`. Two things happen:
+
+    1. Absolute -> relative: the future pose becomes a delta from the current ee pose,
+       ^{e1}T_{e2} = (^{w}T_{e1})^-1 @ ^{w}T_{e2}. The policy predicts motion, not
+       absolute placement, so it transfers across workspace positions.
+    2. ee frame -> camera orientation: the delta is conjugated by ^{cam}R_{ee} so it is
+       expressed in the camera's axes. This is what ties the action to what the model
+       can actually see; get the direction of this rotation wrong and the loss still
+       converges while the robot moves along the wrong axes.
+
+    Only the rotation ceR is used for the conjugation (not the full transform): a delta
+    is a relative quantity, so it must be rotated, never translated.
+
     Args:
         cur_wcT (Tensor): (B, 4, 4), ^{world} T _{cam}
         cur_weT (Tensor): (B, 4, 4), ^{world} T _{ee}
         fut_weT (Tensor): (B, T, 4, 4), future ee pose in world frame
-    
+
     Returns:
-        t3r6 (Tensor): some repr of ^{cam} v _{ee} * dt, shape (B, T, 9)
+        t3r6 (Tensor): 3 translation + 6D rotation, camera-relative, shape (B, T, 9)
     """
     e1e2T = torch.inverse(cur_weT[:, None]) @ fut_weT  # (B, T, 4, 4)
     e1e2R = e1e2T[:, :, :3, :3]  # (B, T, 3, 3)
@@ -494,12 +603,17 @@ def space_ee2cam(cur_wcT: Tensor, cur_weT: Tensor, fut_weT: Tensor):
 
 
 def space_cam2ee(cur_wcT: Tensor, cur_weT: Tensor, t3r6: Tensor):
-    """
+    """Camera-relative action -> world-frame future ee poses. Inverse of `space_ee2cam`.
+
+    Note `ecT` here is (^{world}T_{ee})^-1 @ ^{world}T_{cam}, i.e. the *opposite*
+    direction from `space_ee2cam`'s `ceT`, which is what makes this the inverse rather
+    than a repeat of the same rotation.
+
     Args:
         cur_wcT (Tensor): (B, 4, 4), ^{world} T _{cam}
         cur_weT (Tensor): (B, 4, 4), ^{world} T _{ee}
-        t3r6 (Tensor): (B, T, 9)
-    
+        t3r6 (Tensor): (B, T, 9), 3 translation + 6D rotation, camera-relative
+
     Returns:
         fut_weT (Tensor), future ee pose in world frame, shape (B, T, 4, 4)
     """
@@ -519,14 +633,19 @@ def space_cam2ee(cur_wcT: Tensor, cur_weT: Tensor, t3r6: Tensor):
 
 
 def states2action(cur_wcT: Tensor, cur_weT: Tensor, ee_states: Tensor):
-    """
+    """Dataset ee states -> model action space. The dataset/model boundary.
+
+    Applies `space_ee2cam` to the pose and rescales gripper openness from the dataset's
+    [0, 1] to the model's [-1, 1], matching the zero-centred noise the diffusion head
+    operates on.
+
     Args:
         cur_wcT (Tensor): (B, 4, 4), ^{world} T _{cam}
         cur_weT (Tensor): (B, 4, 4), ^{world} T _{ee}
-        ee_states (Tensor): (B, T, 16 or 17)
-    
+        ee_states (Tensor): (B, T, 16 or 17), flattened 4x4 pose [+ openness in [0,1]]
+
     Returns:
-        action (Tensor): (B, T, 9 or 10)
+        action (Tensor): (B, T, 9 or 10), t3r6 [+ openness in [-1,1]]
     """
     B, Ta, C = ee_states.shape
     weT = ee_states[:, :, :16].view(B, Ta, 4, 4)
@@ -540,14 +659,15 @@ def states2action(cur_wcT: Tensor, cur_weT: Tensor, ee_states: Tensor):
 
 
 def action2states(cur_wcT: Tensor, cur_weT: Tensor, action: Tensor):
-    """
+    """Model action space -> ee states the robot can execute. Inverse of `states2action`.
+
     Args:
         cur_wcT (Tensor): (B, 4, 4), ^{world} T _{cam}
         cur_weT (Tensor): (B, 4, 4), ^{world} T _{ee}
-        action (Tensor): (B, T, 9 or 10)
-    
+        action (Tensor): (B, T, 9 or 10), t3r6 [+ openness in [-1,1]]
+
     Returns:
-        ee_states (Tensor): (B, T, 16 or 17)
+        ee_states (Tensor): (B, T, 16 or 17), flattened 4x4 pose [+ openness in [0,1]]
     """
     B, Ta, C = action.shape
     t3r6 = action[:, :, :9]
@@ -560,23 +680,32 @@ def action2states(cur_wcT: Tensor, cur_weT: Tensor, action: Tensor):
         return torch.cat([weT, openness], dim=-1)
 
 
-def get_target(traj: Tensor, noise: Tensor, timesteps: Tensor, scheduler: DDIMScheduler):
-    """returns supervision depending on scheduler type"""
+def get_target(actions: Tensor, noise: Tensor, timesteps: Tensor, scheduler: DDIMScheduler):
+    """Supervision target matching the scheduler's parameterisation.
+
+    Args:
+        actions (Tensor): (B, Ta, action_dim), the clean action chunk
+        noise (Tensor): (B, Ta, action_dim), the noise mixed into it
+        timesteps (Tensor): (B,), the sampled diffusion steps
+        scheduler: supplies `prediction_type`
+    """
     pred_type = scheduler.config.prediction_type
     if pred_type == "epsilon":
         target = noise
     if pred_type == "sample":
-        target = traj
+        target = actions
     if pred_type == "v_prediction":
-        target = scheduler.get_velocity(traj, noise, timesteps) 
+        target = scheduler.get_velocity(actions, noise, timesteps)
     return target
 
 
 def count_parameters():
     model = ActionExpert(
         hdim=256,
-        diffusion_timesteps=100,
         num_heads=4,
+        num_context_layers=8,
+        num_diffusion_layers=4,
+        diffusion_timesteps=100,
     )
 
     modules = [

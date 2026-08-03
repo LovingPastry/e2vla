@@ -39,6 +39,9 @@ class MySimpleMHA(nn.Module):
         self.flash = flash
         self.qk_norm = qk_norm
         self.pe_type = pe_type
+        if pe_type == "prope":
+            assert self.head_dim % 4 == 0, \
+                "prope reshapes head_dim into 4-vectors, but head_dim = {}".format(self.head_dim)
 
         self.proj_opt = proj_opt
         if proj_opt == ProjOpt.QKV:
@@ -129,39 +132,44 @@ class MySimpleMHA(nn.Module):
         self, 
         x: Tensor, 
         c: Tensor, 
-        x_pe: Tensor = None, 
-        c_pe: Tensor = None, 
+        x_pe: Tensor = None,
+        c_pe: Tensor = None,
         attn_mask: Tensor = None,
         return_attn_weights = False,
         average_attn_weights = True,
+        x_pe_inv: Tensor = None,
     ):
         """
         Arguments:
         - x: (B, Lx, C)
         - c: (B, Lc, C), context
         - x_pe:
-            * if pe_type == rope, shape of x_pe = (B, Lx, H, 2)
+            * if pe_type == rope, shape of x_pe = (B, Lx, HD, 2)
             * if pe_type == prope: shape of x_pe = (B, Lx, 4, 4), camera to world
         - c_pe:
-            * if pe_type == rope: shape of c_pe = (B, Lc, H, 2)
+            * if pe_type == rope: shape of c_pe = (B, Lc, HD, 2)
             * if pe_type == prope: shape of c_pe = (B, Lc, 4, 4), camera to world
         - attn_mask: (B, Lc) or (B, Lx, Lc) or (B, NH, Lx, Lc)
             * if boolean: then attn_bias at attn_mask will be -inf
             * if float/double: then attn_bias will be attn_mask
         - return_attn_weights: bool
         - average_attn_weights: bool
+        - x_pe_inv: only used if pe_type == prope, (B, Lx, 4, 4), world to camera.
+            It is the inverse of `x_pe`. Pass it in to avoid recomputing the same
+            inverse in every layer; if None, it is derived from `x_pe`.
 
         Returns:
         - out: (B, Lx, C)
-        - (Optional) attn_weight: (B, Lx, Lc) if average_attn_weights 
+        - (Optional) attn_weight: (B, Lx, Lc) if average_attn_weights
                              else (B, H, Lx, Lc)
         """
         use_sdpa = self.flash and (not return_attn_weights)
 
         if use_sdpa:
-            return self.forward_sdpa(x, c, x_pe, c_pe, attn_mask)
+            return self.forward_sdpa(x, c, x_pe, c_pe, attn_mask, x_pe_inv)
         else:
-            return self.forward_eager(x, c, x_pe, c_pe, attn_mask, return_attn_weights, average_attn_weights)
+            return self.forward_eager(x, c, x_pe, c_pe, attn_mask, return_attn_weights,
+                                      average_attn_weights, x_pe_inv)
     
     @classmethod
     def _attn_impl_eager(
@@ -227,22 +235,26 @@ class MySimpleMHA(nn.Module):
         return out, attn_mask
 
     def embed_qkv(
-        self, 
-        q: Tensor, k: Tensor, v: Tensor, 
-        x_pe: Tensor, c_pe: Tensor
+        self,
+        q: Tensor, k: Tensor, v: Tensor,
+        x_pe: Tensor, c_pe: Tensor, x_pe_inv: Tensor = None
     ):
         # x_pe can be x_wcT
         # c_pe can be c_wcT
-        x_pe_inv = None
+        # x_pe_inv can be x_cwT, i.e. the inverse of x_pe
         if self.pe_type == "rope":
+            x_pe_inv = None
             if x_pe is not None:
                 q = pe.RoPE.embed_rotary(q, x_pe)
             if c_pe is not None:
                 k = pe.RoPE.embed_rotary(k, c_pe)
         elif self.pe_type == "prope":
-            if x_pe is not None:
-                x_cwT = x_pe_inv = x_pe.inverse()
-                q = pe.PRoPE.embed_q(q, x_cwT)
+            if x_pe is None:
+                x_pe_inv = None
+            else:
+                if x_pe_inv is None:
+                    x_pe_inv = pe.se3_inverse(x_pe)
+                q = pe.PRoPE.embed_q(q, x_pe_inv)
             if c_pe is not None:
                 k = pe.PRoPE.embed_kv(k, c_pe)
                 v = pe.PRoPE.embed_kv(v, c_pe)
@@ -262,14 +274,15 @@ class MySimpleMHA(nn.Module):
         self, 
         x: Tensor, 
         c: Tensor, 
-        x_pe: Tensor = None, 
-        c_pe: Tensor = None, 
+        x_pe: Tensor = None,
+        c_pe: Tensor = None,
         attn_mask: Tensor = None,
         return_attn_weights = False,
         average_attn_weights = True,
+        x_pe_inv: Tensor = None,
     ):
         q, k, v = self.project_qkv(x, c)
-        q, k, v, x_pe_inv = self.embed_qkv(q, k, v, x_pe, c_pe)
+        q, k, v, x_pe_inv = self.embed_qkv(q, k, v, x_pe, c_pe, x_pe_inv)
         
         ret = self._attn_impl_eager(
             q, k, v, 
@@ -298,12 +311,13 @@ class MySimpleMHA(nn.Module):
         self, 
         x: Tensor, 
         c: Tensor, 
-        x_pe: Tensor = None, 
-        c_pe: Tensor = None, 
-        attn_mask: Tensor = None
+        x_pe: Tensor = None,
+        c_pe: Tensor = None,
+        attn_mask: Tensor = None,
+        x_pe_inv: Tensor = None,
     ):
         q, k, v = self.project_qkv(x, c)
-        q, k, v, x_pe_inv = self.embed_qkv(q, k, v, x_pe, c_pe)
+        q, k, v, x_pe_inv = self.embed_qkv(q, k, v, x_pe, c_pe, x_pe_inv)
         
         out, attn_mask = self._attn_impl_sdpa(
             q, k, v,

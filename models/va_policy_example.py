@@ -110,8 +110,11 @@ class StateEncoder(nn.Module):
 
     def reset_parameters(self):
         nn.init.trunc_normal_(self.queries, std=0.02)
-        # zero-init 空间 PE 的输出层：训练初期 x_v 就是干净的 DINOv2 特征
+        # zero-init 空间 PE 的输出层：训练初期 x_v 就是干净的 DINOv2 特征。
+        # weight 和 bias 都要清零 —— 只清 weight 的话 proj_pe 退化成一个随机常量偏移，
+        # 照样扰动预训练特征，zero-init 等于白做。
         nn.init.zeros_(self.proj_pe[-1].weight)
+        nn.init.zeros_(self.proj_pe[-1].bias)
         init_xncoder(self.pre_attn.num_layers, self.pre_attn)
         init_xncoder(self.post_attn.num_layers, self.post_attn)
 
@@ -161,7 +164,7 @@ class StateEncoder(nn.Module):
         q = self.bottleneck_ffn(q)
         return self.post_attn(query=q)[-1]
     
-# 动作向量布局（act_dim = 8）：
+# 动作向量布局（action_dim = 8）：
 #     x[..., 0:3]   末端位置 xyz
 #     x[..., 3:7]   姿态（4 维）
 #     x[..., 7:8]   夹爪开合
@@ -174,7 +177,7 @@ class ActionDecoder(nn.Module):
     """含噪动作 chunk + context -> 去噪目标（eps 或速度场，取决于训练目标）。
 
     命名按 diffusion / flow matching 惯例：
-        x       含噪动作序列 (B, Ta, act_dim)
+        x       含噪动作序列 (B, Ta, action_dim)
         t       去噪时刻 (B,)
         t_emb   去噪时刻的嵌入，驱动 adaLN，是全局条件
         h       网络内部隐特征 (B, L, hdim)
@@ -196,13 +199,13 @@ class ActionDecoder(nn.Module):
         -> 1D 卷积补局部时序 -> 双头输出
     """
 
-    def __init__(self, hdim: int, num_heads: int, act_dim: int = 8):
+    def __init__(self, hdim: int, num_heads: int, action_dim: int = 8):
         super().__init__()
-        self.act_dim = act_dim
+        self.action_dim = action_dim
 
         # ---------------- 输入投影 ----------------
         self.x_proj = nn.Sequential(          # 含噪动作 -> hdim
-            nn.Linear(act_dim, hdim),
+            nn.Linear(action_dim, hdim),
             nn.LeakyReLU(inplace=True),
             nn.Linear(hdim, hdim),
         )
@@ -241,7 +244,7 @@ class ActionDecoder(nn.Module):
         self.pose_head = nn.Sequential(
             nn.Linear(hdim, hdim), nn.ReLU(inplace=True),
             nn.Linear(hdim, hdim), nn.ReLU(inplace=True),
-            nn.Linear(hdim, act_dim - 1),
+            nn.Linear(hdim, action_dim - 1),
         )
         self.gripper_head = nn.Sequential(
             nn.Linear(hdim, hdim), nn.ReLU(inplace=True),
@@ -261,7 +264,7 @@ class ActionDecoder(nn.Module):
     ) -> Tensor:
         """
         Args:
-            x:          (B, Ta, act_dim)      含噪动作 chunk
+            x:          (B, Ta, action_dim)      含噪动作 chunk
             t:          (B,)                  去噪时刻
             context:    (B, Lc, hdim)         StateEncoder 输出
             context_pe: (B, Lc, head_dim, 2)  context 的 RoPE code
@@ -269,7 +272,7 @@ class ActionDecoder(nn.Module):
             current_gripper_embed: (B, hdim)  当前夹爪状态，并入全局条件
 
         Returns:
-            (B, Ta, act_dim)  预测的 eps / 速度场，布局同输入
+            (B, Ta, action_dim)  预测的 eps / 速度场，布局同输入
         """
         B, Ta, _ = x.shape
         xyz = x[..., :3]                       # 兼作 3D 坐标的那 3 维
@@ -280,7 +283,7 @@ class ActionDecoder(nn.Module):
             t_emb = t_emb + current_gripper_embed
 
         # ---- 动作 token：内容投影 + chunk 内序号（加性）----
-        h = self.x_proj(x[..., : self.act_dim])                    # (B, Ta, hdim)
+        h = self.x_proj(x[..., : self.action_dim])                    # (B, Ta, hdim)
         h = h + self.seq_pos_emb(torch.arange(Ta, device=x.device).to(h))[None]
 
         # ---- 拼成一条序列，动作和 context 一起做自注意力 ----
@@ -333,8 +336,8 @@ class ActionDecoderMamba(nn.Module):
     全部逐字保留，所以两者的输入投影、条件注入和输出头完全一致，
     唯一变化的自变量就是「全局注意力 vs SSM 扫描」。这是能把结论归因清楚的前提。
 
-    为什么 U-Net 跑在 hdim 而不是 act_dim 上：
-        跑在 act_dim 上就等于连输入投影和输出头一起换掉了，届时涨跌无法归因。
+    为什么 U-Net 跑在 hdim 而不是 action_dim 上：
+        跑在 action_dim 上就等于连输入投影和输出头一起换掉了，届时涨跌无法归因。
         `MambaUNet1D(action_dim=hdim, ...)` 里的 `action_dim` 只是「序列的通道数」，
         传 hdim 就是把它当作 seq2seq 主干用。
 
@@ -354,7 +357,7 @@ class ActionDecoderMamba(nn.Module):
         self,
         hdim: int,
         num_heads: int,
-        act_dim: int = 8,
+        action_dim: int = 8,
         down_dims: Sequence[int] = (256, 512),
         d_state: int = 16,
         kernel_size: int = 3,
@@ -362,13 +365,13 @@ class ActionDecoderMamba(nn.Module):
         use_attn_pe: bool = True,
     ):
         super().__init__()
-        self.act_dim = act_dim
+        self.action_dim = action_dim
         self.use_attn_pe = use_attn_pe
         self.downsample_factor = 2 ** (len(down_dims) - 1)
 
         # ---------------- 以下与 ActionDecoder 完全一致 ----------------
         self.x_proj = nn.Sequential(
-            nn.Linear(act_dim, hdim),
+            nn.Linear(action_dim, hdim),
             nn.LeakyReLU(inplace=True),
             nn.Linear(hdim, hdim),
         )
@@ -394,7 +397,7 @@ class ActionDecoderMamba(nn.Module):
         self.pose_head = nn.Sequential(
             nn.Linear(hdim, hdim), nn.ReLU(inplace=True),
             nn.Linear(hdim, hdim), nn.ReLU(inplace=True),
-            nn.Linear(hdim, act_dim - 1),
+            nn.Linear(hdim, action_dim - 1),
         )
         self.gripper_head = nn.Sequential(
             nn.Linear(hdim, hdim), nn.ReLU(inplace=True),
@@ -428,7 +431,7 @@ class ActionDecoderMamba(nn.Module):
         """签名与 ActionDecoder.forward 完全相同，可直接对调。
 
         Args:
-            x:          (B, Ta, act_dim)      含噪动作 chunk
+            x:          (B, Ta, action_dim)      含噪动作 chunk
             t:          (B,)                  去噪时刻
             context:    (B, Lc, hdim)         StateEncoder 输出
             context_pe: (B, Lc, head_dim, 2)  context 的 RoPE code
@@ -436,7 +439,7 @@ class ActionDecoderMamba(nn.Module):
             current_gripper_embed: (B, hdim)  当前夹爪状态，并入全局条件
 
         Returns:
-            (B, Ta, act_dim)  预测的 eps / 速度场，布局同输入
+            (B, Ta, action_dim)  预测的 eps / 速度场，布局同输入
         """
         B, Ta, _ = x.shape
         assert Ta % self.downsample_factor == 0, (
@@ -451,7 +454,7 @@ class ActionDecoderMamba(nn.Module):
             t_emb = t_emb + current_gripper_embed
 
         # ---- 动作 token：内容投影 + chunk 内序号（加性）----
-        h = self.x_proj(x[..., : self.act_dim])
+        h = self.x_proj(x[..., : self.action_dim])
         h = h + self.seq_pos_emb(torch.arange(Ta, device=x.device).to(h))[None]
 
         # ---- 交叉注意力注入 context ----

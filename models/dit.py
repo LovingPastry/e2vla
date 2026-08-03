@@ -35,19 +35,21 @@ class DiTBlock(nn.Module):
     
     def forward(
         self, 
-        x: Tensor, 
-        x_pe: Optional[Tensor], 
-        x_mask: Optional[Tensor], 
+        x: Tensor,
+        x_pe: Optional[Tensor],
+        x_mask: Optional[Tensor],
         c: Tensor,
         c_mask: Optional[Tensor],
-        film: Optional[Tensor], 
+        film: Optional[Tensor],
+        x_pe_inv: Optional[Tensor] = None,
     ):
         # self attn
         x, x_mask = self.self_attn(
             query=x,
-            query_pe=x_pe, 
-            query_mask=x_mask, 
-            film=film
+            query_pe=x_pe,
+            query_mask=x_mask,
+            film=film,
+            query_pe_inv=x_pe_inv
         )
         # cross attn
         x, c_mask = self.cross_attn(
@@ -80,13 +82,18 @@ class DiT(nn.Module):
 
     def forward(
         self,
-        x: Tensor, 
-        x_pe: Optional[Tensor], 
-        x_mask: Optional[Tensor], 
+        x: Tensor,
+        x_pe: Optional[Tensor],
+        x_mask: Optional[Tensor],
         conds: List[Tensor],
         cond_masks: Optional[List[Optional[Tensor]]],
-        films: Optional[List[Optional[Tensor]]]
+        films: Optional[List[Optional[Tensor]]],
+        x_pe_inv: Optional[Tensor] = None,
     ):
+        """
+        - x_pe_inv: inverse of `x_pe`, only used if pe_type == "prope". Computing it
+          once outside is much cheaper than inverting the same matrices in every layer.
+        """
         NoneType = type(None)
 
         # wrap to iterable
@@ -107,10 +114,11 @@ class DiT(nn.Module):
         for i in range(self.num_layers):
             x, x_mask, cond_masks[i%n_cond_type] = self.layers[i](
                 x=x,
-                x_pe=x_pe, 
+                x_pe=x_pe,
                 x_mask=x_mask,
                 c=conds[i%n_cond_type],
                 c_mask=cond_masks[i%n_cond_type],
-                film=films[i%n_cond_type]
+                film=films[i%n_cond_type],
+                x_pe_inv=x_pe_inv
             )
         return x

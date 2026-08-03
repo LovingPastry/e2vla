@@ -79,6 +79,28 @@ class RoPE(nn.Module):
 
 
 
+def se3_inverse(T: Tensor):
+    """Analytic inverse of a rigid transform, cheaper and more stable than
+    `torch.inverse`. NOTE: it assumes the top-left 3x3 block is a rotation
+    matrix and the last row is [0, 0, 0, 1].
+
+    Args:
+        T: (..., 4, 4)
+
+    Returns:
+        T_inv: (..., 4, 4)
+    """
+    R = T[..., :3, :3]
+    t = T[..., :3, 3]
+    RT = R.transpose(-1, -2)
+
+    T_inv = torch.zeros_like(T)
+    T_inv[..., :3, :3] = RT
+    T_inv[..., :3, 3] = -(RT @ t.unsqueeze(-1)).squeeze(-1)
+    T_inv[..., 3, 3] = 1
+    return T_inv
+
+
 class PRoPE(nn.Module):
     @staticmethod
     def embed_q(q: Tensor, cwT: Tensor):

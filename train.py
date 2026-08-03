@@ -13,6 +13,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 from models import vla
 from configs import CONFIGS, TrainConfig
+from train_utils.ckpt import load_actor_weights
+from train_utils.lora import setup_lora
 from train_utils.ema_impl import ExponentialMovingAverage
 from data_utils.dataset_base import get_dataloader, generate_sample_weights
 
@@ -119,24 +121,58 @@ class Trainer(object):
         self.writer = None
         
         # ckpt loading priority: conti > pretrained_ckpt
+        #
+        # These two are NOT the same operation:
+        #   conti           -- resume an interrupted run. Everything (weights, optimizer
+        #                      moments, LR schedule position, iteration counter) must be
+        #                      restored so training continues as if never stopped.
+        #   pretrained_ckpt -- start a NEW run from pretrained weights. Only the weights
+        #                      carry over; see `pretrained_weights_only` below.
         if conti:
             self.save = conti  # ckpt subfolder name is same as opt.conti
-            ckpt = torch.load(os.path.join(self.CKPT_DIR, conti, "ckpt_latest.pt"), 
+            ckpt = torch.load(os.path.join(self.CKPT_DIR, conti, "ckpt_latest.pt"),
                               map_location=self.model_device,
                               weights_only=False)
-            self.model.actor.load_state_dict(ckpt["weights"])
+            # A resume checkpoint was written by an already-LoRA-ified model, so LoRA
+            # must be injected BEFORE loading (opposite order from pretrained_ckpt).
+            ckpt_rank = ckpt.get("lora_rank", 0)
+            if ckpt_rank != self.cfg.lora_rank:
+                raise ValueError(
+                    "lora_rank mismatch: checkpoint was trained with {} but the config "
+                    "says {}. Pass the same --config used for the original run."
+                    .format(ckpt_rank, self.cfg.lora_rank))
+            if self.cfg.lora_rank > 0:
+                setup_lora(self.model.actor.context_encoder, self.cfg.lora_rank)
+            load_actor_weights(self.model.actor, ckpt["weights"],
+                               strict=True, what="resume checkpoint")
             self.current_iters = ckpt["current_iters"]
             self.last_ep = ckpt["last_ep"]
         elif self.cfg.pretrained_ckpt:
-            ckpt = torch.load(self.cfg.pretrained_ckpt, 
+            ckpt = torch.load(self.cfg.pretrained_ckpt,
                               map_location=self.model_device,
                               weights_only=False)
-            self.model.actor.load_state_dict(ckpt["weights"])
+            # Load into the PLAIN model first: released checkpoints have no LoRA keys.
+            load_actor_weights(self.model.actor, ckpt["weights"],
+                               strict=self.cfg.pretrained_strict,
+                               what="pretrained checkpoint")
+            if self.cfg.lora_rank > 0:
+                setup_lora(self.model.actor.context_encoder, self.cfg.lora_rank)
             self.current_iters = 0
             self.last_ep = -1
         else:
+            if self.cfg.lora_rank > 0:
+                # LoRA on top of random weights adapts nothing -- the frozen base it
+                # decomposes around is itself untrained.
+                raise ValueError(
+                    "lora_rank > 0 requires --pretrained_ckpt: LoRA freezes the "
+                    "ContextEncoder's base weights, which would leave 60% of the model "
+                    "stuck at its random initialisation.")
             self.current_iters = 0
             self.last_ep = -1
+
+        n_train = count_trainable(self.model)
+        print("[INFO] After checkpoint setup: {:.3f}M trainable parameters"
+              .format(n_train / 1e6))
 
         # if save path is explicitly specified, then overwrite
         if save:
@@ -165,13 +201,34 @@ class Trainer(object):
                 print("[INFO] Key ema not found in checkpoint, skip loading ema model")
         elif self.cfg.pretrained_ckpt:
             print("[INFO] load pretrained ckpt from iter: {}".format(ckpt["current_iters"]))
-            self.optimizer.load_state_dict(ckpt["optimizer"])
-            self.scaler.load_state_dict(ckpt["scaler"])
-            if "ema" in ckpt:
-                self.ema.load_state_dict(ckpt["ema"])
+            if self.cfg.pretrained_weights_only:
+                # Fine-tuning starts a fresh optimisation problem: current_iters is reset
+                # to 0 and the LR schedule re-warms from zero. Carrying over the
+                # pretrain run's Adam moments would pair stale first/second moments with
+                # a warming-up LR, which makes the first updates larger than intended --
+                # exactly what you do not want on a small dataset.
+                print("[INFO] pretrained_weights_only=True: optimizer/scaler/EMA state "
+                      "from the pretrained ckpt is intentionally NOT restored.")
             else:
-                print("[INFO] Key ema not found in checkpoint, skip loading ema model")
-        
+                self.optimizer.load_state_dict(ckpt["optimizer"])
+                self.scaler.load_state_dict(ckpt["scaler"])
+                if "ema" in ckpt:
+                    self.ema.load_state_dict(ckpt["ema"])
+                else:
+                    print("[INFO] Key ema not found in checkpoint, skip loading ema model")
+
+        # EMA that can never fire is worse than no EMA: `save_model` would still write an
+        # "ema" entry, and `remote_service --ema` would then restore the *initial*
+        # weights at eval time, silently discarding the entire run.
+        if self.cfg.ema_enabled and self.cfg.ema_start >= self.cfg.max_iterations:
+            raise ValueError(
+                "ema_enabled=True but ema_start ({}) >= max_iterations ({}), so "
+                "ema.update() would never be called and the saved EMA weights would be "
+                "the untrained initial ones. Lower ema_start (e.g. just after warmup) "
+                "or set ema_enabled=False."
+                .format(self.cfg.ema_start, self.cfg.max_iterations)
+            )
+
         self.scheduler = get_scheduler(
             name="constant_with_warmup",
             optimizer=self.optimizer,
@@ -235,7 +292,12 @@ class Trainer(object):
             ckpt_dir = os.path.join(self.CKPT_DIR, self.save)
             os.makedirs(ckpt_dir, exist_ok=True)
             to_save = {
+                # With LoRA this state_dict carries `...to_q.lin.weight` plus `.A`/`.B`
+                # instead of `...to_q.weight`, so `lora_rank` below tells every loader
+                # to inject LoRA before calling load_state_dict. Deployment merges the
+                # factors back into the base weights (see infer_utils/planner.py).
                 "weights": self.model.actor.state_dict(),
+                "lora_rank": self.cfg.lora_rank,
                 "current_iters": self.current_iters,
                 "last_ep": self.last_ep, 
                 "lr": self.scheduler.get_last_lr()[0], 

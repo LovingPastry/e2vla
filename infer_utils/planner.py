@@ -11,6 +11,7 @@ from typing import Union
 from models import vla
 from .ensemble import TrajEnsembler
 from data_utils.dataset_base import DataSampler, DataConfig, gen_norm_xy_map, rbd
+from train_utils.lora import setup_lora, merge_lora_linear
 from train_utils.ema_impl import ExponentialMovingAverage
 from data_utils.datasets import DATA_CONFIGS
 from .draw_traj import visualize_traj
@@ -20,27 +21,44 @@ from configs import TrainConfig
 def parse_config(ckpt_dir: str):
     config_files = glob.glob(os.path.join(ckpt_dir, "*.json"))
     config_files.sort()
-    
+
     assert len(config_files), "No config files found in {}".format(ckpt_dir)
     config_file = config_files[-1]
     print("[INFO] Use config file {}".format(config_file))
-    
+
     cfg = TrainConfig.load(config_file)
     data_config = cfg.dataset_classes[0].config
     model_name = cfg.model
-    
+
     data_config.shuffle_cameras = False  # overwrite
     print("[INFO] model = {}".format(model_name))
     print("[INFO] data config = {}".format(data_config))
-    
-    return model_name, data_config
+
+    return model_name, data_config, cfg.lora_rank
 
 
 def load_model(path, device, use_ema: bool = False):
-    model_name, data_config = parse_config(os.path.dirname(path))
-    
+    """Build the policy and restore trained weights, handling LoRA checkpoints.
+
+    Order matters and is not interchangeable:
+      1. inject LoRA, so the module tree matches the checkpoint's key names
+      2. load_state_dict
+      3. copy EMA (its shadow tensors are the LoRA factors, so this must precede merge)
+      4. merge LoRA into the base Linears -- inference then runs at zero LoRA overhead
+         and the live model is a plain ActionExpert again
+    """
+    model_name, data_config, cfg_lora_rank = parse_config(os.path.dirname(path))
+
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model: vla.VLA = getattr(vla, "vla_{}".format(model_name))().to(device)
+
+    # the checkpoint's own record wins over the config json, which may have been
+    # overwritten by a later run in the same directory
+    lora_rank = ckpt.get("lora_rank", cfg_lora_rank)
+    if lora_rank > 0:
+        print("[INFO] Checkpoint was trained with LoRA rank {}".format(lora_rank))
+        setup_lora(model.actor.context_encoder, lora_rank)
+
     model.actor.load_state_dict(ckpt["weights"])
     print("[INFO] Load weights from iter: {}".format(ckpt["current_iters"]))
 
@@ -51,6 +69,10 @@ def load_model(path, device, use_ema: bool = False):
         ema.to(device)
         ema.copy_to(param)
         print("[INFO] EMA weights loaded")
+
+    if lora_rank > 0:
+        merge_lora_linear(model.actor.context_encoder, inplace=True)
+        print("[INFO] LoRA merged into the base weights")
 
     model.eval()
     return model, data_config
@@ -68,17 +90,27 @@ class TrajPlanner(object):
 
         self.ensemble = int(ensemble)
         self.ensembler_lock = threading.Lock()
+        self._build_ensemblers(self.ensemble)
+
+        self.obs_frames = []
+        self.obs_lock = threading.Lock()
+
+        self.device = device
+        self.last_obs_data = None
+        # set via set_prompt(); declared here so a missing call fails with a clear message
+        self.prompt_text = None
+
+    def _build_ensemblers(self, ensemble: int):
+        """(Re)create the three ensemblers. The averaging window is the deque `maxlen`,
+        which is fixed at construction time -- changing `ensemble` therefore requires
+        rebuilding, not just resetting."""
         self.pos_ensembler = TrajEnsembler(int(ensemble))
         self.rot_ensembler = TrajEnsembler(int(ensemble))
         self.gripper_ensembler = TrajEnsembler(int(ensemble))
 
-        self.obs_frames = []
-        self.obs_lock = threading.Lock()
-        
-        self.device = device
-        self.last_obs_data = None
-    
     def reset(self):
+        """Clear all per-episode state. Call between episodes: the ensemblers key on
+        timestamps, which restart at zero for a new episode."""
         with self.ensembler_lock:
             self.pos_ensembler.reset()
             self.rot_ensembler.reset()
@@ -164,10 +196,19 @@ class TrajPlanner(object):
         return self
     
     def _make_data_for_infer(self, obs_frames: list):
-        """
+        """Turn the raw observation ring buffer into a batch-of-1 model input.
+
+        Runs the exact same `DataSampler.sample_framedict` used at training time, so
+        temporal alignment, image resizing and the intrinsics adjustment that goes with
+        it stay identical between train and eval. `latest=True` anchors the window on
+        the most recent frame instead of a random one.
+
         Args:
-            obs_frames (list[dict]): list of obs_frame, 
-                see annotations above
+            obs_frames (list[dict]): observation ring buffer, see `add_obs_frame`
+
+        Returns:
+            obs_data (dict): tensors already on `self.device`, each with a leading
+                batch dim of 1
         """
         (
             obs_rgbs, obs_masks, obs_cam_poses, obs_ee_poses, 
@@ -235,20 +276,46 @@ class TrajPlanner(object):
             )  # (B, Ta, nee, 17)
         return actions
     
-    def _make_empty_action(self, B, Ta, Nee):
-        actions = np.zeros((B, Ta, Nee, 16+1))
+    def _make_empty_action(self, batch_size, action_horizon, num_ee):
+        """Identity-pose / zero-gripper placeholder for end-effectors the policy did
+        not predict, so downstream code never sees an all-zero (singular) 4x4."""
+        actions = np.zeros((batch_size, action_horizon, num_ee, 16 + 1))
         actions[..., :16] = np.eye(4).ravel()
         return actions
-    
+
+    @staticmethod
+    def _count_end_effectors(ee_pose: np.ndarray):
+        """Number of end-effectors in a frame's `ee_pose` entry.
+
+        `add_obs_frame` accepts both layouts (matching DataSampler.sample_framedict):
+        (4, 4) for the legacy single-arm case and (Nee, 4, 4) for multi-arm. Reading
+        `shape[0]` blindly returns 4 for the single-arm layout.
+        """
+        return ee_pose.shape[0] if ee_pose.ndim == 3 else 1
+
     def _scatter_to_original_order(
-        self, 
+        self,
         nee_total: int,
-        ee_indices: tuple, 
+        ee_indices: tuple,
         action_selected: np.ndarray
     ):
-        B, Ta, nee_selected, _ = action_selected.shape
-        action_full = self._make_empty_action(B, Ta, nee_total)
-        
+        """Undo the `ee_indices` selection done at sampling time.
+
+        The policy only predicts the end-effectors listed in `config.ee_indices`;
+        this scatters them back to their original slots so callers can index by the
+        robot's own end-effector id.
+
+        Args:
+            nee_total: number of end-effectors the robot actually has
+            ee_indices: original slot of each predicted end-effector, in order
+            action_selected: (B, Ta, len(ee_indices), 17)
+
+        Returns:
+            action_full: (B, Ta, nee_total, 17), unpredicted slots left as identity
+        """
+        batch_size, action_horizon, _, _ = action_selected.shape
+        action_full = self._make_empty_action(batch_size, action_horizon, nee_total)
+
         for i, ee_ind in enumerate(ee_indices):
             action_full[:, :, ee_ind] = action_selected[:, :, i]
         return action_full
@@ -266,9 +333,12 @@ class TrajPlanner(object):
             future_time (np.ndarray): shape (Ta,)
             traj_img (np.ndarray | None): shape (H, Ncam*W, C) if not compressed else (nbytes,)
         """
+        assert self.prompt_text is not None, \
+            "No prompt set; call set_prompt() before get_action()."
+
         with self.obs_lock:
             obs_frames = self.obs_frames.copy()  # shallow copy
-        
+
         if len(obs_frames) == 0:
             return None
         
@@ -291,30 +361,31 @@ class TrajPlanner(object):
         self.last_obs_data = obs_data
         actions = actions.detach().cpu().numpy()  # (B, Ta, nee_sel, 17)
         actions = self._scatter_to_original_order(
-            nee_total=obs_frames[-1]["ee_pose"].shape[0],
+            nee_total=self._count_end_effectors(obs_frames[-1]["ee_pose"]),
             ee_indices=self.config.ee_indices,
             action_selected=actions
         )
-        B, Ta, nee, _ = actions.shape
+        batch_size, action_horizon, num_ee, _ = actions.shape
 
-        ee_poses = np.reshape(actions[:, :, :, :16], (B, Ta, nee, 4, 4))
-        grippers = actions[:, :, :, -1]  # (B, Ta, nee)
-        
-        # obs_data["timestamp"]: (B,)
+        ee_poses = np.reshape(actions[..., :16], (batch_size, action_horizon, num_ee, 4, 4))
+        grippers = actions[..., -1]  # (B, Ta, nee)
+
+        # the policy predicts states at multiples of the *sampling* period, which is
+        # sample_state_gaps env steps -- not one env step
         latest_time = obs_data["timestamps"][0].item()
         action_dt = self.config.sample_dt * self.config.sample_state_gaps
-        future_time = (1 + np.arange(Ta)) * action_dt + latest_time
+        future_time = (1 + np.arange(action_horizon)) * action_dt + latest_time
         future_ee_poses = ee_poses[0]  # (Ta, nee, 4, 4)
         future_grippers = grippers[0]  # (Ta, nee)
 
         return future_ee_poses, future_grippers, future_time, traj_img
     
     def set_ensemble_nums(self, n: int):
+        """Set how many overlapping chunks are averaged. Rebuilds the ensemblers so the
+        new window actually takes effect (`reset()` alone keeps the old deque maxlen)."""
         with self.ensembler_lock:
-            self.ensemble = n
-            self.pos_ensembler.reset()
-            self.rot_ensembler.reset()
-            self.gripper_ensembler.reset()
+            self.ensemble = int(n)
+            self._build_ensemblers(self.ensemble)
 
     def ensemble_traj(
         self, 

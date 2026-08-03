@@ -97,14 +97,15 @@ class CrossAttentionLayer(nn.Module):
 
     def forward(
         self, 
-        query, 
-        value, 
-        query_pe=None, 
-        value_pe=None, 
-        value_mask=None, 
+        query,
+        value,
+        query_pe=None,
+        value_pe=None,
+        value_mask=None,
         film=None,
         return_attn_weights=False,
-        average_attn_weights=True
+        average_attn_weights=True,
+        query_pe_inv=None
     ):
         residual = query
         attn_output, value_mask = self.attn(
@@ -114,7 +115,8 @@ class CrossAttentionLayer(nn.Module):
             c_pe=value_pe,
             attn_mask=value_mask,
             return_attn_weights=return_attn_weights,
-            average_attn_weights=average_attn_weights
+            average_attn_weights=average_attn_weights,
+            x_pe_inv=query_pe_inv
         )
         if return_attn_weights:
             attn_output, attn_weight = attn_output
@@ -141,12 +143,13 @@ class SelfAttentionLayer(CrossAttentionLayer):
 
     def forward(
         self, 
-        query, 
-        query_pe=None, 
-        query_mask=None, 
+        query,
+        query_pe=None,
+        query_mask=None,
         film=None,
         return_attn_weights=False,
-        average_attn_weights=True
+        average_attn_weights=True,
+        query_pe_inv=None
     ):
         residual = query
         attn_output, query_mask = self.attn(
@@ -156,7 +159,8 @@ class SelfAttentionLayer(CrossAttentionLayer):
             c_pe=query_pe,
             attn_mask=query_mask,
             return_attn_weights=return_attn_weights,
-            average_attn_weights=average_attn_weights
+            average_attn_weights=average_attn_weights,
+            x_pe_inv=query_pe_inv
         )
         if return_attn_weights:
             attn_output, attn_weight = attn_output
@@ -200,32 +204,35 @@ class FFWCrossAttentionLayers(nn.Module):
     
     def forward(
         self, 
-        query, 
-        value, 
-        query_pe=None, 
-        value_pe=None, 
-        value_mask=None, 
+        query,
+        value,
+        query_pe=None,
+        value_pe=None,
+        value_mask=None,
         film=None,
         return_attn_weights=False,
-        average_attn_weights=True
+        average_attn_weights=True,
+        query_pe_inv=None
     ):
         """
         - query, value: (B, Lq or Lv, C)
         - query_pe, value_pe: (B, Lq or Lv, HD, 2) or (B, Lq or Lv, 4, 4)
+        - query_pe_inv: (B, Lq, 4, 4), inverse of query_pe, prope only
         - value_mask: (B, Lv)
         - film: (B, C)
         """
         outputs = []
         for i in range(self.num_layers):
             query, value_mask = self.attn_layers[i](
-                query=query, 
-                value=value, 
-                query_pe=query_pe, 
-                value_pe=value_pe, 
-                value_mask=value_mask, 
+                query=query,
+                value=value,
+                query_pe=query_pe,
+                value_pe=value_pe,
+                value_mask=value_mask,
                 film=film,
-                return_attn_weights=return_attn_weights, 
-                average_attn_weights=average_attn_weights
+                return_attn_weights=return_attn_weights,
+                average_attn_weights=average_attn_weights,
+                query_pe_inv=query_pe_inv
             )
             if return_attn_weights:
                 query, attn_weight = query
@@ -267,28 +274,31 @@ class FFWSelfAttentionLayers(nn.Module):
 
     def forward(
         self, 
-        query, 
-        query_pe=None, 
-        query_mask=None, 
+        query,
+        query_pe=None,
+        query_mask=None,
         film=None,
         return_attn_weights=False,
-        average_attn_weights=True
+        average_attn_weights=True,
+        query_pe_inv=None
     ):
         """
         - query, value: (B, Lq or Lv, C)
-        - query_pe, value_pe: (B, Lq or Lv, C, 2)
+        - query_pe, value_pe: (B, Lq or Lv, HD, 2) or (B, Lq or Lv, 4, 4)
+        - query_pe_inv: (B, Lq, 4, 4), inverse of query_pe, prope only
         - value_mask: (B, Lv)
         - film: (B, C)
         """
         outputs = []
         for i in range(self.num_layers):
             query, query_mask = self.attn_layers[i](
-                query=query, 
-                query_pe=query_pe, 
-                query_mask=query_mask, 
+                query=query,
+                query_pe=query_pe,
+                query_mask=query_mask,
                 film=film,
-                return_attn_weights=return_attn_weights, 
-                average_attn_weights=average_attn_weights
+                return_attn_weights=return_attn_weights,
+                average_attn_weights=average_attn_weights,
+                query_pe_inv=query_pe_inv
             )
             if return_attn_weights:
                 query, attn_weight = query

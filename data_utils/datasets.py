@@ -273,6 +273,51 @@ class OpenOven(H5DatasetMapBase):
         return cls(h5_files)
 
 
+class RealRobot(H5DatasetMapBase):
+    """Template for fine-tuning on your own robot. Edit the four marked fields.
+
+    The class name is what `TrajPlanner.set_config` looks up at inference time (it keys
+    into DATA_CONFIGS by class name), so rename it consistently or keep it as is.
+
+    Camera order matters and is not cosmetic: `camera_names[0]` is the reference frame
+    for the entire action representation -- `main_cam_embed` tags its tokens and
+    `space_ee2cam` expresses every action in its coordinates. Put the third-person
+    camera first and the wrist camera second, matching the pretraining datasets
+    (LIBERO: agentview then eye_in_hand; DROID: exterior then wrist).
+    """
+
+    config = DataConfig(
+        # TODO(1): seconds between two consecutive recorded frames, i.e. 1/control_hz.
+        #   Must be the real wall-clock period: it sets how far ahead the predicted
+        #   chunk reaches (sample_dt * sample_state_gaps * num_future_states seconds).
+        sample_dt=1.0 / 15,
+
+        # TODO(2): leave None to infer the period from each episode's `timestamp`
+        #   dataset; set a float to override it with a fixed period.
+        record_dt=None,
+
+        # TODO(3): your camera group names inside the HDF5 file. Third-person FIRST.
+        camera_names=("exterior", "wrist"),
+
+        # TODO(4): which end-effectors to train on. Single-arm robots use (0,).
+        ee_indices=(0,),
+
+        output_image_hw=(256, 256),
+    )
+
+    @classmethod
+    def inst(cls):
+        h5_files = glob.glob("./data_converted/real_robot/**/*.h5", recursive=True)
+        print("[INFO] num samples of {}: {}".format(cls.__name__, len(h5_files)))
+        assert len(h5_files) > 0, (
+            "No episodes found under ./data_converted/real_robot/. Convert your "
+            "recordings to HDF5 first -- see the 'Fine-tune on your own robot' section "
+            "of README.md."
+        )
+        h5_files.sort()
+        return cls(h5_files)
+
+
 def get_subclasses(base_class):
     current_module = sys.modules[__name__]
     subclasses = []

@@ -247,7 +247,7 @@ class Encoder(nn.Module):
         """
         x_ds, gx = self.encode_mv_images(rgb)
         mask_ds = self.pool_mv_masks(mask)
-        pe = self.ray_encoding(norm_xy, extrinsic)
+        norm_xy_ds, pe = self.ray_encoding(norm_xy, extrinsic)
         aux_ds = {k:self.pool_mv_aux(a) for k, a in aux_tensors.items()}
 
         return {
