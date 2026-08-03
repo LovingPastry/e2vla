@@ -13,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from models import vla
 from configs import CONFIGS, TrainConfig
-from train_utils.ckpt import load_actor_weights
+from train_utils.ckpt import load_actor_weights, check_objective, OBJECTIVE
 from train_utils.lora import setup_lora
 from train_utils.ema_impl import ExponentialMovingAverage
 from data_utils.dataset_base import get_dataloader, generate_sample_weights
@@ -133,6 +133,7 @@ class Trainer(object):
             ckpt = torch.load(os.path.join(self.CKPT_DIR, conti, "ckpt_latest.pt"),
                               map_location=self.model_device,
                               weights_only=False)
+            check_objective(ckpt, what="resume checkpoint")
             # A resume checkpoint was written by an already-LoRA-ified model, so LoRA
             # must be injected BEFORE loading (opposite order from pretrained_ckpt).
             ckpt_rank = ckpt.get("lora_rank", 0)
@@ -151,6 +152,7 @@ class Trainer(object):
             ckpt = torch.load(self.cfg.pretrained_ckpt,
                               map_location=self.model_device,
                               weights_only=False)
+            check_objective(ckpt, what="pretrained checkpoint")
             # Load into the PLAIN model first: released checkpoints have no LoRA keys.
             load_actor_weights(self.model.actor, ckpt["weights"],
                                strict=self.cfg.pretrained_strict,
@@ -298,6 +300,11 @@ class Trainer(object):
                 # factors back into the base weights (see infer_utils/planner.py).
                 "weights": self.model.actor.state_dict(),
                 "lora_rank": self.cfg.lora_rank,
+                # Stamp what these weights actually mean. Nothing else can tell: a head
+                # trained on a different objective has the same tensor names and shapes,
+                # so it would load here without a single missing key. The released
+                # pretrain checkpoints predate this stamp; ours all carry it.
+                "objective": OBJECTIVE,
                 "current_iters": self.current_iters,
                 "last_ep": self.last_ep, 
                 "lr": self.scheduler.get_last_lr()[0], 

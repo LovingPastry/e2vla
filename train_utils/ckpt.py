@@ -7,10 +7,51 @@ serialized. See `Trainer.save_model`, which writes `model.actor.state_dict()`.
 The point of this module is to fail *loudly and specifically* on a mismatch. A silent
 partial load is the worst outcome: training proceeds, the loss curve looks plausible,
 and you only find out at evaluation time that half the network was random.
+
+SCOPE, and it is narrow: these helpers compare tensor *names and shapes*. They cannot
+see what the weights mean, so their success messages say the layout matched, never that
+the checkpoint is the right one. Anything semantic has to be carried out of band --
+which is what `OBJECTIVE` and `check_objective` below are for.
 """
 
-from typing import Dict, Optional
+from typing import Dict
 from torch import nn, Tensor
+
+
+# The generative objective the action head implements: DDIM epsilon prediction.
+#
+# `Trainer.save_model` stamps this into every checkpoint and `check_objective` verifies
+# it on the way back in. That looks redundant while there is only one possible value,
+# and it is -- today. The point is the failure it forecloses: a head trained on some
+# other objective (a flow-matching variant was prototyped and rolled back, and could
+# come back) has the *same parameter tensors*, so its checkpoint would load here with
+# zero missing keys, report a clean layout match, and then sample nonsense. Names and
+# shapes cannot distinguish the two; only this stamp can.
+#
+# The released pretrain checkpoints predate the stamp and carry no key. They are all
+# DDIM, hence the default below.
+OBJECTIVE = "ddim"
+
+
+def check_objective(ckpt: dict, what: str = "checkpoint"):
+    """Verify a checkpoint was trained with the objective this code implements.
+
+    Args:
+        ckpt: the loaded checkpoint dict
+        what: label used in messages
+
+    Returns:
+        str, the checkpoint's objective (always `OBJECTIVE` if this returns at all)
+    """
+    objective = ckpt.get("objective", OBJECTIVE)
+    if objective != OBJECTIVE:
+        raise ValueError(
+            "objective mismatch: the {} was trained with '{}', but this code implements "
+            "'{}'. The weights would load without a single missing key -- the two heads "
+            "have identical state_dict layouts -- and then sample nonsense, so this is "
+            "refused rather than warned about."
+            .format(what, objective, OBJECTIVE))
+    return objective
 
 
 class CkptCompatReport(object):
@@ -94,7 +135,9 @@ def load_actor_weights(
     report = inspect_actor_weights(actor, weights)
 
     if report.is_exact:
-        print("[INFO] {} matches the model exactly ({} tensors)."
+        # "layout", not "matches": every tensor lined up by name and shape, which is all
+        # this function can check. See the module docstring.
+        print("[INFO] {}: state_dict layout matches ({} tensors, names and shapes)."
               .format(what, len(report.matched)))
         actor.load_state_dict(_strip_prefix(weights, "actor."))
         return report

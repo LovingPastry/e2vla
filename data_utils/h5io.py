@@ -16,6 +16,45 @@ def jpeg_decode(array: np.ndarray):
     return cv2.imdecode(array, cv2.IMREAD_COLOR)
 
 
+_WARNED_IDENTITY_EXTRINSICS = set()
+
+
+def identity_extrinsics(num_frames: int):
+    """(T, 4, 4) stack of identity poses, the no-extrinsics fallback.
+
+    Identity is the only safe filler here: `ContextEncoder` rebases every camera onto
+    camera 0 and then feeds the result to PRoPE, and `space_ee2cam` inverts it -- a
+    zero matrix would produce NaN on the first `torch.inverse`. With identity
+    everywhere PRoPE degenerates to a no-op (it is exactly the value camera 0 already
+    takes after rebasing) and the action frame degenerates from camera-relative to
+    base-relative, which is a valid, self-consistent representation.
+    """
+    return np.tile(np.eye(4, dtype=np.float32), (num_frames, 1, 1))
+
+
+def is_identity_extrinsics(wcT, atol: float = 1e-6):
+    """True if every pose in `wcT` (..., 4, 4) is identity, i.e. the dataset carries no
+    real extrinsics. Callers that project 3D points into the image use this to skip the
+    overlay instead of drawing a geometrically meaningless one."""
+    if wcT is None:
+        return True
+    if isinstance(wcT, np.ndarray):
+        return bool(np.allclose(wcT, np.eye(4), atol=atol))
+    import torch
+    return bool(torch.allclose(wcT.float().cpu(), torch.eye(4), atol=atol))
+
+
+def _warn_identity_extrinsics(source: str):
+    """Warn once per source. A silent geometry fallback is the kind of thing that
+    trains fine and then makes every projection/visualisation quietly wrong."""
+    if source not in _WARNED_IDENTITY_EXTRINSICS:
+        _WARNED_IDENTITY_EXTRINSICS.add(source)
+        print("[WARN] no camera extrinsics found in {}, falling back to identity. "
+              "PRoPE becomes a no-op and actions are expressed in the robot base "
+              "frame instead of the camera frame; any wcT-based projection or "
+              "trajectory overlay is meaningless.".format(source))
+
+
 def gather_frames(
     traj: List[dict], 
     cam_name: str, 
@@ -47,11 +86,20 @@ def gather_frames(
             rgb = rearrange(rgb, "h w c -> c h w")
 
         rgbs.append(rgb)
-        cam_poses.append(cam.wcT)
-    
+        cam_poses.append(None if cam.wcT is None else np.asarray(cam.wcT))
+
     if not compress:
         rgbs = np.stack(rgbs, axis=0)  # (T, H, W, 3)
-    cam_poses = np.stack(cam_poses, axis=0)  # (T, 4, 4)
+
+    if any(p is None for p in cam_poses):
+        # all-or-nothing: a half-filled pose sequence is a bug in the converter, not a
+        # dataset without extrinsics
+        assert all(p is None for p in cam_poses), \
+            "camera '{}' has extrinsics on some frames but not others".format(cam_name)
+        _warn_identity_extrinsics("frame dict, camera '{}'".format(cam_name))
+        cam_poses = identity_extrinsics(len(cam_poses))
+    else:
+        cam_poses = np.stack(cam_poses, axis=0)  # (T, 4, 4)
 
     outputs = {
         "rgb": rgbs,
@@ -210,6 +258,11 @@ def slice_encoded_frames(
             # raw data format
             # sampled[k] = dset[ind_clipped]
             sampled[k] = slice_dset(dset, indices)
+
+    if "pose" not in sampled:
+        _warn_identity_extrinsics("h5 group '{}'".format(camera_group.name))
+        sampled["pose"] = identity_extrinsics(len(indices))
+
     return sampled
 
 

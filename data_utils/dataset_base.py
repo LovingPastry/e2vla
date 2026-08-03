@@ -860,7 +860,13 @@ def visualize_traj(data: Dict[str, Tensor]):
     
     # data["obs_extrinsics"]: (To, ncam, 4, 4)
     wcT = data["obs_extrinsics"][-1]  # (ncam, 4, 4)
-    
+
+    if h5io.is_identity_extrinsics(wcT):
+        # identity extrinsics == no extrinsics; projecting base-frame ee poses through
+        # them lands wherever, so show the raw views instead of a misleading overlay
+        bgrs = rearrange(rgb.flip(-1).cpu().numpy(), "n h w c -> h (n w) c")
+        return np.ascontiguousarray(bgrs)
+
     # data["gt_future_ee_states"]: (Ta, nee, 4*4+1)
     Ta, nee, _ = data["gt_future_ee_states"].shape
     weTs = data["gt_future_ee_states"][:, :, :16].view(Ta, nee, 4, 4)  # (Ta, nee, 4, 4)

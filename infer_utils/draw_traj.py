@@ -4,6 +4,7 @@ import numpy as np
 from torch import Tensor
 from einops import rearrange
 from typing import Dict, List, Tuple
+from data_utils import h5io
 from data_utils.dataset_base import draw_ee_proj
 
 
@@ -34,6 +35,11 @@ def visualize_traj(
     wcT = data["obs_extrinsics"][-1]  # (ncam, 4, 4)
     wcT_np = wcT.cpu().numpy()
     
+    if h5io.is_identity_extrinsics(wcT):
+        # no extrinsics in the dataset -- see `visualize_traj` in dataset_base
+        bgrs = rearrange(rgb.flip(-1).cpu().numpy(), "n h w c -> h (n w) c")
+        return np.ascontiguousarray(bgrs)
+
     valid_ee_mask = data["valid_ee_mask"]  # (nee)
     valid_ee_mask_np = valid_ee_mask.cpu().numpy()
     

@@ -12,6 +12,7 @@ from models import vla
 from .ensemble import TrajEnsembler
 from data_utils.dataset_base import DataSampler, DataConfig, gen_norm_xy_map, rbd
 from train_utils.lora import setup_lora, merge_lora_linear
+from train_utils.ckpt import check_objective
 from train_utils.ema_impl import ExponentialMovingAverage
 from data_utils.datasets import DATA_CONFIGS
 from .draw_traj import visualize_traj
@@ -50,6 +51,13 @@ def load_model(path, device, use_ema: bool = False):
     model_name, data_config, cfg_lora_rank = parse_config(os.path.dirname(path))
 
     ckpt = torch.load(path, map_location=device, weights_only=False)
+
+    # Refuse a checkpoint trained on a different generative objective before building
+    # anything: its weights would load with zero missing keys and then sample garbage,
+    # and no later step could notice. Released checkpoints predate the stamp and are
+    # read as DDIM; anything this repo trained carries it explicitly.
+    check_objective(ckpt, what="checkpoint")
+
     model: vla.VLA = getattr(vla, "vla_{}".format(model_name))().to(device)
 
     # the checkpoint's own record wins over the config json, which may have been
