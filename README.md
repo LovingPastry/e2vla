@@ -254,14 +254,15 @@ CUDA_VISIBLE_DEVICES=x python train.py \
 | | `action_space="ee_cam"`(默认) | `action_space="joint7"` |
 | --- | --- | --- |
 | 模型输出 | 相机系下的 SE(3) 增量 + 夹爪,10 维 | 绝对关节角 + 夹爪,nq+1 维 |
-| 预训练权重 | **可用**,发布的 ckpt 都是这个空间 | **不可用**,只能从头训 |
+| 预训练权重 | **可用**,精确加载 | **可迁移 99.98%**,3 个边界层重新初始化 |
 | 相机标定 | 必需(动作定义在相机系) | 不进入动作链路,只影响 PRoPE |
 | 逆运动学 | 执行时需要 | 不需要,直接下发关节控制器 |
 | 头部绝对位置编码 | 有 | 无(需要正运动学才能复原) |
 | 数据格式 | HDF5(§1) | HDF5 或 memmap/bin(§1b) |
 | 部署 | 已支持(§4) | **尚未支持**,见 §4 的说明 |
+| LoRA | 可用 | 需先做跨空间迁移加载(§3.7) |
 
-单任务真机上关节角常常更好用:动作直接是控制器的输入,标定误差不进入动作表示。代价是放弃预训练——这是主要成本,详见下面这段。走这条路请通读 §3.7。
+单任务真机上关节角常常更好用:动作直接是控制器的输入,标定误差不进入动作表示。代价不是"放弃预训练"——只有 3 个边界层(约 2.2 万参数)与动作编码绑定,99.98% 的权重照样迁移,详见 §3.7。真正放弃的是头部的绝对位置编码。走这条路请通读 §3.7。
 
 **走 `ee_cam` 的话,推荐从预训练 checkpoint 出发,但这不是硬性要求** —— 在 50-100 条演示上做单任务行为克隆是标准做法(Diffusion Policy、ACT 都是这个量级的模型和数据)。把它当成一个实验问题:如果能跑两次 20k 步,直接测一下。
 
@@ -382,13 +383,23 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
   --pretrained_ckpt ./checkpoints/E2VLA/PRETRAIN_EXP_NAME/ckpt_xxxxxxx.pt \
   -s MY_ROBOT_EXP
 
-# joint7:从头训,不能传 --pretrained_ckpt
+# joint7:从头训
 CUDA_VISIBLE_DEVICES=0 python train.py \
   --config finetune_real_joint \
   -s MY_ROBOT_JOINT_EXP
+
+# joint7:从 ee_cam 的预训练 ckpt 迁移主干(推荐,见 §3.7)
+CUDA_VISIBLE_DEVICES=0 python train.py \
+  --config finetune_real_joint \
+  --pretrained_ckpt ./checkpoints/E2VLA/PRETRAIN_EXP_NAME/ckpt_xxxxxxx.pt \
+  --pretrained_strict False \
+  --pretrained_ignore_action_layout True \
+  -s MY_ROBOT_JOINT_EXP
 ```
 
-`finetune_real_joint` 与 `finetune_real` 的差别都源于「没有预训练初始化」:`lora_rank=0`(冻结一个随机初始化的基座没有意义)、`max_lr=1e-4` 而不是 `5e-5`、`max_iterations=60k` 而不是 `20k`。传了 `--pretrained_ckpt` 会在 `check_action_layout` 处直接报错,不会静默加载。
+`finetune_real_joint` 的默认值是按「从头训」配的:`lora_rank=0`、`max_lr=1e-4` 而不是 `5e-5`、`max_iterations=60k` 而不是 `20k`。走上面第二条命令(有预训练主干)的话,`max_iterations` 可以砍半,`lora_rank` 也可以调回 16 —— ContextEncoder 这时是预训练的,正好补上 LoRA 缺的那个前提。
+
+两个 flag 缺一不可,而且不给的话会明确报错而不是静默降级:`--pretrained_ignore_action_layout True` 绕过 layout 戳,`--pretrained_strict False` 允许那 4 个张量形状不匹配。只给前者会直接抛错告诉你还差后者。
 
 `finetune_real` 预设(`ee_cam`)与 LIBERO 那几个的差别都源于数据量更小:20k 步而不是 70k,`max_lr=5e-5` 而不是 `1e-4`,开启 `grad_clip=1.0`,`bs=16`,EMA 从第 1k 步开启。`sample_multiplex=1000` 把 episode 列表膨胀,让一个 "epoch" 有可用的长度。此外它默认 `lora_rank=16`,见下一节。
 
@@ -447,7 +458,7 @@ LoRA 注入 `ContextEncoder` 中所有注意力投影(`to_q`/`to_k`/`to_v` 及�
 
 - 顺序错了会抛 `RuntimeError` 并列出所有不匹配的 key,**不会静默地只加载一半**。
 - Checkpoint 里存了 `lora_rank` 字段。续训时如果它和当前 config 不一致,会直接报错而不是加载失败。
-- **`lora_rank > 0` 时必须传 `--pretrained_ckpt`**,否则直接拒绝运行:LoRA 冻结的基座权重如果本身是随机初始化的,等于 60% 的参数被永久卡在初始化状态。**这条也就意味着关节空间用不了 LoRA** —— 没有可加载的预训练权重,`finetune_real_joint` 因此设 `lora_rank=0`。
+- **`lora_rank > 0` 时必须传 `--pretrained_ckpt`**,否则直接拒绝运行:LoRA 冻结的基座权重如果本身是随机初始化的,等于 60% 的参数被永久卡在初始化状态。关节空间也满足得了这个前提 —— 用 §3.7 的跨空间迁移加载 `ee_cam` 的 ckpt,ContextEncoder 就是预训练的。`finetune_real_joint` 默认 `lora_rank=0` 只是因为它的默认配置是从头训。
 - 部署时的 merge 必须在 EMA `copy_to` **之后**:EMA 的 shadow 参数就是 LoRA 因子本身,先 merge 会把 EMA 权重丢掉。
 
 ### 部署时的开销:零(LoRA)
@@ -516,12 +527,29 @@ CUDA_VISIBLE_DEVICES=0 python train.py --config finetune_libero_10 \
 
 要改成增量的话,覆盖 `AbsJoint` 的 `states2action` / `action2states` 即可,但**必须同时改 `layout` 字符串**,否则旧的统计文件会静默套用到新编码上。
 
+### 预训练权重仍然能用,只是不是精确加载
+
+和动作编码绑定的只有三层:`dp_head.hist_enc.0`、`dp_head.traj_enc.0`、`dp_head.act_head.3`,合计约 2.2 万参数。`ContextEncoder` 的 60.95M 和头部整个 DiT 栈都与动作空间无关,形状分毫不变。实测把 `ee_cam` 的 checkpoint 加载进 `joint7` 模型:
+
+```
+transferable: 101.73M / 101.74M = 99.98%
+shape mismatch: 4 个张量
+    dp_head.hist_enc.0.weight   (768, 9)  vs (768, 7)
+    dp_head.traj_enc.0.weight   (768, 10) vs (768, 8)
+    dp_head.act_head.3.weight   (10, 768) vs (8, 768)
+    dp_head.act_head.3.bias     (10,)     vs (8,)
+unexpected: abs_pos_enc 的 6 个张量(关节空间不建它)
+```
+
+用 `--pretrained_strict False --pretrained_ignore_action_layout True` 开启。两个 flag 分工不同:前者允许形状不匹配的部分加载(仓库本来就有的机制),后者显式绕过 layout 戳。默认都关着,因为跨空间**误**加载一旦发生是查不出来的;要绕过就必须是有意的。
+
+有了预训练主干,**LoRA 也重新可用了** —— `lora_rank > 0` 缺的那个前提(基座权重不能是随机初始化的)正好被补上。
+
+不要试图用「保留 10 维输出、只监督前 8 维」的办法来强行精确加载。形状能对上,语义对不上:通道 0 上的预训练权重编码的是「相机系平移的米数」,把关节角 q0 喂进去不是迁移;夹爪会落到 r11 上,而 6D 旋转那 6 维是**刻意排除在 clip 之外**的(`DEFAULT_CLIP_DIMS`),夹爪坐那儿会失去越界保护。更硬的障碍是 `pos_rel2abs` 读 `[..., :9]` 做 SE(3) 代数,关节角坐在那里会算出垃圾位置并加进特征 —— 要么关掉这条路(那 `abs_pos_enc` 本来就是死权重),要么它每一步都在污染特征。openpi 的 padding 是为了在**一个模型里 batch 不同 DOF 的机器人**,被 pad 的维度都是同一种量,那是另一个问题。
+
 ### 关节空间放弃了什么
 
-1. **预训练权重。** `action_dim` 从 10 变成 8,`hist_enc` / `traj_enc` / `act_head` 全部换形状,没有 checkpoint 能跨过去。这是主要成本 —— 可训练参数的 60% 在 `ContextEncoder` 里,它学的多视角几何融合本来是迁移性最好的部分。视觉 backbone 仍然是冻结的预训练权重,所以「从头训」不等于「从随机视觉特征开始」,但 ContextEncoder 确实要重新学。
-2. **头部的绝对位置编码。** `DiffusionHead.pos_rel2abs` 把预测的 t3r6 还原成相机系下的末端绝对位置,再作为一路附加位置编码加回特征。关节角要做这件事需要正运动学(得有 URDF/DH 参数),所以 `joint7` 下 `abs_pos_enc` 根本不建 —— 不是建了不用,是不进 `state_dict`,免得每个 checkpoint 里躺着一堆拿不到梯度的死权重。有 DH 参数的话,在 `AbsJoint` 里实现 FK 并把 `has_pose_geometry` 打开就能补回来。
-3. **LoRA。** 见 §3.5,`lora_rank > 0` 必须配 `--pretrained_ckpt`。
-
+1. **头部的绝对位置编码。** `DiffusionHead.pos_rel2abs` 把预测的 t3r6 还原成相机系下的末端绝对位置,再作为一路附加位置编码加回特征。关节角要做这件事需要正运动学(得有 URDF/DH 参数),所以 `joint7` 下 `abs_pos_enc` 根本不建 —— 不是建了不用,是不进 `state_dict`,免得每个 checkpoint 里躺着一堆拿不到梯度的死权重。有 DH 参数的话,在 `AbsJoint` 里实现 FK 并把 `has_pose_geometry` 打开就能补回来。
 换来的是:模型输出直接就是关节控制器的输入,不过逆运动学,手眼标定误差也不再进入动作链路。
 
 ### 防串用的两道戳

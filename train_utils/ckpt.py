@@ -118,7 +118,14 @@ def check_action_norm(ckpt: dict, action_norm, what: str = "checkpoint",
 
     if stored is not None and action_norm is not None:
         from models.action_norm import ActionNormalizer
-        if action_norm.matches(ActionNormalizer.from_dict(stored, what=what)):
+        # Read the stored stats under THEIR own layout, not the current run's. This is a
+        # comparison, and a cross-space comparison must be able to return "different"
+        # rather than raise: `matches` already treats a layout difference as a mismatch,
+        # which routes into the message below. Passing the run's layout here would make
+        # resuming any non-default-space run raise inside its own consistency check.
+        stored_layout = stored.get("layout", "cam_rel_t3r6_openness")
+        if action_norm.matches(ActionNormalizer.from_dict(
+                stored, what=what, expect_layout=stored_layout)):
             return True
         message = ("{}: action normalization statistics differ from the ones this run "
                    "uses. The weights load without a single missing key -- normalization "

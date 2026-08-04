@@ -180,8 +180,25 @@ class Trainer(object):
                               map_location=self.model_device,
                               weights_only=False)
             check_objective(ckpt, what="pretrained checkpoint")
-            check_action_layout(ckpt, self.action_space.layout,
-                                what="pretrained checkpoint")
+            if self.cfg.pretrained_ignore_action_layout:
+                stored = ckpt.get("action_layout", "cam_rel_t3r6_openness")
+                if stored != self.action_space.layout:
+                    if self.cfg.pretrained_strict:
+                        raise ValueError(
+                            "pretrained_ignore_action_layout needs pretrained_strict=False: "
+                            "the checkpoint predicts in '{}' and this run in '{}', so "
+                            "hist_enc.0 / traj_enc.0 / act_head.3 genuinely differ in shape."
+                            .format(stored, self.action_space.layout))
+                    print("[WARN] pretrained checkpoint predicts in action layout '{}', "
+                          "this run uses '{}'. Proceeding on the explicit "
+                          "pretrained_ignore_action_layout flag: the shared trunk "
+                          "(ContextEncoder + the head's DiT stack) transfers, and the "
+                          "three layers bound to the action encoding are re-initialised. "
+                          "The per-tensor report below is the authority on what loaded."
+                          .format(stored, self.action_space.layout))
+            else:
+                check_action_layout(ckpt, self.action_space.layout,
+                                    what="pretrained checkpoint")
             # Not strict: fine-tuning a released (unnormalized) pretrain checkpoint with
             # per-dataset q01/q99 statistics is a normal thing to want. It still gets a
             # loud warning, because doing it unintentionally is indistinguishable from

@@ -55,7 +55,26 @@ class TrainConfig(object):
     # invalidates action_norm_stats -- the layout stamp in the JSON is checked against it.
     # Joint space additionally drops the DiffusionHead's absolute-position encoding
     # (`abs_pos_enc`), which would need forward kinematics to reconstruct.
+    # A pretrained checkpoint from the other space can still be transferred, though --
+    # see `pretrained_ignore_action_layout` below; only three layers are bound to the
+    # encoding, so "no checkpoint crosses the boundary" applies to an exact load only.
     action_space: str = "ee_cam"
+
+    # Allow `pretrained_ckpt` to come from a DIFFERENT action space. Off by default: the
+    # layout stamp exists to stop an accidental cross-space load, which is undetectable
+    # once it happens.
+    #
+    # Turning it on is only sensible for one thing -- transferring the shared trunk. Only
+    # three layers are bound to the action encoding (`hist_enc.0`, `traj_enc.0`,
+    # `act_head.3`, ~22k params); ContextEncoder's 60.95M and the whole DiT stack in the
+    # head are action-space agnostic and keep their exact shapes. Loading an ee_cam
+    # checkpoint into a joint run transfers 99.98% of the parameters and re-initialises
+    # those three boundary layers.
+    #
+    # Requires `pretrained_strict=False` (the shapes genuinely do not match), and applies
+    # ONLY to `pretrained_ckpt`. Resuming with `-c` always demands an exact match: a
+    # resume must continue the same optimisation problem, action space included.
+    pretrained_ignore_action_layout: bool = False
 
     bs: int = 32  # batch size
     workers: int = 4  # num_workers
@@ -202,24 +221,34 @@ CONFIGS["finetune_real"] = TrainConfig(
 )
 
 # Same real-robot setting as `finetune_real`, but the head predicts absolute joint angles
-# instead of camera-relative SE(3) deltas. Trades away three things and buys one:
-#   - no pretrained init: action_dim goes 10 -> 8, so hist_enc / traj_enc / act_head all
-#     change shape and no released checkpoint loads. This trains from scratch.
+# instead of camera-relative SE(3) deltas. Trades away two things and buys one:
 #   - no absolute-position encoding in the head (needs forward kinematics from joints)
 #   - no PRoPE benefit from real extrinsics if the rig is uncalibrated
 #   + the output goes straight to the joint controller: no IK, and hand-eye calibration
 #     error stops being in the action path at all
-# max_iterations is raised over `finetune_real` because there is no pretrained init.
+#
+# A released (ee_cam) checkpoint still transfers: only hist_enc.0 / traj_enc.0 /
+# act_head.3 are bound to the action encoding (~22k params), so 99.98% of the weights
+# load. It needs both flags below, because the shapes genuinely differ:
+#   python train.py --config finetune_real_joint \
+#     --pretrained_ckpt PRETRAIN.pt --pretrained_strict False \
+#     --pretrained_ignore_action_layout True -s EXP
+# max_iterations is sized for training from scratch; halve it when starting from a
+# pretrained trunk. With one, lora_rank=16 also becomes usable again -- ContextEncoder
+# is then pretrained, which is the precondition LoRA was missing.
 CONFIGS["finetune_real_joint"] = TrainConfig(
     dataset_classes=[datasets.RealBinDataset],
     dataset_weights=[1],
     sample_multiplex=1000,
     action_space="joint7",
+    # Set both when passing --pretrained_ckpt; see the comment above.
+    pretrained_strict=True,
+    pretrained_ignore_action_layout=False,
     # Recompute per dataset; the layout stamp in the JSON is checked against action_space.
     #   python -m data_prepare.compute_action_stats --config finetune_real_joint \
     #       -o ./action_stats/real_joint7.json
     action_norm_stats=None,
-    lora_rank=0,  # nothing to LoRA-adapt when training from scratch
+    lora_rank=0,  # from scratch; raise to 16 if starting from a pretrained trunk
     bs=16,
     max_lr=1e-4,
     grad_clip=1.0,
