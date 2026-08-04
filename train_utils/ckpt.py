@@ -11,53 +11,56 @@ and you only find out at evaluation time that half the network was random.
 SCOPE, and it is narrow: these helpers compare tensor *names and shapes*. They cannot
 see what the weights mean, so their success messages say the layout matched, never that
 the checkpoint is the right one. Anything semantic has to be carried out of band --
-which is what `OBJECTIVE` and `check_objective` below are for.
+which is what `check_objective` below (and its siblings for the action space, the action
+normalization and the VLM's LoRA) are for.
 """
 
 from typing import Dict
 from torch import nn, Tensor
 
 
-# The generative objective the action head implements: DDIM epsilon prediction.
-#
-# `Trainer.save_model` stamps this into every checkpoint and `check_objective` verifies
-# it on the way back in. That looks redundant while there is only one possible value,
-# and it is -- today. The point is the failure it forecloses: a head trained on some
-# other objective (a flow-matching variant was prototyped and rolled back, and could
-# come back) has the *same parameter tensors*, so its checkpoint would load here with
-# zero missing keys, report a clean layout match, and then sample nonsense. Names and
-# shapes cannot distinguish the two; only this stamp can.
-#
-# The released pretrain checkpoints predate the stamp and carry no key. They are all
-# DDIM, hence the default below.
-OBJECTIVE = "ddim"
+def check_objective(ckpt: dict, objective: str, what: str = "checkpoint"):
+    """Verify a checkpoint was trained with the generative objective this run uses.
 
+    The action head supports two (see `models/action_expert.py:OBJECTIVES`): DDIM epsilon
+    prediction and rectified-flow matching. They share *every parameter tensor*, name and
+    shape alike -- the network is the same conditional vector field, only the meaning of
+    its output changes. So a flow checkpoint loads into a DDIM model without a single
+    missing key, reports a clean layout match, and then hands a velocity field to a
+    noise-prediction sampler. Nothing but this stamp can tell them apart, which is why the
+    mismatch is refused rather than warned about.
 
-def check_objective(ckpt: dict, what: str = "checkpoint"):
-    """Verify a checkpoint was trained with the objective this code implements.
+    `Trainer.save_model` writes `cfg.objective` into every checkpoint it produces. The
+    released pretrain checkpoints predate the stamp and carry no key; they are all DDIM,
+    hence the default below.
 
     Args:
         ckpt: the loaded checkpoint dict
+        objective: the objective this run is configured for
         what: label used in messages
 
     Returns:
-        str, the checkpoint's objective (always `OBJECTIVE` if this returns at all)
+        str, the checkpoint's objective (always `objective` if this returns at all)
     """
-    objective = ckpt.get("objective", OBJECTIVE)
-    if objective != OBJECTIVE:
+    from models.action_expert import DEFAULT_OBJECTIVE
+    stored = ckpt.get("objective", DEFAULT_OBJECTIVE)
+    if stored != objective:
         raise ValueError(
-            "objective mismatch: the {} was trained with '{}', but this code implements "
-            "'{}'. The weights would load without a single missing key -- the two heads "
-            "have identical state_dict layouts -- and then sample nonsense, so this is "
-            "refused rather than warned about."
-            .format(what, objective, OBJECTIVE))
-    return objective
+            "objective mismatch: the {} was trained with '{}', but this run is configured "
+            "for '{}'. The weights would load without a single missing key -- the two "
+            "heads have identical state_dict layouts -- and then sample nonsense, so this "
+            "is refused rather than warned about.\n\n"
+            "Set `objective` in the config to match the checkpoint, or start from a "
+            "checkpoint trained with the objective you want. There is no conversion: the "
+            "two are different regression problems on the same weights."
+            .format(what, stored, objective))
+    return stored
 
 
 def check_action_layout(ckpt: dict, layout: str, what: str = "checkpoint"):
     """Verify a checkpoint predicts in the action space this run is configured for.
 
-    Same failure mode as `check_objective`, one level down: `models/action_space.py`
+    Same failure mode as `check_objective`, one axis over: `models/action_space.py`
     offers an EE-pose space (10 channels) and a joint space (nq+1 channels). Those
     usually differ in width, and then the state_dict layout check catches the mismatch on
     its own. They do not always -- a 9-joint arm also lands on 10 -- and in that case
@@ -152,6 +155,96 @@ def check_action_norm(ckpt: dict, action_norm, what: str = "checkpoint",
           "action head to the new action space -- expect the first few thousand steps to "
           "look like training from scratch on the affected layers.")
     return False
+
+
+def read_vlm_lora_spec(ckpt: dict):
+    """What VLM-side LoRA a checkpoint was trained with, as (rank, targets).
+
+    Everything written before this feature existed has fully frozen backbones, and rank
+    0 says exactly that -- so the absent key needs no special case anywhere upstream.
+    """
+    rank = int(ckpt.get("vlm_lora_rank", 0))
+    targets = list(ckpt.get("vlm_lora_targets", []))
+    return rank, targets
+
+
+def check_vlm_lora(ckpt: dict, rank: int, targets, what: str = "checkpoint",
+                   strict: bool = True):
+    """Verify a checkpoint's VLM-side LoRA matches what this run is configured for.
+
+    The failure this prevents is quiet in the usual way: the VLM's weights are not in the
+    checkpoint at all (they are pulled from HuggingFace/torch.hub at construction), so a
+    checkpoint whose backbones were adapted and a run that does not re-inject that LoRA
+    differ by nothing a state_dict check can see. The action expert loads perfectly and
+    then reads features from a backbone it was never trained against.
+
+    Args:
+        ckpt: the loaded checkpoint dict
+        rank: `vlm_lora_rank` for the current run
+        targets: `vlm_lora_targets` for the current run
+        what: label used in messages
+        strict: raise on mismatch, else warn. Fine-tuning a run that had no VLM LoRA into
+            one that does is legitimate (the factors just start from zero); the reverse --
+            dropping factors the checkpoint was fitted with -- is a silent regression, so
+            it warns rather than passing unremarked.
+
+    Returns:
+        bool, True if the checkpoint's VLM LoRA matches this run's
+    """
+    ckpt_rank, ckpt_targets = read_vlm_lora_spec(ckpt)
+    if ckpt_rank == rank and (ckpt_rank == 0 or sorted(ckpt_targets) == sorted(targets)):
+        return True
+
+    message = ("{}: VLM LoRA differs -- checkpoint has rank {} on {}, this run is "
+               "configured for rank {} on {}. The backbones are not stored in the "
+               "checkpoint, so nothing downstream can detect this: the action expert "
+               "would load cleanly and then read features from a differently-adapted "
+               "encoder."
+               .format(what, ckpt_rank, ckpt_targets or "nothing", rank,
+                       targets if rank else "nothing"))
+
+    if strict:
+        raise ValueError(message + "\n\nSet vlm_lora_rank / vlm_lora_targets in the "
+                         "config to match the checkpoint.")
+
+    if ckpt_rank > 0:
+        print("[WARN] " + message)
+        print("[WARN] The checkpoint's LoRA factors are DISCARDED. Its action expert was "
+              "fitted to the adapted features and now sees the raw ones.")
+    else:
+        print("[INFO] {}: pretrained checkpoint has fully frozen backbones; this run adds "
+              "rank-{} LoRA on {}. The factors start from zero (injection is a no-op at "
+              "init), so this is a clean warm start.".format(what, rank, targets))
+    return False
+
+
+def load_vlm_lora_weights(vlm, weights: Dict[str, Tensor], what: str = "checkpoint"):
+    """Restore the LoRA factors of an already-injected VLM.
+
+    Exact match required in both directions, and deliberately so: this is a small,
+    fully-determined tensor set, and any disagreement means the injection that produced
+    the checkpoint is not the injection that just ran.
+
+    Args:
+        vlm: the `VLM` module, already passed through `setup_vlm_lora`
+        weights: the checkpoint's `"vlm_lora_weights"` entry
+        what: label used in messages
+    """
+    expected = {name for name, p in vlm.named_parameters() if p.requires_grad}
+    got = set(weights)
+
+    if expected != got:
+        raise RuntimeError(
+            "{}: VLM LoRA weights do not match the injected factors.\n"
+            "  missing (model has, ckpt lacks): {}\n"
+            "  unexpected (ckpt has, model lacks): {}\n"
+            "Inject with the same vlm_lora_rank / vlm_lora_targets the checkpoint was "
+            "trained with."
+            .format(what, sorted(expected - got)[:8], sorted(got - expected)[:8]))
+
+    # strict=False because `weights` covers only the factors, never the frozen backbone
+    vlm.load_state_dict(weights, strict=False)
+    print("[INFO] {}: loaded {} VLM LoRA tensors.".format(what, len(weights)))
 
 
 class CkptCompatReport(object):

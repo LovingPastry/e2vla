@@ -7,6 +7,8 @@ from torch import nn, Tensor
 from torchvision.transforms import v2
 from transformers import SiglipProcessor, SiglipTokenizer, SiglipImageProcessor, SiglipModel
 
+from ..layers.utils import maybe_no_grad
+
 
 class SiglipEncoder(nn.Module):
     REPO_ID = "google/siglip-base-patch16-256"
@@ -56,6 +58,17 @@ class SiglipEncoder(nn.Module):
     @property
     def patch_size(self):
         return self.siglip.config.vision_config.patch_size  # 16
+
+    @property
+    def vision_tower(self):
+        """The image half of `SiglipModel`. Named so the two towers can be frozen,
+        LoRA-adapted and grad-scoped independently -- they share one `SiglipModel`, so
+        `self.siglip` is too coarse a handle for any of that."""
+        return self.siglip.vision_model
+
+    @property
+    def text_tower(self):
+        return self.siglip.text_model
     
     def forward_siglip_head(self, x_vision: Tensor):
         B, L, C = x_vision.shape
@@ -190,7 +203,9 @@ class Encoder(nn.Module):
         """
         B, T, N, C, H, W = rgb.shape
         rgb = rearrange(rgb, "b t n c h w -> (b t n) c h w")
-        with torch.no_grad():
+        # Scoped to the vision tower, not to `self.frozen`: the two towers live in one
+        # SiglipModel, and LoRA on the text side must not start taping the image graph.
+        with maybe_no_grad(self.frozen.siglip.vision_tower):
             x_ds, gx = self.frozen.encode_images(rgb)
         x_ds = rearrange(x_ds, "(b t n) l c -> b t n l c", b=B, t=T, n=N)
         gx = rearrange(gx, "(b t n) c -> b t n c", b=B, t=T, n=N)
@@ -212,7 +227,7 @@ class Encoder(nn.Module):
         return norm_xy_ds, pe
     
     def encode_text(self, texts: List[str]):
-        with torch.no_grad():
+        with maybe_no_grad(self.frozen.siglip.text_tower):
             x, gx = self.frozen.encode_texts(texts)
         return x, gx
 

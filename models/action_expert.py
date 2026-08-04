@@ -17,6 +17,29 @@ from .layers.attn_dn import FFWSelfAttentionLayers, init_xncoder
 from .layers.rot_transforms import matrix_to_rotation_6d, rotation_6d_to_matrix
 
 
+# The generative objectives the action head can be trained with. This tuple is the single
+# source of truth: `configs.TrainConfig` validates against it and `train_utils/ckpt.py`
+# stamps the chosen value into every checkpoint.
+#
+#   "ddim" -- DDIM epsilon prediction, `diffusion_timesteps` train steps, ~20 at inference
+#   "flow" -- rectified-flow / optimal-transport matching, ~10 Euler steps at inference
+#
+# Both drive the *same* network: `DiffusionHead` maps (time, x_t, context) to a vector of
+# action_dim. Only three things around it differ -- how x_t is built from the clean chunk,
+# what the output is supervised against, and how the sampler integrates it. Which is
+# exactly why the checkpoint stamp has to exist: the two share every tensor name and every
+# tensor shape, so a flow checkpoint loads into a DDIM model with zero missing keys, prints
+# a clean layout match, and then feeds a velocity field to a noise-prediction sampler.
+OBJECTIVES = ("ddim", "flow")
+
+# What a checkpoint carrying no "objective" key is. The released pretrain checkpoints
+# predate the stamp and are all DDIM.
+DEFAULT_OBJECTIVE = "ddim"
+
+# How the flow time t is drawn during training. t = 0 is pure noise, t = 1 is data.
+FLOW_TIME_SAMPLING = ("uniform", "logitnormal", "beta")
+
+
 class ContextEncoder(nn.Module):
     """Frozen VLM features -> a short, fixed-length context for the diffusion head.
 
@@ -167,13 +190,23 @@ class ContextEncoder(nn.Module):
 
 
 class DiffusionHead(nn.Module):
-    """DDIM epsilon predictor over a chunk of camera-frame end-effector actions.
+    """Conditional vector field over a chunk of camera-frame end-effector actions.
 
-    - Input: the encoded observation context and the noisy action chunk at step `t`
-    - Output: the predicted noise, from which the scheduler derives step `t-1`
+    - Input: the encoded observation context and the corrupted action chunk at time `t`
+    - Output: one action_dim vector per chunk position
+
+    The module is deliberately objective-agnostic -- what that output *means* is decided
+    by `ActionExpert.objective`, not here:
+      * "ddim" -- it is the noise mixed into the chunk, and the scheduler derives step t-1
+      * "flow" -- it is the velocity dx_t/dt, and the sampler takes an Euler step along it
+    Nothing in this class changes between the two, which is why a checkpoint cannot be
+    told apart by its tensors and needs the objective stamp (see `OBJECTIVES` above).
 
     Two different "times" run through this module; keep them apart:
-      * `timestep`     -- the denoising step, a global condition driving adaLN/FiLM
+      * `timestep`     -- the denoising / flow time, a global condition driving adaLN/FiLM.
+                          Always arrives already scaled to [0, diffusion_timesteps) --
+                          see `ActionExpert.head_time` for why flow's t in [0,1] must not
+                          be passed raw.
       * chunk position -- where an action sits inside the horizon, an additive
                           sinusoidal embedding (`traj_time_embed`)
 
@@ -183,7 +216,7 @@ class DiffusionHead(nn.Module):
     copy the previous gripper command; it has to read openness off the wrist camera.
 
     NOTE on normalization: when `action_norm` is set, everything this module sees --
-    `history`, `noisy_actions`, and the predicted noise -- lives in the *normalized*
+    `history`, `noisy_actions`, and the prediction -- lives in the *normalized*
     action space. The one exception is `pos_rel2abs`, which is geometry: it interprets
     its input as a metric SE(3) delta, so the t3r6 channels are unnormalized right
     before that call. Feeding it normalized values would silently produce a wrong
@@ -226,10 +259,28 @@ class DiffusionHead(nn.Module):
         # Zero both weight AND bias. A zeroed weight with a random bias still injects a
         # constant offset, which defeats the point of starting these branches at zero:
         # `abs_pos_enc` must not perturb the features at init, and `act_head` must
-        # predict exactly zero noise at init.
+        # predict exactly zero at init (zero noise under DDIM, a zero velocity field
+        # under flow -- in both cases the sampler starts as the identity on its input).
         if self.abs_pos_enc is not None:
             nn.init.zeros_(self.abs_pos_enc[-1].weight)
             nn.init.zeros_(self.abs_pos_enc[-1].bias)
+        self.reset_output_layer()
+
+    def reset_output_layer(self):
+        """Re-zero `act_head` -- the only layer whose meaning depends on the objective.
+
+        Everything else in this module *encodes* something: an action chunk, a history, a
+        time, a position. Those inputs live in the same spaces under either objective, so
+        the weights that read them keep their meaning. The output layer does not. An
+        epsilon head predicts the noise; a flow head predicts `actions - noise`, which at
+        the high-noise end of the path is very nearly the *negation* of it. Carrying the
+        trained layer across therefore starts the new run with a systematically
+        sign-flipped output -- strictly worse than the zero it would have had from
+        scratch, and worse in a way that looks like slow convergence rather than a bug.
+
+        Called on its own by `train.py` when `pretrained_ignore_objective` transfers a
+        trunk across the objective boundary.
+        """
         nn.init.zeros_(self.act_head[-1].weight)
         nn.init.zeros_(self.act_head[-1].bias)
 
@@ -279,15 +330,16 @@ class DiffusionHead(nn.Module):
         cond_masks: Optional[List[Optional[Tensor]]],
         fp16: bool
     ):
-        """One denoising step.
+        """One network evaluation.
 
         History and the noisy action chunk are concatenated into a single sequence so
         self-attention can relate the two; only the action segment is read out at the
         end. History acts as clean, always-available conditioning.
 
         Args:
-            timestep: (B,), denoising step (NOT the position within the chunk)
-            noisy_actions: (B, Ta, action_dim), the noisy action chunk
+            timestep: (B,), the denoising / flow time, already scaled to
+                [0, diffusion_timesteps) (NOT the position within the chunk)
+            noisy_actions: (B, Ta, action_dim), the corrupted action chunk at `timestep`
             cur_wcT: (B, 4, 4), ^{world} T _{cam}
             cur_weT: (B, 4, 4), ^{world} T _{ee}
             history: (B, nhist, action_dim), past actions in the same encoding
@@ -296,7 +348,7 @@ class DiffusionHead(nn.Module):
             fp16 (bool): use bfloat16 autocast for the attention stack
 
         Returns:
-            pred_noise: (B, Ta, action_dim)
+            pred: (B, Ta, action_dim), noise or velocity depending on the objective
         """
         time_embed = self.denoising_time_embed(timestep)  # (B, hdim)
         film = time_embed
@@ -342,8 +394,8 @@ class DiffusionHead(nn.Module):
 
         # drop the history segment; only the chunk is supervised
         action_feats = seq_feats[:, history_horizon:history_horizon+action_horizon]
-        pred_noise = self.act_head(action_feats)
-        return pred_noise
+        pred = self.act_head(action_feats)
+        return pred
 
 
 class ActionExpert(nn.Module):
@@ -357,8 +409,20 @@ class ActionExpert(nn.Module):
         inference_timesteps: Optional[int] = None,
         action_norm: Optional[ActionNormalizer] = None,
         action_space: Optional[str | ActionSpace] = None,
+        objective: str = DEFAULT_OBJECTIVE,
+        flow_time_sampling: str = "uniform",
+        flow_time_alpha: float = 1.5,
     ):
         super().__init__()
+        if objective not in OBJECTIVES:
+            raise ValueError("unknown objective '{}'; valid choices are {}"
+                             .format(objective, list(OBJECTIVES)))
+        if flow_time_sampling not in FLOW_TIME_SAMPLING:
+            raise ValueError("unknown flow_time_sampling '{}'; valid choices are {}"
+                             .format(flow_time_sampling, list(FLOW_TIME_SAMPLING)))
+        self.objective = objective
+        self.flow_time_sampling = flow_time_sampling
+        self.flow_time_alpha = float(flow_time_alpha)
         # None == the EE-pose space, i.e. the historical behaviour.
         self.action_space = build_action_space(action_space)
         # q01/q99 normalization of the action space. None reproduces the pre-normalization
@@ -376,16 +440,29 @@ class ActionExpert(nn.Module):
                                      num_layers=num_diffusion_layers,
                                      action_norm=action_norm)
 
-        self.noise_scheduler = DDIMScheduler(
-            num_train_timesteps=diffusion_timesteps,
-            beta_schedule="squaredcos_cap_v2",
-            prediction_type="epsilon",
-            clip_sample=False
-        )
+        # Only built for DDIM. Flow matching has no noise schedule to speak of -- the
+        # forward process is a straight line and the sampler is plain Euler -- so leaving
+        # the scheduler as None keeps `objective` the single thing that decides behaviour
+        # rather than having a live-but-unused scheduler lying around to be picked up by
+        # accident.
+        if objective == "ddim":
+            self.noise_scheduler = DDIMScheduler(
+                num_train_timesteps=diffusion_timesteps,
+                beta_schedule="squaredcos_cap_v2",
+                prediction_type="epsilon",
+                clip_sample=False
+            )
+        else:
+            self.noise_scheduler = None
 
+        # Under "flow" this is no longer a count of anything; it survives as the numeric
+        # range the head's sinusoidal time embedding is defined over. See `head_time`.
         self.diffusion_timesteps = diffusion_timesteps
         if inference_timesteps is None:
-            inference_timesteps = max(diffusion_timesteps//5, 10)
+            # Flow needs far fewer function evaluations than DDIM for the same quality --
+            # that, and not the loss, is the practical reason to switch objectives here.
+            inference_timesteps = (max(diffusion_timesteps//5, 10) if objective == "ddim"
+                                   else 10)
         self.inference_timesteps = inference_timesteps
         self.inference_scheduler = self.noise_scheduler
 
@@ -399,15 +476,73 @@ class ActionExpert(nn.Module):
         """
         return self.action_space.action_dim
 
-    def iterative_denoise(
+    def head_time(self, t: Tensor):
+        """Flow time t in [0, 1] -> what the head's time embedding is actually fed.
+
+        NOTE THE FLIP: this returns `(1 - t) * diffusion_timesteps`, so t and the value
+        the head sees run in *opposite* directions. Two separate reasons, and both are
+        needed.
+
+        Scale. `dp_head.denoising_time_embed` starts with a
+        `SinusoidalPosEmb(temperature=1e4)` designed around integer DDIM steps spread over
+        [0, diffusion_timesteps). Handing it a raw t in [0, 1] would compress every
+        training sample into the first 1% of that range, where all but the very highest
+        frequency bands are flat -- the head would be nearly time-blind and would settle
+        for one averaged velocity field instead of a t-dependent one. That failure is
+        quiet: the loss still drops (the average field is a real minimiser), the samples
+        just blur toward the mean action.
+
+        Direction. What these embeddings conventionally index is *noise level*, and the
+        two objectives number it the other way round: a DDIM timestep of 0 is clean data
+        and `diffusion_timesteps` is pure noise, whereas flow's t = 0 is pure noise and
+        t = 1 is data. Feeding `1 - t` makes the argument mean "noise fraction" under both
+        -- the same thing pi0 feeds, since its t is already the noise fraction. Without
+        the flip a DDIM-pretrained head would start out with its notion of "how corrupted
+        is my input" exactly inverted, which is the difference between a useful init and
+        an actively misleading one (see `TrainConfig.pretrained_ignore_objective`).
+
+        Both properties are bijections on [0, 1], so a from-scratch flow run is
+        indifferent to either choice; only transfer and readability care.
+        """
+        return (1.0 - t) * self.diffusion_timesteps
+
+    def sample_time(self, batch_size: int, device) -> Tensor:
+        """Draw the training-time flow times, (B,) in [0, 1]. t=0 is noise, t=1 is data.
+
+        Which end of the path gets the most supervision is the one real hyperparameter of
+        flow matching, hence three choices:
+
+        * "uniform"     -- the rectified-flow baseline. Every t is equally important.
+        * "logitnormal" -- sigmoid(N(0,1)), from SD3. Concentrates on the middle of the
+                           path, where the field actually changes; the two ends are close
+                           to trivial (near t=0 the answer is nearly `-noise`, near t=1
+                           nearly the residual).
+        * "beta"        -- 1 - Beta(alpha, 1), pi0's choice restated in this module's t
+                           convention (pi0 runs t the other way round). Mass sits near
+                           t=0, the high-noise end: errors made there are integrated by
+                           every remaining Euler step, so they cost the most.
+
+        Uniform is the default because it is the objective as published and has no knob;
+        the other two are worth trying if sampling with few steps looks under-converged.
+        """
+        if self.flow_time_sampling == "uniform":
+            return torch.rand(batch_size, device=device)
+        if self.flow_time_sampling == "logitnormal":
+            return torch.sigmoid(torch.randn(batch_size, device=device))
+        if self.flow_time_sampling == "beta":
+            beta = torch.distributions.Beta(self.flow_time_alpha, 1.0)
+            return 1.0 - beta.sample((batch_size,)).to(device)
+        raise ValueError("unknown flow_time_sampling '{}'".format(self.flow_time_sampling))
+
+    def sample_actions(
         self,
         actions_shape: Tuple[int, int, int],
         fixed_inputs: Dict[str, Tensor],
         initial_noise: Optional[Tensor] = None
     ):
-        """Full DDIM reverse loop, from pure noise to an action chunk.
+        """Pure noise -> an action chunk, by whichever sampler the objective calls for.
 
-        `fixed_inputs` is everything that does not change across denoising steps (the
+        `fixed_inputs` is everything that does not change across sampler steps (the
         observation context, the current camera/ee poses, the action history); it is
         computed once by `forward` and splatted into the head each step.
 
@@ -425,6 +560,12 @@ class ActionExpert(nn.Module):
             initial_noise = torch.randn(batch_size, action_horizon, self.action_dim,
                                         device=device)
 
+        if self.objective == "flow":
+            return self.flow_integrate(fixed_inputs, initial_noise)
+        return self.iterative_denoise(fixed_inputs, initial_noise)
+
+    def iterative_denoise(self, fixed_inputs: Dict[str, Tensor], initial_noise: Tensor):
+        """Full DDIM reverse loop. See `sample_actions`."""
         self.inference_scheduler.set_timesteps(self.inference_timesteps)
         actions = initial_noise
         for t in self.inference_scheduler.timesteps:
@@ -436,6 +577,31 @@ class ActionExpert(nn.Module):
             actions = self.inference_scheduler.step(
                 pred_noise[..., :self.action_dim], t, actions[..., :self.action_dim]
             ).prev_sample
+        return actions
+
+    def flow_integrate(self, fixed_inputs: Dict[str, Tensor], initial_noise: Tensor):
+        """Euler integration of the learned velocity field, t: 0 (noise) -> 1 (data).
+
+        Uniform steps and no scheduler, deliberately. On the OT path the true trajectory
+        between a noise sample and its paired action chunk is a straight line travelled at
+        constant speed, so the discretisation itself contributes no error -- everything
+        that remains is the network's own deviation from the marginal field, which no
+        step-size schedule can anticipate. `inference_timesteps` is therefore exactly the
+        number of network evaluations, and 10 is usually enough where DDIM wanted 20.
+
+        See `sample_actions` for the arguments.
+        """
+        num_steps = self.inference_timesteps
+        dt = 1.0 / num_steps
+        actions = initial_noise
+        for i in range(num_steps):
+            # left endpoint of the step: the field is evaluated where we currently are.
+            # t counts UP from 0 (noise) to 1 (data); head_time flips it, so the value the
+            # head sees counts down from diffusion_timesteps -- see `head_time`.
+            t = torch.full((actions.shape[0],), i * dt,
+                           device=actions.device, dtype=actions.dtype)
+            velocity = self.dp_head(self.head_time(t), actions, **fixed_inputs)
+            actions = actions + dt * velocity[..., :self.action_dim]
         return actions
 
     def forward(
@@ -537,7 +703,7 @@ class ActionExpert(nn.Module):
 
         ###################### Inference ######################
         if inference:
-            pred_actions = self.iterative_denoise(
+            pred_actions = self.sample_actions(
                 actions_shape=(flat_batch_size, action_horizon, self.action_dim),
                 fixed_inputs=fixed_inputs
             )  # (B', Ta, action_dim)
@@ -563,23 +729,39 @@ class ActionExpert(nn.Module):
         noise = torch.randn(flat_batch_size, action_horizon, self.action_dim,
                             device=future_actions.device)
 
-        # sample a random timestep
-        timesteps = torch.randint(
-            0,
-            self.noise_scheduler.config.num_train_timesteps,
-            size=(flat_batch_size,),
-            device=noise.device
-        )
+        if self.objective == "flow":
+            # Rectified flow / optimal-transport path. The forward process is a straight
+            # line between a noise sample and the clean chunk,
+            #     x_t = (1 - t) * noise + t * actions,   t in [0, 1]
+            # so its velocity is constant along the path and the regression target is
+            # just the endpoint difference. Same convention as
+            # pvrobo/src/agent/flow_policy.py -- t = 1 is data, which is the opposite of
+            # pi0's; if you port code between them, flip t and negate the velocity.
+            t = self.sample_time(flat_batch_size, noise.device)  # (B',)
+            t_expand = t[:, None, None]
+            noisy_actions = (1 - t_expand) * noise + t_expand * future_action_cam
+            # head_time, not t: the head's sinusoidal embedding is defined over
+            # [0, diffusion_timesteps), see `head_time`
+            pred = self.dp_head(self.head_time(t), noisy_actions, **fixed_inputs)
+            target = future_action_cam - noise
+        else:
+            # sample a random timestep
+            timesteps = torch.randint(
+                0,
+                self.noise_scheduler.config.num_train_timesteps,
+                size=(flat_batch_size,),
+                device=noise.device
+            )
 
-        # forward diffusion, then a single denoising step (not the full loop)
-        noisy_actions = self.noise_scheduler.add_noise(
-            future_action_cam, noise,
-            timesteps
-        )
+            # forward diffusion, then a single denoising step (not the full loop)
+            noisy_actions = self.noise_scheduler.add_noise(
+                future_action_cam, noise,
+                timesteps
+            )
 
-        pred_noise = self.dp_head(timesteps, noisy_actions, **fixed_inputs)
-        target = get_target(future_action_cam, noise, timesteps, self.noise_scheduler)
-        
+            pred = self.dp_head(timesteps, noisy_actions, **fixed_inputs)
+            target = get_target(future_action_cam, noise, timesteps, self.noise_scheduler)
+
         # # drop too aggresive actions
         # debug_gt_ee_pose = future_actions.transpose(1, 2)[valid_ee_mask][..., :16].reshape(flat_batch_size, -1, 4, 4)
         # debug_gt_ee_pos = debug_gt_ee_pose[..., :3, 3]  # (B', Ta, 3)
@@ -588,14 +770,20 @@ class ActionExpert(nn.Module):
         # debug_mask[..., 1:-1] = debug_mask[..., 1:-1] & debug_mask[..., :-2] & debug_mask[..., 2:]
         # debug_mask = torch.cat([debug_mask[:, 0:1], debug_mask], dim=-1)  # (B', Ta)
         # # filter
-        # pred_noise = pred_noise[debug_mask]
+        # pred = pred[debug_mask]
         # target = target[debug_mask]
 
         # Loss is split per action channel only so the terms can be weighted and logged
-        # separately -- with prediction_type="epsilon" every slice is part of the same
-        # standard normal, so the weights are pure loss shaping. The split itself is a
-        # property of the encoding, hence it lives on the action space.
-        total_loss, metrics = self.action_space.loss(pred_noise, target)
+        # separately; the split itself is a property of the encoding, hence it lives on
+        # the action space.
+        #
+        # Under "ddim" the weights are pure loss shaping: every slice of an epsilon target
+        # is part of the same standard normal. Under "flow" the target is
+        # `actions - noise`, which inherits the action space's own per-channel scale, so
+        # the same weights now also act as a (crude) dimensional correction. Both are
+        # fine, but it does mean the two objectives' loss values are NOT comparable --
+        # judge a flow run by its rollout, not by putting its curve next to a DDIM one.
+        total_loss, metrics = self.action_space.loss(pred, target)
         return total_loss, metrics
 
 
@@ -690,6 +878,13 @@ def states2action(cur_wcT: Tensor, cur_weT: Tensor, ee_states: Tensor,
         action (Tensor): (B, T, 9 or 10), t3r6 [+ openness in [-1,1]]
     """
     B, Ta, C = ee_states.shape
+    # 数据集给的是关节角（nq+1 宽）而 action_space 仍是 ee_cam 时，下面的 view 会抛一句
+    # 看不出病因的 "shape ... is invalid for input of size ..."。这里先拦住，对齐
+    # AbsJoint.states2action 的断言。
+    assert C in (16, 17), \
+        ("ee_cam 动作空间期望 state_dim=16 或 17（展平 4x4 位姿 [+ 夹爪]），实得 {}。"
+         "若数据集是关节空间（nq+1），请把 TrainConfig.action_space 设成 'joint{}'"
+         .format(C, C - 1))
     weT = ee_states[:, :, :16].view(B, Ta, 4, 4)
     t3r6 = space_ee2cam(cur_wcT, cur_weT, weT)
 
@@ -732,7 +927,10 @@ def action2states(cur_wcT: Tensor, cur_weT: Tensor, action: Tensor,
 
 
 def get_target(actions: Tensor, noise: Tensor, timesteps: Tensor, scheduler: DDIMScheduler):
-    """Supervision target matching the scheduler's parameterisation.
+    """Supervision target matching the scheduler's parameterisation. DDIM only.
+
+    The flow objective has no scheduler and no `prediction_type`; its target is written
+    inline in `ActionExpert.forward` because it is one subtraction.
 
     Args:
         actions (Tensor): (B, Ta, action_dim), the clean action chunk

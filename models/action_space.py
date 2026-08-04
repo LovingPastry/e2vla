@@ -12,7 +12,7 @@ checkpoint 一起弄坏。所以这里把它抽成策略对象，两条路并存
     state_dim   数据集给的宽度（EE: 17 = 展平 4x4 + 夹爪；关节: nq + 1）
     action_dim  模型内部的宽度（EE: 10 = t3r6 + 夹爪；关节: nq + 1）
 
-`layout` 是防串用的标记，同 `train_utils/ckpt.py:OBJECTIVE` 的思路：它会写进统计 json 和
+`layout` 是防串用的标记，同 `train_utils/ckpt.py:check_objective` 的思路：它会写进统计 json 和
 checkpoint 并在加载时校验。这里尤其必要——两套空间的 nq+1 若恰好等于 10，张量形状会完全
 一致，权重能干净加载然后输出垃圾，只有这个标记能拦住。
 """
@@ -52,7 +52,15 @@ class ActionSpace(object):
         """
         return states
 
-    def loss(self, pred_noise: Tensor, target: Tensor) -> Tuple[Tensor, Dict[str, float]]:
+    def loss(self, pred: Tensor, target: Tensor) -> Tuple[Tensor, Dict[str, float]]:
+        """按通道切分的加权 L1。
+
+        `pred`/`target` 的含义由 objective 决定——DDIM 下是噪声，flow 下是速度场——但切
+        法只取决于动作编码，所以两种目标共用这一个实现。注意权重的性质会跟着变：epsilon
+        目标的每一段都是同一个标准正态的切片，权重纯粹是 loss 整形；flow 的目标
+        `actions - noise` 带着动作空间自己的量纲，同一组权重就顺带成了量纲补偿。两种
+        目标的 loss 数值因此不可比。
+        """
         raise NotImplementedError
 
 
@@ -80,10 +88,10 @@ class CamRelEEPose(ActionSpace):
         states[..., :16] = torch.eye(4).ravel().to(states)
         return states
 
-    def loss(self, pred_noise, target):
-        pos_loss = F.l1_loss(pred_noise[..., 0:3], target[..., 0:3], reduction="mean")
-        rot_loss = F.l1_loss(pred_noise[..., 3:9], target[..., 3:9], reduction="mean")
-        openness_loss = F.l1_loss(pred_noise[..., 9:10], target[..., 9:10], reduction="mean")
+    def loss(self, pred, target):
+        pos_loss = F.l1_loss(pred[..., 0:3], target[..., 0:3], reduction="mean")
+        rot_loss = F.l1_loss(pred[..., 3:9], target[..., 3:9], reduction="mean")
+        openness_loss = F.l1_loss(pred[..., 9:10], target[..., 9:10], reduction="mean")
         total_loss = 30 * pos_loss + 10 * rot_loss + 10 * openness_loss
         return total_loss, {
             "pos_loss": pos_loss.item(),
@@ -142,13 +150,12 @@ class AbsJoint(ActionSpace):
         openness = action[..., -1:] / 2 + 0.5
         return torch.cat([joints, openness], dim=-1)
 
-    def loss(self, pred_noise, target):
+    def loss(self, pred, target):
         nq = self.num_joints
-        joint_loss = F.l1_loss(pred_noise[..., :nq], target[..., :nq], reduction="mean")
-        openness_loss = F.l1_loss(pred_noise[..., nq:nq+1], target[..., nq:nq+1],
+        joint_loss = F.l1_loss(pred[..., :nq], target[..., :nq], reduction="mean")
+        openness_loss = F.l1_loss(pred[..., nq:nq+1], target[..., nq:nq+1],
                                   reduction="mean")
-        # 权重沿用 EC 路径的量级。prediction_type="epsilon" 下两项都是同一个标准正态的切片，
-        # 所以这纯粹是 loss 整形，不是量纲补偿。
+        # 权重沿用 EE 路径的量级，性质见基类 `ActionSpace.loss` 的说明。
         total_loss = 30 * joint_loss + 10 * openness_loss
         return total_loss, {
             "joint_loss": joint_loss.item(),

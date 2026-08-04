@@ -2,7 +2,7 @@ from typing import Optional
 from torch import nn, Tensor
 
 from .vlm import VLM
-from .action_expert import ActionExpert
+from .action_expert import ActionExpert, DEFAULT_OBJECTIVE
 from .action_norm import ActionNormalizer, build_action_normalizer
 from .action_space import ActionSpace, build_action_space
 
@@ -16,12 +16,18 @@ class VLA(nn.Module):
         num_actor_diffusion_layers: int,
 
         diffusion_timesteps: int = 100,
-        inference_timesteps: int = 20,
+        # None means "whatever the objective's default is" -- 20 for DDIM (unchanged from
+        # when this was hardcoded), 10 for flow. Passing a number overrides both.
+        inference_timesteps: Optional[int] = None,
         action_norm: Optional[ActionNormalizer | str | dict] = None,
         action_space: Optional[str | ActionSpace] = None,
+        objective: str = DEFAULT_OBJECTIVE,
+        flow_time_sampling: str = "uniform",
+        flow_time_alpha: float = 1.5,
     ):
         super().__init__()
         self.action_space = build_action_space(action_space)
+        self.objective = objective
         self.vlm = VLM()
         self.actor = ActionExpert(
             hdim=hdim,
@@ -33,6 +39,9 @@ class VLA(nn.Module):
             action_norm=build_action_normalizer(
                 action_norm, expect_layout=self.action_space.layout),
             action_space=self.action_space,
+            objective=objective,
+            flow_time_sampling=flow_time_sampling,
+            flow_time_alpha=flow_time_alpha,
         )
     
         self.reset_parameters()
@@ -130,58 +139,52 @@ class VLA(nn.Module):
         )
 
 
-def vla_tiny(
+# (hdim, num_heads) per size name. The layer counts are the same across all three.
+VLA_SIZES = {
+    "tiny": (192, 3),
+    "small": (384, 6),
+    "base": (768, 12),
+}
+
+
+def _build_vla(
+    size: str,
     diffusion_timesteps: int = 100,
-    inference_timesteps: int = 20,
+    inference_timesteps: Optional[int] = None,
     action_norm: Optional[ActionNormalizer | str | dict] = None,
     action_space: Optional[str | ActionSpace] = None,
+    objective: str = DEFAULT_OBJECTIVE,
+    flow_time_sampling: str = "uniform",
+    flow_time_alpha: float = 1.5,
 ):
+    hdim, num_heads = VLA_SIZES[size]
     return VLA(
-        hdim=192,
-        num_heads=3,
+        hdim=hdim,
+        num_heads=num_heads,
         num_actor_context_layers=8,
         num_actor_diffusion_layers=4,
         diffusion_timesteps=diffusion_timesteps,
         inference_timesteps=inference_timesteps,
         action_norm=action_norm,
-        action_space=action_space
+        action_space=action_space,
+        objective=objective,
+        flow_time_sampling=flow_time_sampling,
+        flow_time_alpha=flow_time_alpha,
     )
 
 
-def vla_small(
-    diffusion_timesteps: int = 100,
-    inference_timesteps: int = 20,
-    action_norm: Optional[ActionNormalizer | str | dict] = None,
-    action_space: Optional[str | ActionSpace] = None,
-):
-    return VLA(
-        hdim=384,
-        num_heads=6,
-        num_actor_context_layers=8,
-        num_actor_diffusion_layers=4,
-        diffusion_timesteps=diffusion_timesteps,
-        inference_timesteps=inference_timesteps,
-        action_norm=action_norm,
-        action_space=action_space
-    )
+# The three public entry points. `train.py` and `infer_utils/planner.py` both resolve them
+# by name (`getattr(vla, "vla_" + cfg.model)`), so they have to exist as real attributes.
+def vla_tiny(**kwargs):
+    return _build_vla("tiny", **kwargs)
 
 
-def vla_base(
-    diffusion_timesteps: int = 100,
-    inference_timesteps: int = 20,
-    action_norm: Optional[ActionNormalizer | str | dict] = None,
-    action_space: Optional[str | ActionSpace] = None,
-):
-    return VLA(
-        hdim=768,
-        num_heads=12,
-        num_actor_context_layers=8,
-        num_actor_diffusion_layers=4,
-        diffusion_timesteps=diffusion_timesteps,
-        inference_timesteps=inference_timesteps,
-        action_norm=action_norm,
-        action_space=action_space
-    )
+def vla_small(**kwargs):
+    return _build_vla("small", **kwargs)
+
+
+def vla_base(**kwargs):
+    return _build_vla("base", **kwargs)
 
 
 

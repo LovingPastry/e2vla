@@ -467,6 +467,42 @@ LoRA 注入 `ContextEncoder` 中所有注意力投影(`to_q`/`to_k`/`to_v` 及�
 
 > 关于数值:LoRA 注入时 `B` 是零初始化的,所以 `lin(x) + (x @ A) @ B` 在函数意义上与 `lin(x)` 完全等价。但端到端测下来 context 输出会有约 `1e-6` 的漂移 —— 这不是逻辑错误:`lin(x) + 0` 会分配一个新张量,落在不同地址,可能走不同的 matmul/SDPA kernel 分块路径。已验证:把线程数钉到 1 时漂移显著减小,参数逐位相同,每个 `LoraLinear` 的输出与其基座 `Linear` 逐位相同。作为尺度参考,训练跑在 bfloat16 下,其 eps(~8e-3)比这个漂移大约 4000 倍。
 
+### 视觉主干上的 LoRA(DINOv2 / SigLIP,默认关闭)
+
+上面那套 LoRA 全部作用在 `ActionExpert` 内部,VLM 的两个主干始终是冻结的特征提取器 —— 这是本仓库的默认假设,所有已发布的 checkpoint 也都是这么训的。`vlm_lora_rank` 让你在**主干本身**上加 LoRA:
+
+```python
+# configs.py —— 只在预设里配,命令行不是它的入口
+CONFIGS["finetune_real_joint_vlmlora"] = TrainConfig(
+    ...,
+    vlm_lora_rank=16,
+    vlm_lora_targets=["dinov2", "siglip_vision"],  # 默认值,可加 "siglip_text"
+)
+```
+
+什么时候值得开:预训练特征来自网络图片,而真机的光照、遮挡视野的夹爪、没有纹理的桌面,是 60M 的 ContextEncoder 只能绕开、没法修正的分布偏移。什么时候不该开:任何**先**该试的方案都还没试的时候 —— 这是整个流程里最贵的一个开关。
+
+`vla_base` 上的实际参数量(rank 按每个投影计,DINOv2 的 `qkv` 是融合的所以拿 `3r`):
+
+| `vlm_lora_rank` | DINOv2(86.58M) | SigLIP vision(92.93M) | 合计新增可训练 |
+| --- | ---: | ---: | ---: |
+| `0`(默认,全冻结) | 0 | 0 | **0** |
+| `8` | 0.885M | 0.442M | 1.33M |
+| `16` | 1.769M | 0.885M | **2.65M** |
+| `32` | 3.539M | 1.769M | 5.31M |
+
+参数量不是重点,**显存和步时才是**:一旦主干进入反传,两个 ViT 的全部激活都要为每个样本的每个相机保留下来。先把 `bs` 砍半再说。同时,任何"预计算/缓存冻结特征"的快路径都随之失效 —— 特征不再是图像的固定函数。
+
+除 LoRA 因子外**什么都不训**:没有 bias/norm tuning。这与 ContextEncoder 那套配方相反,理由也直接 —— 主干的 norm 统计量正是最该原样保留的部分,而且这里没有"在本机器上预训练过"的状态可供重新拟合。
+
+关于目标选择:`siglip_text` 可选但默认不开。单任务微调集只有一条 prompt,适配文本编码器等于去拟合那一个字符串。
+
+三个必须知道的行为:
+
+- **因子会随 checkpoint 走,但主干权重不会。** 主干是构建时从 HuggingFace / torch.hub 拉的,从来不进 state_dict。所以 `vlm_lora_weights` 是"这套权重对应的特征不是原版特征"的**唯一**记录。一个开了 VLM LoRA 训出来的 checkpoint,如果在评测时没重新注入,会**一个 key 都不缺地加载成功**,然后让 action expert 去读它从没见过的特征。`check_vlm_lora` 就是为了让这种不匹配变响。
+- **部署时不 merge**,与 ActionExpert 相反。主干是 bf16,而 `round_bf16(W + AB)` 无论 `AB` 多小都会在 `W` 上引入约 `3.3e-3` 的相对误差。实测(768 宽的 bf16 Linear):一个对输出影响为 `2.3e-3` 的 LoRA,merge 会再叠上 `2.7e-3` 的误差 —— 适配量整个埋进舍入噪声;再小十倍时只有 36% 的 `AB` 能从舍入里活下来。所以推理保留 `LoraLinear`,代价是每个注意力投影多一次 rank-r 矩阵乘(相对 ViT 前向可以忽略),换来评测与训练算的是同一个函数。
+- **主干里所有 `no_grad` 都变成了条件式的**(`models/layers/utils.py:maybe_no_grad`)。没开 LoRA 时行为逐位不变,走的还是原来的 `no_grad`;开了之后只有被适配的那个塔解除 `no_grad`。这一步不是可选的:原来那个无条件的 `no_grad` 会把 LoRA 因子静默地从计算图里摘掉 —— 参数照样在优化器里、照样进 checkpoint,只是永远不动,而且不报任何错。
+
 ## 3.6 动作归一化(q01/q99)
 
 默认**关闭**,`action_norm_stats` 不设就是历史行为。开启后,模型动作空间的每个通道按其 1%/99% 分位数线性映射到 `[-1, 1]`。
@@ -554,9 +590,94 @@ unexpected: abs_pos_enc 的 6 个张量(关节空间不建它)
 
 ### 防串用的两道戳
 
-`layout` 会同时写进统计 json 和 checkpoint(`action_layout` 字段),在 `build_action_normalizer` 和 `train_utils/ckpt.py:check_action_layout` 两处校验。理由和 `objective = "ddim"` 那个戳完全一样:两个空间的通道数可能撞车(9 轴机械臂的关节空间也是 10 维),那时**每个张量的名字和形状都对得上**,权重零缺失 key 地加载、布局检查报告干净匹配,然后模型开始输出垃圾。名字和形状分辨不了,只有这个戳能。
+`layout` 会同时写进统计 json 和 checkpoint(`action_layout` 字段),在 `build_action_normalizer` 和 `train_utils/ckpt.py:check_action_layout` 两处校验。理由和 `objective` 那个戳完全一样(见 §3.8):两个空间的通道数可能撞车(9 轴机械臂的关节空间也是 10 维),那时**每个张量的名字和形状都对得上**,权重零缺失 key 地加载、布局检查报告干净匹配,然后模型开始输出垃圾。名字和形状分辨不了,只有这个戳能。
 
 早于这两个戳的文件一律按 `ee_cam` 读 —— 它们确实都是。
+
+## 3.8 生成目标:DDIM 还是 Flow Matching
+
+动作头支持两种生成目标,由 `TrainConfig.objective` 选择:
+
+| | `"ddim"`(默认) | `"flow"` |
+| --- | --- | --- |
+| 前向过程 | 余弦噪声表,`diffusion_timesteps=100` 步 | 直线 `x_t = (1-t)·noise + t·action`,`t ∈ [0,1]` |
+| 网络预测 | 混进去的噪声 epsilon | 路径上的速度 `action - noise` |
+| 采样 | DDIM 反向循环,默认 20 步 | 显式 Euler 积分,默认 10 步 |
+| 预训练 ckpt | 官方发布的都是这个 | 得自己从头 pretrain |
+
+**网络本身一个字都没改。** `DiffusionHead` 始终是 `(时间, x_t, 上下文) -> action_dim 的向量`;变的只有三件事:训练时 `x_t` 怎么造、输出拿什么去回归、采样时怎么把输出积分回动作。想换 objective 就改这一个字段:
+
+```bash
+# 用预设(它们只是把对应的 DDIM 预设的 objective 改成 flow)
+CUDA_VISIBLE_DEVICES=0 python train.py --config finetune_libero_10_flow -s EXP
+CUDA_VISIBLE_DEVICES=0 python train.py --config pretrain_flow -s EXP
+
+# 或者在任意预设上直接覆盖(tyro 接管 --config 之后的所有参数)
+CUDA_VISIBLE_DEVICES=0 python train.py --config finetune_real --objective flow -s EXP
+```
+
+评测端不需要任何额外参数:`objective`、采样步数这些都会跟着 config json 存进 checkpoint 目录,`infer_utils/planner.py` 从那里重建模型。
+
+### 换它图什么
+
+**推理步数**。同等质量下 flow 通常只要 DDIM 一半的网络前向 —— 动作头每一步都要跑一遍 DiT,这在实机控制频率上是直接的开销。OT 路径上噪声和动作之间的真实轨迹是一条匀速直线,离散化本身不产生误差,所以均匀步长、无调度器的 Euler 就够了,`inference_timesteps` 就是精确的前向次数。
+
+代价是 flow 的 checkpoint 和 DDIM 的**不能互相加载**(`check_objective` 会拦)。但**主干是能迁移的** —— 见下面"用 DDIM 预训练权重初始化 flow 运行"。
+
+### 一个不显然的实现细节:时间要缩放,而且要翻向
+
+`ActionExpert.head_time` 喂给头部的不是 `t`,是 `(1 - t) × diffusion_timesteps`。两个理由,缺一不可。
+
+**缩放。** 头部的时间嵌入是 `SinusoidalPosEmb(temperature=1e4)`,当初是照着 `[0, diffusion_timesteps)` 上的整数步设计的。直接把 `t ∈ [0,1]` 喂进去,所有样本会挤在这个范围最前面的 1% 里,除了最高频的几个频带以外全是平的 —— 头部近似于对时间失明,学出来的是一个平均速度场。这个失败**是安静的**:loss 照样下降(平均场确实是一个极小点),只是采样出来的动作糊向均值。
+
+**翻向。** 这类嵌入索引的是**噪声水平**,而两种目标的编号方向正好相反:DDIM 的 timestep 0 是干净数据、`diffusion_timesteps` 是纯噪声;flow 的 `t=0` 是纯噪声、`t=1` 是数据。喂 `1 - t` 之后,这个参数在两种目标下都表示"噪声占比"(也正是 pi0 喂的东西,它的 t 本来就是噪声占比)。不翻的话,DDIM 预训练的头部一上来对"我的输入有多脏"的判断是**完全反的**。
+
+两者都是 `[0,1]` 上的双射,所以从头训 flow 对这两个选择无所谓;只有迁移和可读性在乎。
+
+### 用 DDIM 预训练权重初始化 flow 运行
+
+**可以,而且是推荐做法。** 动作专家 102.3M 参数里有 96.5% 跟 objective 无关:
+
+| 模块 | 参数量 | 占比 | 跨 objective |
+| --- | --- | --- | --- |
+| `context_encoder` | 60.95M | 59.6% | 原样可用 |
+| `dp_head.traj_context_attn`(头部 DiT) | 37.81M | 37.0% | 原样可用 |
+| `hist_enc` / `traj_enc` / `abs_pos_enc` / 两个时间嵌入 | 2.98M | 2.9% | 原样可用 |
+| `act_head` 的输出 Linear | 7.7k | 0.008% | **重置** |
+
+道理是:除了输出层,头部里所有东西都在**编码**输入 —— 动作块、历史、时间、位置 —— 而这些输入在两种目标下活在同一个空间里。只有读出层的含义变了:epsilon 头预测噪声,flow 头预测 `action - noise`,在高噪声端后者几乎就是前者的**相反数**。把训好的输出层搬过去,等于让新 run 从一个系统性反号的输出开始 —— 比从零开始更差,而且表现为"收敛慢"而不是报错。所以 `train.py` 在迁移时把它清零,回到 from-scratch init 的状态,喂给它的那一层保留。
+
+```bash
+python train.py --config finetune_libero_10_flow \
+  --pretrained_ckpt PRETRAIN_DDIM.pt \
+  --pretrained_ignore_objective -s EXP
+```
+
+几点:
+- **不需要**放宽 `pretrained_strict`。每个张量都名字形状对得上 —— 这恰恰就是危险所在,所以才要一个显式 flag。
+- 只对 `--pretrained_ckpt` 生效。`-c` 续训永远要求精确匹配:续训是继续同一个优化问题。
+- 和 `pretrained_ignore_action_layout` 可以叠加(跨 objective + 跨动作空间),那时 `hist_enc.0` / `traj_enc.0` / `act_head.3` 因为形状不同也会重置,还要再加 `--no-pretrained_strict`。
+- tyro 把 bool 字段渲染成裸 flag,不是 `--flag True`:开是 `--pretrained_ignore_objective`,关是 `--no-pretrained_ignore_objective`(实测 tyro 1.0.15)。
+
+### 训练时的 t 怎么采
+
+`flow_time_sampling` 三选一,只在 `objective="flow"` 时读:
+
+- `"uniform"` —— rectified flow 原论文的做法,没有旋钮。**默认。**
+- `"logitnormal"` —— `sigmoid(N(0,1))`,SD3 的做法,权重压在路径中段(两端接近平凡:t→0 时答案几乎就是 `-noise`,t→1 时几乎是残差)。
+- `"beta"` —— `1 - Beta(flow_time_alpha, 1)`,pi0 的做法换算到本仓库的 t 约定(pi0 的 t 方向是反的)。质量压在高噪声端,那里的误差会被之后每一个 Euler 步继承,代价最大。
+
+少步数采样看着欠收敛时,先试后两个。
+
+### 防串用的第三道戳
+
+`objective` 的戳和 §3.7 那两道是同一类东西,而且是其中最危险的一个:两种目标**共用每一个张量的名字和形状**,一个 flow 的 checkpoint 加载进 DDIM 模型会零缺失 key 地成功、布局检查报告干净匹配,然后把一个速度场喂给噪声预测的采样器。所以 `train_utils/ckpt.py:check_objective` 在不匹配时**直接报错**,不降级成警告 —— 和动作归一化那道戳不同,这里没有"警告一下继续"的中间地带,要么是意外(必须拦死),要么是上面那种明确的主干迁移(走 `pretrained_ignore_objective`,而且会顺手重置输出层)。
+
+不带 `objective` 字段的 checkpoint(官方发布的预训练权重)一律按 `"ddim"` 读 —— 它们确实都是。
+
+### 两种 objective 的 loss 数值不可比
+
+`action_space.loss` 的 30/10/10 权重在两种目标下性质不同:epsilon 目标的每一段都是同一个标准正态的切片,权重纯粹是 loss 整形;flow 的目标 `action - noise` 带着动作空间自己的量纲,同一组权重就顺带成了(粗糙的)量纲补偿。把两条 loss 曲线并排看没有意义,判断 flow 跑得好不好要看 rollout。
 
 ## 4. 部署
 
@@ -573,7 +694,7 @@ CUDA_VISIBLE_DEVICES=0 python -m infer_utils.remote_service \
   --uri MY_ROBOT --ensemble 3
 ```
 
-只有在训练确实开了 EMA 时才加 `--ema`(`finetune_real` 是开的)。LoRA 不需要额外参数,`lora_rank` 从 checkpoint 里读。
+只有在训练确实开了 EMA 时才加 `--ema`(`finetune_real` 是开的)。LoRA 不需要额外参数,`lora_rank` 和 `vlm_lora_rank` / `vlm_lora_targets` 都从 checkpoint 里读:前者注入后 merge,后者注入后**保持不 merge**(理由见 §3.5)。
 
 你的控制循环参照 `examples/libero/eval.py`:
 

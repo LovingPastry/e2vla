@@ -5,6 +5,8 @@ from einops import rearrange
 from torch import nn, Tensor
 from torchvision.transforms import v2
 
+from ..layers.utils import maybe_no_grad
+
 
 class Dinov2Encoder(nn.Module):
     """Frozen DINOv2 (ViT-B/14 + 4 register tokens), loaded through ``torch.hub``.
@@ -21,7 +23,8 @@ class Dinov2Encoder(nn.Module):
     * The upstream implementation uses xformers' memory-efficient attention when it is
       installed and a plain matmul+softmax otherwise; it does not go through PyTorch
       SDPA. Without xformers this is somewhat slower than the HF path was, but the
-      encoder is frozen and runs under ``no_grad``, so it only costs forward time.
+      encoder is frozen and runs under ``no_grad``, so it only costs forward time --
+      unless LoRA is injected into it, which is off by default (``vlm_lora_rank``).
 
     Preprocessing constants are inlined rather than read from a processor config: the
     old code overrode the processor's resize-then-center-crop with a direct resize to
@@ -158,7 +161,8 @@ class Encoder(nn.Module):
         """
         B, T, N, C, H, W = rgb.shape
         rgb = rearrange(rgb, "b t n c h w -> (b t n) c h w")
-        with torch.no_grad():
+        # `no_grad` only while nothing here is trainable -- LoRA lifts it, see maybe_no_grad
+        with maybe_no_grad(self.frozen):
             x_ds, gx = self.frozen.encode_images(rgb)
         x_ds = rearrange(x_ds, "(b t n) l c -> b t n l c", b=B, t=T, n=N)
         gx = rearrange(gx, "(b t n) c -> b t n c", b=B, t=T, n=N)

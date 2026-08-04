@@ -1,7 +1,27 @@
 import torch
+import contextlib
 from typing import Optional
 from torch import Tensor, nn
 import torch.nn.functional as F
+
+
+def maybe_no_grad(module: nn.Module):
+    """`torch.no_grad()` for a fully frozen `module`, a no-op context otherwise.
+
+    The vision/text backbones are frozen, so their forwards are wrapped in `no_grad` and
+    their activations are never kept. That wrapper must not stay unconditional: injecting
+    LoRA (see `train_utils/lora.py:setup_vlm_lora`) makes part of a backbone trainable,
+    and a `no_grad` above the factors detaches them *silently* -- the parameters would
+    still sit in the optimizer and in the checkpoint, receive no gradient, and never
+    move. Nothing fails; the run just trains the action expert alone.
+
+    `nullcontext` rather than `enable_grad`: inference runs inside `torch.inference_mode`
+    and forcing grad on there would rebuild the autograd graph for every denoising step.
+    """
+    for p in module.parameters():
+        if p.requires_grad:
+            return contextlib.nullcontext()
+    return torch.no_grad()
 
 
 def concat_mask(

@@ -11,8 +11,9 @@ from typing import Union
 from models import vla
 from .ensemble import TrajEnsembler
 from data_utils.dataset_base import DataSampler, DataConfig, gen_norm_xy_map, rbd
-from train_utils.lora import setup_lora, merge_lora_linear
-from train_utils.ckpt import check_objective, check_action_layout
+from train_utils.lora import setup_lora, setup_vlm_lora, merge_lora_linear
+from train_utils.ckpt import (check_objective, check_action_layout,
+                             load_vlm_lora_weights, read_vlm_lora_spec)
 from models.action_norm import build_action_normalizer
 from models.action_space import build_action_space
 from train_utils.ema_impl import ExponentialMovingAverage
@@ -31,14 +32,16 @@ def parse_config(ckpt_dir: str):
 
     cfg = TrainConfig.load(config_file)
     data_config = cfg.dataset_classes[0].config
-    model_name = cfg.model
 
     data_config.shuffle_cameras = False  # overwrite
-    print("[INFO] model = {}".format(model_name))
+    print("[INFO] model = {}".format(cfg.model))
     print("[INFO] data config = {}".format(data_config))
 
-    return (model_name, data_config, cfg.lora_rank, cfg.action_norm_stats,
-            cfg.action_space)
+    # The whole config, not a tuple of the fields evaluation happens to need today: every
+    # new model-shaping option (objective, sampler steps, ...) has to reach the model here
+    # or evaluation silently rebuilds a *different* network from the one that was trained,
+    # and a tuple return makes forgetting one the path of least resistance.
+    return cfg, data_config
 
 
 def load_model(path, device, use_ema: bool = False):
@@ -50,9 +53,14 @@ def load_model(path, device, use_ema: bool = False):
       3. copy EMA (its shadow tensors are the LoRA factors, so this must precede merge)
       4. merge LoRA into the base Linears -- inference then runs at zero LoRA overhead
          and the live model is a plain ActionExpert again
+
+    Steps 1-3 apply to VLM-side LoRA too, and step 3 is why they have to be interleaved
+    rather than done backbone-first: the EMA shadow is one flat list over
+    `model.parameters()`, so every LoRA factor anywhere in the model must already exist,
+    and none of them may have been merged away yet, at the moment it is copied back.
+    Step 4 does NOT apply to the backbones -- see the note next to it.
     """
-    (model_name, data_config, cfg_lora_rank, cfg_norm_stats,
-     cfg_action_space) = parse_config(os.path.dirname(path))
+    cfg, data_config = parse_config(os.path.dirname(path))
 
     ckpt = torch.load(path, map_location=device, weights_only=False)
 
@@ -60,13 +68,19 @@ def load_model(path, device, use_ema: bool = False):
     # anything: its weights would load with zero missing keys and then sample garbage,
     # and no later step could notice. Released checkpoints predate the stamp and are
     # read as DDIM; anything this repo trained carries it explicitly.
-    check_objective(ckpt, what="checkpoint")
+    #
+    # The two records being compared come from different places -- the objective the
+    # weights were stamped with, and the objective the run's config json says to build --
+    # so this also catches a config json overwritten by a later run in the same directory.
+    check_objective(ckpt, cfg.objective, what="checkpoint")
+    print("[INFO] objective = {} ({} sampler steps)"
+          .format(cfg.objective, cfg.inference_timesteps or "default"))
 
     # Same guard one level down: an EE-pose and a joint checkpoint can have identical
     # state_dict layouts, and picking the wrong one here means the robot executes joint
     # angles as if they were metres. Resolved from the run's config json and verified
     # against the checkpoint's own stamp.
-    action_space = build_action_space(cfg_action_space)
+    action_space = build_action_space(cfg.action_space)
     check_action_layout(ckpt, action_space.layout, what="checkpoint")
     print("[INFO] action space = {} (layout '{}')"
           .format(action_space.name, action_space.layout))
@@ -85,24 +99,43 @@ def load_model(path, device, use_ema: bool = False):
             expect_layout=action_space.layout)
         source = "checkpoint"
     else:
-        action_norm = build_action_normalizer(cfg_norm_stats, what=str(cfg_norm_stats),
+        action_norm = build_action_normalizer(cfg.action_norm_stats,
+                                              what=str(cfg.action_norm_stats),
                                               expect_layout=action_space.layout)
-        source = "config json ({})".format(cfg_norm_stats)
+        source = "config json ({})".format(cfg.action_norm_stats)
 
     if action_norm is None:
         print("[INFO] No action normalization (from {})".format(source))
     else:
         print("[INFO] Action normalization from {}:\n{}".format(source, action_norm))
 
-    model: vla.VLA = getattr(vla, "vla_{}".format(model_name))(
-        action_norm=action_norm, action_space=action_space).to(device)
+    model: vla.VLA = getattr(vla, "vla_{}".format(cfg.model))(
+        action_norm=action_norm, action_space=action_space,
+        **cfg.model_kwargs()).to(device)
 
     # the checkpoint's own record wins over the config json, which may have been
     # overwritten by a later run in the same directory
-    lora_rank = ckpt.get("lora_rank", cfg_lora_rank)
+    lora_rank = ckpt.get("lora_rank", cfg.lora_rank)
     if lora_rank > 0:
         print("[INFO] Checkpoint was trained with LoRA rank {}".format(lora_rank))
         setup_lora(model.actor.context_encoder, lora_rank)
+
+    # Same resolution rule, and it matters more here: the VLM's weights are not in the
+    # checkpoint at all, so skipping this step produces a model that loads perfectly and
+    # feeds the action expert stock features it was never trained on.
+    vlm_lora_rank, vlm_lora_targets = read_vlm_lora_spec(ckpt)
+    if vlm_lora_rank == 0 and "vlm_lora_rank" not in ckpt:
+        vlm_lora_rank, vlm_lora_targets = cfg.vlm_lora_rank, cfg.vlm_lora_targets
+    if vlm_lora_rank > 0:
+        print("[INFO] Checkpoint was trained with VLM LoRA rank {} on {}"
+              .format(vlm_lora_rank, vlm_lora_targets))
+        setup_vlm_lora(model.vlm, vlm_lora_rank, vlm_lora_targets)
+        if "vlm_lora_weights" not in ckpt:
+            raise RuntimeError(
+                "checkpoint declares VLM LoRA (rank {}) but carries no "
+                "'vlm_lora_weights'. The adapted backbones cannot be reconstructed -- "
+                "the factors are the only copy of them.".format(vlm_lora_rank))
+        load_vlm_lora_weights(model.vlm, ckpt["vlm_lora_weights"], what="checkpoint")
 
     model.actor.load_state_dict(ckpt["weights"])
     print("[INFO] Load weights from iter: {}".format(ckpt["current_iters"]))
@@ -119,6 +152,23 @@ def load_model(path, device, use_ema: bool = False):
         merge_lora_linear(model.actor.context_encoder, inplace=True)
         print("[INFO] LoRA merged into the base weights")
 
+    # NOTE: the VLM's factors are deliberately NOT merged, unlike the action expert's.
+    # Step 4 above assumes merging is free, and for the expert it is -- its weights are
+    # fp32. The backbones are bf16, where `round_bf16(W + AB)` costs ~3.3e-3 relative
+    # error on W no matter how small AB is. Measured on a 768-wide bf16 Linear: a LoRA
+    # whose effect on the output is 2.3e-3 gets 2.7e-3 of merge error on top, i.e. the
+    # adaptation is entirely inside the rounding noise, and at a tenth of that scale only
+    # 36% of AB survives the round at all. Keeping the factors live costs one rank-r
+    # matmul per attention projection -- nothing against a ViT forward -- and makes
+    # evaluation compute exactly what training computed.
+    if vlm_lora_rank > 0:
+        print("[INFO] VLM LoRA kept unmerged (bf16 backbones; see the note in load_model)")
+
+    # Nothing here is trained again, and saying so puts the backbones back on their
+    # `no_grad` fast path -- `maybe_no_grad` keys on exactly this. That matters now that
+    # the VLM's factors stay live: a caller who forgets `torch.inference_mode()` would
+    # otherwise tape the whole ViT forward on every observation.
+    model.requires_grad_(False)
     model.eval()
     return model, data_config
 
