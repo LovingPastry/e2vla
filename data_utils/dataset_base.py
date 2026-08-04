@@ -478,11 +478,22 @@ def gen_norm_xy_map(H: int, W: int, K: np.ndarray):
     Args:
         H (int): image height
         W (int): image width
-        K (np.ndarray): (Ncam, 3, 3)
-    
+        K (np.ndarray): (Ncam, 3, 3), or (3, 3) for a single camera
+
     Returns:
         norm_xy (np.ndarray): (Ncam, 2, H, W)
     """
+    K = np.asarray(K)
+    if K.ndim == 2:
+        # A bare (3, 3) reaches here whenever K did not come through
+        # `ImageProcessor.preprocess_images`, which is what stacks the per-camera list.
+        # Promote to Ncam=1 rather than failing: the caller's next line is
+        # `norm_xys[None].repeat(T)`, and a wrong Ncam would surface loudly downstream
+        # as a shape mismatch against rgbs anyway.
+        K = K[None]
+    if K.shape[-2:] != (3, 3):
+        raise ValueError("K must be (Ncam, 3, 3) or (3, 3), got {}".format(K.shape))
+
     fx = K[:, 0, 0]; fy = K[:, 1, 1]; cx = K[:, 0, 2]; cy = K[:, 1, 2]  # (ncam,)
     XX, YY = np.meshgrid(np.arange(W), np.arange(H), indexing="xy")
     grid = np.stack([XX, YY], axis=0)  # (2, H, W)
