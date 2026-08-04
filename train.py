@@ -12,8 +12,10 @@ from diffusers.optimization import get_scheduler
 from torch.utils.tensorboard import SummaryWriter
 
 from models import vla
+from models.action_norm import build_action_normalizer
 from configs import CONFIGS, TrainConfig
-from train_utils.ckpt import load_actor_weights, check_objective, OBJECTIVE
+from train_utils.ckpt import (load_actor_weights, check_objective,
+                              check_action_norm, OBJECTIVE)
 from train_utils.lora import setup_lora
 from train_utils.ema_impl import ExponentialMovingAverage
 from data_utils.dataset_base import get_dataloader, generate_sample_weights
@@ -105,8 +107,20 @@ class Trainer(object):
         print(self.cfg)
 
         self.model_device = "cuda:0"
-        self.model: vla.VLA = getattr(vla, "vla_" + self.cfg.model.strip()
-                                      )().to(self.model_device)
+        # Built before the model: the normalizer is a constructor argument, because both
+        # the dataset boundary (states2action/action2states) and the geometry inside the
+        # diffusion head need the same statistics.
+        self.action_norm = build_action_normalizer(
+            self.cfg.action_norm_stats, what="action_norm_stats")
+        if self.action_norm is None:
+            print("[INFO] No action normalization (action_norm_stats is unset): the head "
+                  "denoises raw camera-relative actions.")
+        else:
+            print("[INFO] Action normalization from {}:\n{}"
+                  .format(self.cfg.action_norm_stats, self.action_norm))
+
+        self.model: vla.VLA = getattr(vla, "vla_" + self.cfg.model.strip())(
+            action_norm=self.action_norm).to(self.model_device)
 
         print("[INFO] Total {:.3f}M trainable parameters"
               .format(count_trainable(self.model) / 1e6))
@@ -134,6 +148,10 @@ class Trainer(object):
                               map_location=self.model_device,
                               weights_only=False)
             check_objective(ckpt, what="resume checkpoint")
+            # A resume must continue the same optimisation problem, action space
+            # included -- no legitimate reason for these to differ.
+            check_action_norm(ckpt, self.action_norm, what="resume checkpoint",
+                              strict=True)
             # A resume checkpoint was written by an already-LoRA-ified model, so LoRA
             # must be injected BEFORE loading (opposite order from pretrained_ckpt).
             ckpt_rank = ckpt.get("lora_rank", 0)
@@ -153,6 +171,12 @@ class Trainer(object):
                               map_location=self.model_device,
                               weights_only=False)
             check_objective(ckpt, what="pretrained checkpoint")
+            # Not strict: fine-tuning a released (unnormalized) pretrain checkpoint with
+            # per-dataset q01/q99 statistics is a normal thing to want. It still gets a
+            # loud warning, because doing it unintentionally is indistinguishable from
+            # doing it on purpose right up until evaluation.
+            check_action_norm(ckpt, self.action_norm, what="pretrained checkpoint",
+                              strict=False)
             # Load into the PLAIN model first: released checkpoints have no LoRA keys.
             load_actor_weights(self.model.actor, ckpt["weights"],
                                strict=self.cfg.pretrained_strict,
@@ -257,15 +281,14 @@ class Trainer(object):
     def compute_metrics(self, data: Dict[str, Tensor]):
         data = self.preprocess_data(data, self.model_device)
         total_loss, metrics = self.model(
-            obs_rgbs=data["obs_rgbs"], 
-            obs_masks=data.get("obs_masks", None),
+            rgbs=data["rgbs"],
             obs_norm_xys=data["obs_norm_xys"],
             obs_extrinsics=data["obs_extrinsics"],
             prompt_text=data["prompt_text"],
 
-            current_ee_pose=data["current_ee_pose"],
-            history_ee_states=data["history_ee_states"],
-            gt_future_ee_states=data["gt_future_ee_states"], 
+            ee_poses=data["ee_poses"],
+            history_actions=data["history_actions"],
+            future_actions=data["future_actions"], 
             valid_ee_mask=data["valid_ee_mask"], 
             inference=False,
             fp16=self.scaler.is_enabled(),
@@ -305,6 +328,12 @@ class Trainer(object):
                 # so it would load here without a single missing key. The released
                 # pretrain checkpoints predate this stamp; ours all carry it.
                 "objective": OBJECTIVE,
+                # The action statistics are part of what the weights mean, so they
+                # travel with them. `infer_utils/planner.py` reads them back from here,
+                # which keeps evaluation correct even if the JSON has moved or the
+                # config file in the checkpoint dir was overwritten by a later run.
+                "action_norm": (None if self.action_norm is None
+                                else self.action_norm.to_dict()),
                 "current_iters": self.current_iters,
                 "last_ep": self.last_ep, 
                 "lr": self.scheduler.get_last_lr()[0], 

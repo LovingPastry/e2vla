@@ -11,17 +11,16 @@ from data_utils.dataset_base import DataConfig, H5DatasetMapBase
 # __getitem__(self, i) of H5DatasetMapBase return a dict of Tensors (except for `prompt_text`),
 # We list the name and shape as follows:
 
-# K:                    (ncam, 3, 3)
-# obs_rgbs:             (To, ncam, 3, H, W)
-# obs_masks:            (To, ncam, H, W)
-# prompt_text:          str
-# obs_norm_xys:         (To, ncam, 2, H, W), coordinates in normalized camera plane, 2 = (x, y)
-# obs_extrinsics:       (To, ncam, 4, 4)
-# current_ee_pose:      (nee, 4, 4)
-# history_ee_states:    (nhist, nee, 17), 17 = (16 for flattened 4x4 pose matrix (row major), 1 for gripper)
-# gt_future_ee_states:  (Ta, nee, 17)
-# timestamps:           (To,)
-# valid_ee_mask:        (nee,)
+# K:                (ncam, 3, 3)
+# rgbs:             (To, ncam, 3, H, W)
+# prompt_text:      str
+# obs_norm_xys:     (To, ncam, 2, H, W), coordinates in normalized camera plane, 2 = (x, y)
+# obs_extrinsics:   (To, ncam, 4, 4)
+# ee_poses:         (nee, 4, 4), current end-effector poses, ^{world}_{ee} T
+# history_actions:  (nhist, nee, 17), 17 = (16 for flattened 4x4 pose matrix (row major), 1 for gripper)
+# future_actions:   (Ta, nee, 17)
+# timestamps:       (To,)
+# valid_ee_mask:    (nee,)
 
 # NOTE:
 # To -> number of image observations
@@ -180,9 +179,9 @@ class Droid(H5DatasetMapBase):
     def adjust_ee_pose(self, out):
         fwd_axis = 2  # zaxis
         gripper_length = 0.15
-        for key in ["current_ee_pose"]:
+        for key in ["ee_poses"]:
             out[key][..., :3, 3] += out[key][..., :3, fwd_axis] * gripper_length
-        for key in ["history_ee_states", "gt_future_ee_states"]:
+        for key in ["history_actions", "future_actions"]:
             ee = out[key]  # (B, T, Nee, 17)
             Ta, Nee, _ = ee.shape
             pose = ee[..., :16].reshape(Ta, Nee, 4, 4)

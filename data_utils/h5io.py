@@ -250,8 +250,17 @@ def slice_encoded_frames(
     camera_group: h5py.Group, 
     indices: np.ndarray,
     timestamp: np.ndarray = None, 
-    video_root: str = None
+    video_root: str = None,
+    skip_rgb: bool = False
 ):
+    """Sample one camera group at `indices`.
+
+    `skip_rgb` returns a 1x1 placeholder instead of decoding the frames, and is only for
+    callers that need the geometry (`pose`, `K`) and not the pixels -- notably
+    `data_prepare/compute_action_stats.py`, where jpeg/video decoding is ~all the cost
+    and none of the answer. Everything else about the sampling stays identical, which is
+    the point: the statistics must describe exactly the windows training will see.
+    """
 
     sampled: Dict[str, np.ndarray] = {}
     if "K" in camera_group:
@@ -269,6 +278,10 @@ def slice_encoded_frames(
         if dset.dtype == np.object_:
             # compressed via jpeg encoding
             ind_clipped = np.clip(indices, 0, dset.len() - 1)
+
+            if skip_rgb:
+                sampled[k] = np.zeros((len(indices), 3, 1, 1), dtype=np.float32)
+                continue
 
             first_sample = dset[ind_clipped[0]]
 

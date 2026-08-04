@@ -33,6 +33,19 @@ class TrainConfig(object):
     # NOTE: this changes the checkpoint's state_dict layout -- see train_utils/lora.py.
     lora_rank: int = 0
 
+    # Path to a q01/q99 action-statistics JSON, produced by
+    #   python -m data_prepare.compute_action_stats --config THIS_CONFIG -o PATH
+    # None disables action normalization, which is the historical behaviour: the model
+    # then denoises raw camera-relative deltas (metres for translation, near-identity 6D
+    # rotation), whose per-channel scales are wildly different from the unit-variance
+    # noise DDIM samples.
+    #
+    # The statistics are over the *model's* action space, not the dataset's raw poses,
+    # so a file computed for one dataset/DataConfig combination does not transfer to
+    # another. Recompute per fine-tuning set. The resolved stats are copied into every
+    # checkpoint, so evaluation does not need this path to still exist.
+    action_norm_stats: str | None = None
+
     bs: int = 32  # batch size
     workers: int = 4  # num_workers
     fp16: bool = True  # enable mixed precision training (fp32 and bfloat16)

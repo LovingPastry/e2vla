@@ -54,6 +54,67 @@ def check_objective(ckpt: dict, what: str = "checkpoint"):
     return objective
 
 
+def check_action_norm(ckpt: dict, action_norm, what: str = "checkpoint",
+                      strict: bool = True):
+    """Verify a checkpoint's action normalization matches the one being used.
+
+    Same class of hazard as `check_objective`, and it is worth spelling out because the
+    failure is even quieter. q01/q99 normalization is an affine reparameterisation of
+    the action space; it changes *no* tensor name and *no* tensor shape. A checkpoint
+    trained on normalized actions, loaded into a model with no normalizer, loads
+    perfectly, trains to a plausible loss, and drives the arm with actions that are off
+    by roughly the inverse of the affine -- a factor of ~20 on translation. Nothing but
+    the stored statistics can catch it.
+
+    Args:
+        ckpt: the loaded checkpoint dict
+        action_norm: `ActionNormalizer` or None, what this run is about to use
+        what: label used in messages
+        strict: raise on mismatch. False downgrades to a warning, which is what
+            fine-tuning wants: adapting a checkpoint to a new action normalization is a
+            legitimate thing to do, it just must not happen by accident.
+
+    Returns:
+        bool, True if the checkpoint's normalization matches `action_norm`
+    """
+    # A checkpoint predating this feature carries no key, which means "no normalization"
+    # -- the same default the config has, so the common case stays silent.
+    stored = ckpt.get("action_norm", None)
+
+    if stored is None and action_norm is None:
+        return True
+
+    if stored is not None and action_norm is not None:
+        from models.action_norm import ActionNormalizer
+        if action_norm.matches(ActionNormalizer.from_dict(stored, what=what)):
+            return True
+        message = ("{}: action normalization statistics differ from the ones this run "
+                   "uses. The weights load without a single missing key -- normalization "
+                   "is an affine on the action space, not a tensor -- and the policy then "
+                   "acts on a mis-scaled action.".format(what))
+    elif stored is None:
+        message = ("{}: was trained WITHOUT action normalization, but this run uses "
+                   "q01/q99 normalized actions. The action space the weights were fit to "
+                   "is not the one they are about to be used in.".format(what))
+    else:
+        message = ("{}: was trained WITH q01/q99 action normalization, but this run has "
+                   "no action stats (action_norm_stats is unset). Predictions would be "
+                   "interpreted in normalized units and executed as metres."
+                   .format(what))
+
+    if strict:
+        raise ValueError(
+            message + "\n\nEither point --action_norm_stats at the statistics this "
+            "checkpoint was trained with, or pass the flag that relaxes this check if "
+            "you are deliberately re-normalizing during fine-tuning.")
+
+    print("[WARN] " + message)
+    print("[WARN] Continuing anyway. This is only correct if you intend to re-fit the "
+          "action head to the new action space -- expect the first few thousand steps to "
+          "look like training from scratch on the affected layers.")
+    return False
+
+
 class CkptCompatReport(object):
     """Result of matching a checkpoint's tensors against a live module."""
 

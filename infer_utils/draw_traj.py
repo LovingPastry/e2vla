@@ -23,9 +23,9 @@ def visualize_traj(
     Returns:
         bgrs: image to visualize
     """
-    # data["obs_rgbs"]: (To, ncam, C, H, W)
-    To, ncam, _, H, W = data["obs_rgbs"].shape
-    rgb = rearrange(data["obs_rgbs"][-1], "n c h w -> n h w c")  # latest time
+    # data["rgbs"]: (To, ncam, C, H, W)
+    To, ncam, _, H, W = data["rgbs"].shape
+    rgb = rearrange(data["rgbs"][-1], "n c h w -> n h w c")  # latest time
     
     # data["K"]: (ncam, 3, 3)
     K = data["K"]  # (ncam, 3, 3)
@@ -43,8 +43,8 @@ def visualize_traj(
     valid_ee_mask = data["valid_ee_mask"]  # (nee)
     valid_ee_mask_np = valid_ee_mask.cpu().numpy()
     
-    nhist, nee, _ = data["history_ee_states"].shape
-    history_weTs = data["history_ee_states"][:, :, :16].view(nhist, nee, 4, 4)
+    nhist, nee, _ = data["history_actions"].shape
+    history_weTs = data["history_actions"][:, :, :16].view(nhist, nee, 4, 4)
     history_weTs_np = history_weTs.cpu().numpy()
     
     bgrs = np.ascontiguousarray(rgb.flip(-1).cpu().numpy())  # (ncam, H, W, C)

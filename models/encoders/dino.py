@@ -164,16 +164,6 @@ class Encoder(nn.Module):
         gx = rearrange(gx, "(b t n) c -> b t n c", b=B, t=T, n=N)
         return x_ds, gx
     
-    def pool_mv_masks(self, mask: Tensor):
-        if mask is not None:
-            B, T, N, H, W = mask.shape
-            mask = rearrange(mask, "b t n h w -> (b t n) () h w")
-            mask_ds = self.frozen.encode_aux(mask)
-            mask_ds = rearrange(mask_ds, "(b t n) l 1 -> b t n l", b=B, t=T, n=N)
-        else:
-            mask_ds = None
-        return mask_ds
-    
     def pool_mv_aux(self, aux: Tensor):
         if aux is not None:
             B, T, N, C, H, W = aux.shape
@@ -192,7 +182,6 @@ class Encoder(nn.Module):
     def forward(
         self, 
         rgb: Tensor, 
-        mask: Tensor, 
         norm_xy: Tensor, 
         extrinsic: Tensor, 
         **aux_tensors: Tensor
@@ -200,7 +189,6 @@ class Encoder(nn.Module):
         """
         Args:
             rgb (Tensor): (B, T, N, 3, H, W)
-            mask (Tensor): (B, T, N, H, W)
             norm_xy (Tensor): (B, T, N, 2, H, W)
             extrinsic (Tensor): (B, T, N, 4, 4), ^ref_cam T
             aux_tensors (Tensor): each of (B, T, N, C, H, W)
@@ -210,11 +198,9 @@ class Encoder(nn.Module):
                 - x:    tensor of shape (B, To, Ncam, L, C) patch feature
                 - gx:   tensor of shape (B, To, Ncam, C), projected global feature, not masked
                 - pe:   tensor of shape (B, To, Ncam, L, 6), ray pe
-                - mask: tensor of shape (B, To, Ncam, L) or None, patch mask
                 - aux:  {aux_user_key: tensor of shape (B, To, Ncam, L, ...)}
         """
         x_ds, gx = self.encode_mv_images(rgb)
-        mask_ds = self.pool_mv_masks(mask)
         norm_xy_ds, pe = self.ray_encoding(norm_xy, extrinsic)
         aux_ds = {k:self.pool_mv_aux(a) for k, a in aux_tensors.items()}
 
@@ -222,7 +208,6 @@ class Encoder(nn.Module):
             "x": x_ds,       # (B, T, N, L, C)
             "gx": gx,        # (B, T, N, C)
             "pe": pe,        # (B, T, N, L, 6)
-            "mask": mask_ds, # (B, T, N, L) or None
             "aux": aux_ds,   # (B, T, N, L, ...) of each entry
         }
 

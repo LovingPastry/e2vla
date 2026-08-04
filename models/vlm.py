@@ -19,36 +19,34 @@ class VLM(nn.Module):
             p.requires_grad_(False)
 
     def forward(
-        self, 
-        obs_rgbs: Tensor,
-        obs_masks: Tensor, 
-        obs_norm_xys: Tensor, 
-        obs_extrinsics: Tensor, 
-        prompt_text: List[str], 
+        self,
+        rgbs: Tensor,
+        obs_norm_xys: Tensor,
+        obs_extrinsics: Tensor,
+        prompt_text: List[str],
         fp16: bool
     ):
-        
+
         with torch.no_grad():
-            x_dinov2, gx_dinov2 = self.dinov2.encode_mv_images(obs_rgbs)
-            x_siglip, gx_siglip = self.siglip.encode_mv_images(obs_rgbs)
+            x_dinov2, gx_dinov2 = self.dinov2.encode_mv_images(rgbs)
+            x_siglip, gx_siglip = self.siglip.encode_mv_images(rgbs)
             x_text, gx_text = self.siglip.encode_text(prompt_text)
-        
-        mask_ds = self.siglip.pool_mv_masks(obs_masks)
+
         norm_xy_ds = self.siglip.pool_mv_aux(obs_norm_xys)
-        
+
         obs = {
-            "rgb": obs_rgbs,
-            "mask": obs_masks,
+            "rgb": rgbs,
             "norm_xy": obs_norm_xys,
-            "extrinsics": obs_extrinsics, 
+            "extrinsics": obs_extrinsics,
             "text": prompt_text,
         }
-        
+
+        # Every patch of every camera is valid: images are dense and the dataset no
+        # longer carries segmentation, so attention runs unmasked over vision tokens.
         feature = {
-            "norm_xy_ds": norm_xy_ds[:, -1],        # (B, Ncam, Lv, 2) 
-            "vision_embeds": [x_dinov2[:, -1], 
+            "norm_xy_ds": norm_xy_ds[:, -1],        # (B, Ncam, Lv, 2)
+            "vision_embeds": [x_dinov2[:, -1],
                               x_siglip[:, -1]],     # List of (B, Ncam, Lv, C)
-            "vision_mask": mask_ds[:, -1],          # (B, Ncam, Lv)
             "lang_embeds": [x_text],                # List of (B, La, C)
             "lang_mask": None,                      # (B, La)
             "extrinsics": obs_extrinsics[:, -1]

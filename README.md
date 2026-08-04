@@ -394,11 +394,46 @@ LoRA 注入 `ContextEncoder` 中所有注意力投影(`to_q`/`to_k`/`to_v` 及�
 - **`lora_rank > 0` 时必须传 `--pretrained_ckpt`**,否则直接拒绝运行:LoRA 冻结的基座权重如果本身是随机初始化的,等于 60% 的参数被永久卡在初始化状态。
 - 部署时的 merge 必须在 EMA `copy_to` **之后**:EMA 的 shadow 参数就是 LoRA 因子本身,先 merge 会把 EMA 权重丢掉。
 
-### 部署时的开销:零
+### 部署时的开销:零(LoRA)
 
 `infer_utils/planner.py` 的 `load_model` 会自动读取 checkpoint 里的 `lora_rank`,注入、加载、然后调用 `merge_lora_linear` 把 `A @ B` 折进基座权重。merge 之后模型退回成一个普通的 `ActionExpert`,没有任何 `LoraLinear` 残留,推理没有额外算子和显存开销。整条链路(训练态输出 vs 部署态 merge 后输出)的数值漂移在 float32 下约 `1e-6`。
 
 > 关于数值:LoRA 注入时 `B` 是零初始化的,所以 `lin(x) + (x @ A) @ B` 在函数意义上与 `lin(x)` 完全等价。但端到端测下来 context 输出会有约 `1e-6` 的漂移 —— 这不是逻辑错误:`lin(x) + 0` 会分配一个新张量,落在不同地址,可能走不同的 matmul/SDPA kernel 分块路径。已验证:把线程数钉到 1 时漂移显著减小,参数逐位相同,每个 `LoraLinear` 的输出与其基座 `Linear` 逐位相同。作为尺度参考,训练跑在 bfloat16 下,其 eps(~8e-3)比这个漂移大约 4000 倍。
+
+## 3.6 动作归一化(q01/q99)
+
+默认**关闭**,`action_norm_stats` 不设就是历史行为。开启后,模型动作空间的每个通道按其 1%/99% 分位数线性映射到 `[-1, 1]`。
+
+### 为什么
+
+模型的动作不是数据集里的绝对位姿,而是 `space_ee2cam` 产出的**相机系相对量**:3 维平移 + 6D 旋转 + 夹爪开合,共 10 维。这 10 个通道的量纲差得很远 —— 平移是米(约 `1e-2`),而一个接近单位阵的 delta 的 6D 旋转是 `[1, 0, 0, 0, 1, 0]`,两个通道钉在 1 附近、四个钉在 0 附近。DDIM 从 `N(0, I)` 采样并预测 epsilon,隐含假设被去噪的干净数据是单位尺度的,现状并不满足。
+
+用分位数而不是均值/方差:遥操作数据里有罕见的大跳变(跟踪丢失、操作员复位),标准差会被这些尾巴主导,反而把真正重要的那 98% 的运动压扁。
+
+### 用法
+
+```bash
+# 1. 统计。必须对着将要训练的那个 config 算 —— 统计量是 config 的属性,不是磁盘上数据的属性
+python -m data_prepare.compute_action_stats --config finetune_libero_10 \
+  -o ./action_stats/libero_10.json
+
+# 2. 训练时指向它
+CUDA_VISIBLE_DEVICES=0 python train.py --config finetune_libero_10 \
+  --action-norm-stats ./action_stats/libero_10.json \
+  --pretrained_ckpt PRETRAIN.pt -s FT_EXP
+
+# 3. 评测不需要任何额外参数,统计量已经存进 checkpoint 了
+```
+
+统计脚本不解码图像(`skip_rgb`),因为动作空间不依赖像素,而解码几乎是全部的耗时;除像素外的采样、对齐、时间窗口都与训练完全一致。它默认同时统计 `history_actions` 和 `future_actions`(两者共用同一个 normalizer),`--future-only` 可以只统计预测的 chunk。
+
+### 几个不显然但重要的点
+
+- **统计量不可跨数据集复用。** 它是在相机系相对动作上算的,依赖 DataConfig(哪几个相机、`sample_state_gaps`、未来时域、是否 shuffle 相机)。换一个微调集就重算一次。
+- **clip 不作用于旋转通道**(`DEFAULT_CLIP_DIMS = (0, 1, 2, 9)`)。平移和开合度是度量量,超界意味着危险的跳变,该 clip;6D 旋转要经过 `rotation_6d_to_matrix` 的 Gram-Schmidt,是「看方向、不看模长」的量,超界无害,而 clip 会把整个越界半空间塌缩到同一个角点 —— 一旦两个 3 维向量共线,Gram-Schmidt 会返回一个带零行的矩阵,那根本不是旋转矩阵。未训练的模型第一次前向就能走到这个状态。
+- **近似常数的通道会被自动跳过**(`q99 - q01 < 1e-6` 时 scale=1、offset=0),不会除以 0。脚本会在表格里把这些通道标出来 —— 看到它先怀疑是不是采样窗口太少,而不是数据真的退化。
+- **归一化不改变任何张量的名字和形状。** 一个在归一化动作上训练的 checkpoint,加载到没有 normalizer 的模型里会**零缺失 key 地加载成功**,loss 曲线看着正常,然后机器人执行的动作差了大约一个仿射的倒数。因此统计量会被写进 checkpoint 的 `action_norm` 字段,`train_utils/ckpt.py:check_action_norm` 在续训时严格比对(不一致直接报错),从预训练 ckpt 微调时降级为大声警告(拿官方无归一化的 ckpt 配上自己数据的分位数微调是合理操作,但不该是无意中发生的)。这和 `objective` 那个 stamp 防的是同一类问题。
+- 推理侧的解析顺序和 `lora_rank` 一致:**checkpoint 里的记录优先于 config json**,因为同一个目录下的 json 可能被后来的 run 覆盖掉。
 
 ## 4. 部署
 

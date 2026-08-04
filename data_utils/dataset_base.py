@@ -83,44 +83,32 @@ class DataSampler(object):
         cls,
         Ks: List[np.ndarray],
         rgbs: List[np.ndarray],
-        masks: Optional[List[np.ndarray]],
         output_image_hw: Optional[Tuple[int, int]] = None
     ):
         processed_Ks = []
         processed_rgbs = []
-        processed_masks = []
-        
+
         for cam_idx, rgb in enumerate(rgbs):
             # rgb: (T, 3, H, W)
             K = Ks[cam_idx]  # (3, 3)
 
             if rgb.dtype == np.uint8:
                 rgb = rgb.astype(np.float32) / 255.
-            
-            if masks is None or masks[cam_idx] is None:
-                T, _, Hin, Win = rgb.shape
-                mask = np.ones((T, Hin, Win), dtype=bool)
-            else:
-                mask = masks[cam_idx]
-            
+
             if output_image_hw is not None:
                 Hout, Wout = output_image_hw
                 rgb, metadata = ImageProcessor.scale_to_fit(rgb, Hout, Wout)
-                mask, metadata = ImageProcessor.scale_to_fit(mask, Hout, Wout)
                 K = ImageProcessor.tform_K_for_scale_to_fit(K, **metadata)
 
                 rgb, metadata = ImageProcessor.center_view(rgb, Hout, Wout)
-                mask, metadata = ImageProcessor.center_view(mask, Hout, Wout)
                 K = ImageProcessor.tform_K_for_center_view(K, **metadata)
-            
+
             processed_Ks.append(K)
             processed_rgbs.append(rgb)
-            processed_masks.append(mask)
-        
+
         processed_Ks = np.stack(processed_Ks, axis=0)  # (Ncam, 3, 3)
         processed_rgbs = np.stack(processed_rgbs, axis=1)  # (T, Ncam, 3, H, W)
-        processed_masks = np.stack(processed_masks, axis=1)  # (T, Ncam, H, W)
-        return processed_Ks, processed_rgbs, processed_masks
+        return processed_Ks, processed_rgbs
 
     @classmethod
     def sample_framedict(
@@ -135,9 +123,8 @@ class DataSampler(object):
         sample_state_gaps: int = 1,
         sample_camera_gaps: int = 1, 
         sample_dt: float = 1.0,
-        record_dt: Optional[float] = None, 
-        output_image_hw: Optional[Tuple[int, int]] = None, 
-        enable_seg: bool = False, 
+        record_dt: Optional[float] = None,
+        output_image_hw: Optional[Tuple[int, int]] = None,
         pad2ncam: int = -1,
         pad2nee: int = -1
     ):
@@ -154,7 +141,6 @@ class DataSampler(object):
                 - K: np.ndarray of shape (3, 3) or (9,)
             - data:
                 - color: np.ndarray, shape=(H, W, C)
-                - seg: None | np.ndarray of shape (H, W) | isaacsim seg output
                 - wcT: np.ndarray of shape (4, 4), ^{world}_{cam} T
         
         - CAMERA_NAME_1: similar as CAMERA_NAME_0
@@ -190,13 +176,14 @@ class DataSampler(object):
                     obs_across_cams[k] = []
                 obs_across_cams[k].append(v)
 
-        K, rgbs, masks = cls.preprocess_images(
+        K, rgbs = cls.preprocess_images(
             Ks=obs_across_cams["K"],
             rgbs=obs_across_cams["rgb"],
-            masks=obs_across_cams.get("mask", None) if enable_seg else None,
-            output_image_hw=output_image_hw
+            # resizing a 1x1 placeholder up to the training resolution would allocate
+            # real memory to hold zeros
+            output_image_hw=None if skip_rgb else output_image_hw
         )
-        # K: (ncam, 3, 3); rgbs: (T, ncam, 3, H, W); masks: (T, ncam, H, W)
+        # K: (ncam, 3, 3); rgbs: (T, ncam, 3, H, W)
         
         cam_poses = np.stack(obs_across_cams["pose"], axis=1)   # (T, ncam, 4, 4)
         ee_poses = h5io.gather_ee_poses(obs_traj, prev_obs_sample_ind)  # (T, nee, 4, 4)
@@ -216,7 +203,7 @@ class DataSampler(object):
             train_data=all_states,
             interp_funcs=interp_funcs
         )
-        history_states = h5io.compose_ee_gripper(
+        history_actions = h5io.compose_ee_gripper(
             ee_poses=history_queries["ee_pose"], 
             grippers=history_queries["gripper"]
         )
@@ -227,7 +214,7 @@ class DataSampler(object):
             train_data=all_states,
             interp_funcs=interp_funcs,
         )
-        future_states = h5io.compose_ee_gripper(
+        future_actions = h5io.compose_ee_gripper(
             ee_poses=future_queries["ee_pose"],
             grippers=future_queries["gripper"]
         )
@@ -235,45 +222,43 @@ class DataSampler(object):
         # pad to n camera
         if pad2ncam > 0:
             rgbs = cls.pad2ncam(rgbs, pad2ncam, dim=1, zero_init=True)
-            masks = cls.pad2ncam(masks, pad2ncam, dim=1, zero_init=True)
             cam_poses = cls.pad2ncam(cam_poses, pad2ncam, dim=1, zero_init=False)
             K = cls.pad2ncam(K, pad2ncam, dim=0, zero_init=False)
         
         # previous data has only one ee, therefore we preserve this for compatility
         if ee_poses.ndim == 3:
             ee_poses = ee_poses[:, None]  # (To, 4, 4) -> (To, Nee=1, 4, 4)
-        if history_states.ndim == 2:
-            history_states = history_states[:, None]  # (nhist, 17) -> (nhist, Nee=1, 17)
-        if future_states.ndim == 2:
-            future_states = future_states[:, None]  # (Ta, 17) -> (Ta, Nee=1, 17)
+        if history_actions.ndim == 2:
+            history_actions = history_actions[:, None]  # (nhist, 17) -> (nhist, Nee=1, 17)
+        if future_actions.ndim == 2:
+            future_actions = future_actions[:, None]  # (Ta, 17) -> (Ta, Nee=1, 17)
         
         # select ee by indices
         assert isinstance(ee_indices, (list, tuple))
         ee_poses = ee_poses.take(ee_indices, axis=1)
-        history_states = history_states.take(ee_indices, axis=1)
-        future_states = future_states.take(ee_indices, axis=1)
+        history_actions = history_actions.take(ee_indices, axis=1)
+        future_actions = future_actions.take(ee_indices, axis=1)
         
         # pad to n ee
         current_nee = len(ee_indices)
         if pad2nee > 0:
             ee_poses = cls.pad2nee(ee_poses, pad2nee, dim=1)
-            history_states = cls.pad2nee(history_states, pad2nee, dim=1)
-            future_states = cls.pad2nee(future_states, pad2nee, dim=1)
+            history_actions = cls.pad2nee(history_actions, pad2nee, dim=1)
+            future_actions = cls.pad2nee(future_actions, pad2nee, dim=1)
             valid_ee_mask = np.zeros(pad2nee, dtype=bool)
             valid_ee_mask[:current_nee] = True
         else:
             valid_ee_mask = np.ones(current_nee, dtype=bool)
 
         return (
-            rgbs,                               # (To, ncam, 3, H, W)
-            masks,                              # (To, ncam, H, W)
-            cam_poses.astype(np.float32),       # (To, ncam, 4, 4)
-            ee_poses.astype(np.float32),        # (To, nee, 4, 4)
-            history_states.astype(np.float32),  # (nhist, nee, 17)
-            future_states.astype(np.float32),   # (Ta, nee, 17)
-            current_time,                       # scalar,
-            K.astype(np.float32),               # (ncam, 3, 3)
-            valid_ee_mask,                      # (nee,)
+            rgbs,                                # (To, ncam, 3, H, W)
+            cam_poses.astype(np.float32),        # (To, ncam, 4, 4)
+            ee_poses.astype(np.float32),         # (To, nee, 4, 4)
+            history_actions.astype(np.float32),  # (nhist, nee, 17)
+            future_actions.astype(np.float32),   # (Ta, nee, 17)
+            current_time,                        # scalar,
+            K.astype(np.float32),                # (ncam, 3, 3)
+            valid_ee_mask,                       # (nee,)
         )
 
     @classmethod
@@ -290,14 +275,18 @@ class DataSampler(object):
         sample_camera_gaps: int = 1,
         sample_dt: float = 1.0,
         record_dt: Optional[float] = None, 
-        output_image_hw: Optional[Tuple[int, int]] = None, 
-        enable_seg: bool = False, 
+        output_image_hw: Optional[Tuple[int, int]] = None,
         pad2ncam: int = -1,
-        pad2nee: int = -1, 
+        pad2nee: int = -1,
         video_root: Optional[str] = None,
-        debug_sample_index: Optional[int] = None
+        debug_sample_index: Optional[int] = None,
+        skip_rgb: bool = False
     ):
         """
+        `skip_rgb` returns a 1x1 placeholder for `rgbs` (and leaves K unrescaled) instead
+        of decoding frames. Only the action/pose outputs are meaningful then; see
+        `h5io.slice_encoded_frames`.
+
         obs_traj is a tree-like data structure
         - ee_pose: np.ndarray of shape (T, nee, 4, 4)
         - gripper: np.ndarray of shape (T, nee)
@@ -343,20 +332,22 @@ class DataSampler(object):
                 obs_traj[cam_name], 
                 prev_obs_sample_ind,
                 timestamp=all_timestamps,  # use original timestamp to iter video file
-                video_root=video_root
+                video_root=video_root,
+                skip_rgb=skip_rgb
             )
             for k, v in obs_cam.items():
                 if k not in obs_across_cams:
                     obs_across_cams[k] = []
                 obs_across_cams[k].append(v)
         
-        K, rgbs, masks = cls.preprocess_images(
+        K, rgbs = cls.preprocess_images(
             Ks=obs_across_cams["K"],
             rgbs=obs_across_cams["rgb"],
-            masks=obs_across_cams.get("mask", None) if enable_seg else None,
-            output_image_hw=output_image_hw
+            # resizing a 1x1 placeholder up to the training resolution would allocate
+            # real memory to hold zeros
+            output_image_hw=None if skip_rgb else output_image_hw
         )
-        # K: (ncam, 3, 3); rgbs: (T, ncam, 3, H, W); masks: (T, ncam, H, W)
+        # K: (ncam, 3, 3); rgbs: (T, ncam, 3, H, W)
         
         cam_poses = np.stack(obs_across_cams["pose"], axis=1)   # (T, ncam, 4, 4)
         ee_poses = h5io.slice_dset(obs_traj["ee_pose"], prev_obs_sample_ind)  # (T, 4, 4)
@@ -383,7 +374,7 @@ class DataSampler(object):
             train_data=all_states,
             interp_funcs=interp_funcs
         )
-        history_states = h5io.compose_ee_gripper(
+        history_actions = h5io.compose_ee_gripper(
             ee_poses=history_queries["ee_pose"], 
             grippers=history_queries["gripper"]
         )
@@ -418,7 +409,7 @@ class DataSampler(object):
                 interp_funcs={"ee_pose": align.interp_SE3_sep}
             )["ee_pose"]  # (L, nee, 4, 4)
         
-        future_states = h5io.compose_ee_gripper(
+        future_actions = h5io.compose_ee_gripper(
             ee_poses=future_ee_poses,
             grippers=future_grippers
         )  # (L, nee, 17)
@@ -426,17 +417,16 @@ class DataSampler(object):
         # pad to n camera
         if pad2ncam > 0:
             rgbs = cls.pad2ncam(rgbs, pad2ncam, dim=1, zero_init=True)
-            masks = cls.pad2ncam(masks, pad2ncam, dim=1, zero_init=True)
             cam_poses = cls.pad2ncam(cam_poses, pad2ncam, dim=1, zero_init=False)
             K = cls.pad2ncam(K, pad2ncam, dim=0, zero_init=False)
         
         # previous data has only one ee, therefore we preserve this for compatility
         if ee_poses.ndim == 3:
             ee_poses = ee_poses[:, None]  # (To, 4, 4) -> (To, Nee=1, 4, 4)
-        if history_states.ndim == 2:
-            history_states = history_states[:, None]  # (nhist, 17) -> (nhist, Nee=1, 17)
-        if future_states.ndim == 2:
-            future_states = future_states[:, None]  # (Ta, 17) -> (Ta, Nee=1, 17)
+        if history_actions.ndim == 2:
+            history_actions = history_actions[:, None]  # (nhist, 17) -> (nhist, Nee=1, 17)
+        if future_actions.ndim == 2:
+            future_actions = future_actions[:, None]  # (Ta, 17) -> (Ta, Nee=1, 17)
         
         # select ee by indices
         if "ee_indices" in obs_traj.attrs:
@@ -453,15 +443,15 @@ class DataSampler(object):
         
         assert isinstance(ee_indices, (list, tuple, np.ndarray))
         ee_poses = ee_poses.take(ee_indices, axis=1)
-        history_states = history_states.take(ee_indices, axis=1)
-        future_states = future_states.take(ee_indices, axis=1)
+        history_actions = history_actions.take(ee_indices, axis=1)
+        future_actions = future_actions.take(ee_indices, axis=1)
         
         # pad to n ee
         current_nee = len(ee_indices)
         if pad2nee > 0:
             ee_poses = cls.pad2nee(ee_poses, pad2nee, dim=1)
-            history_states = cls.pad2nee(history_states, pad2nee, dim=1)
-            future_states = cls.pad2nee(future_states, pad2nee, dim=1)
+            history_actions = cls.pad2nee(history_actions, pad2nee, dim=1)
+            future_actions = cls.pad2nee(future_actions, pad2nee, dim=1)
             valid_ee_mask = np.zeros(pad2nee, dtype=bool)
             valid_ee_mask[:current_nee] = True
         else:
@@ -472,15 +462,14 @@ class DataSampler(object):
             rgbs = np.ascontiguousarray(np.flip(rgbs, axis=2))
 
         return (
-            rgbs,                               # (To, ncam, 3, H, W)
-            masks,                              # (To, ncam, H, W)
-            cam_poses.astype(np.float32),       # (To, ncam, 4, 4)
-            ee_poses.astype(np.float32),        # (To, nee, 4, 4)
-            history_states.astype(np.float32),  # (nhist, nee, 17)
-            future_states.astype(np.float32),   # (Ta, nee, 17)
-            current_time,                       # scalar,
-            K.astype(np.float32),               # (ncam, 3, 3)
-            valid_ee_mask,                      # (nee,)
+            rgbs,                                # (To, ncam, 3, H, W)
+            cam_poses.astype(np.float32),        # (To, ncam, 4, 4)
+            ee_poses.astype(np.float32),         # (To, nee, 4, 4)
+            history_actions.astype(np.float32),  # (nhist, nee, 17)
+            future_actions.astype(np.float32),   # (Ta, nee, 17)
+            current_time,                        # scalar,
+            K.astype(np.float32),                # (ncam, 3, 3)
+            valid_ee_mask,                       # (nee,)
         )
 
 
@@ -515,7 +504,6 @@ class DataConfig(object):
     ### used in training and real-world execution
     ee_indices: Tuple[int]
     camera_names: Tuple[str]
-    enable_seg: bool = False  # segment image patches if mask is available
 
     sample_state_gaps: int = 1
     sample_camera_gaps: int = 4
@@ -623,6 +611,9 @@ class H5DatasetMapBase(Dataset):
     ):
         self.h5_filelist = h5_filelist
         self.data_sampler = DataSampler()
+        # opt-out of image decoding; see `H5DatasetMapBase.sample_from_hdf5`. Set by
+        # data_prepare/compute_action_stats.py, never during training.
+        self.skip_rgb = False
 
         if isinstance(self.config.camera_names, str):
             # wrap to tuple
@@ -668,8 +659,8 @@ class H5DatasetMapBase(Dataset):
             camera_names = self.config.camera_names
 
         (
-            obs_rgbs, obs_masks, obs_cam_poses, obs_ee_poses, 
-            history_states, future_states, timestamps, K, valid_ee_mask
+            rgbs, obs_cam_poses, obs_ee_poses,
+            history_actions, future_actions, timestamps, K, valid_ee_mask
         ) = self.data_sampler.sample_hdf5(
             obs_traj=h5, 
             default_ee_indices=self.config.ee_indices,
@@ -683,27 +674,26 @@ class H5DatasetMapBase(Dataset):
             sample_dt=self.config.sample_dt,
             record_dt=self.config.record_dt, 
             output_image_hw=self.config.output_image_hw,
-            enable_seg=self.config.enable_seg,
             pad2ncam=self.pad2ncam,
             pad2nee=self.pad2nee,
             video_root=self.config.video_root,
-            debug_sample_index=debug_sample_index
+            debug_sample_index=debug_sample_index,
+            skip_rgb=self.skip_rgb
         )
 
-        T, ncam, C, H, W = obs_rgbs.shape
+        T, ncam, C, H, W = rgbs.shape
         norm_xys = gen_norm_xy_map(H, W, K).astype(np.float32)
         norm_xys = norm_xys[None].repeat(T, axis=0)  # (T, ncam, 2, H, W)
         
         out = {
             "K": K,                                 # (ncam, 3, 3)
-            "obs_rgbs": obs_rgbs,                   # (To, ncam, 3, H, W)
-            "obs_masks": obs_masks,                 # (To, ncam, H, W)
+            "rgbs": rgbs,                           # (To, ncam, 3, H, W)
             "prompt_text": prompt_text,             # str
             "obs_norm_xys": norm_xys,               # (To, ncam, 2, H, W)
             "obs_extrinsics": obs_cam_poses,        # (To, ncam, 4, 4)
-            "current_ee_pose": obs_ee_poses[-1],    # (nee, 4, 4)
-            "history_ee_states": history_states,    # (nhist, nee, 17)
-            "gt_future_ee_states": future_states,   # (Ta, nee, 17)
+            "ee_poses": obs_ee_poses[-1],           # (nee, 4, 4)
+            "history_actions": history_actions,     # (nhist, nee, 17)
+            "future_actions": future_actions,       # (Ta, nee, 17)
             "timestamps": timestamps,               # (To,)
             "valid_ee_mask": valid_ee_mask,         # (nee,)
         }
@@ -851,9 +841,9 @@ def draw_ee_proj(bgr: np.ndarray, K: np.ndarray, cwT: np.ndarray, pose: np.ndarr
 
 
 def visualize_traj(data: Dict[str, Tensor]):
-    # data["obs_rgbs"]: (To, ncam, C, H, W)
-    To, ncam, _, H, W = data["obs_rgbs"].shape
-    rgb = rearrange(data["obs_rgbs"][-1], "n c h w -> n h w c")  # latest time
+    # data["rgbs"]: (To, ncam, C, H, W)
+    To, ncam, _, H, W = data["rgbs"].shape
+    rgb = rearrange(data["rgbs"][-1], "n c h w -> n h w c")  # latest time
     
     # data["K"]: (ncam, 3, 3)
     K = data["K"]  # (ncam, 3, 3)
@@ -867,12 +857,12 @@ def visualize_traj(data: Dict[str, Tensor]):
         bgrs = rearrange(rgb.flip(-1).cpu().numpy(), "n h w c -> h (n w) c")
         return np.ascontiguousarray(bgrs)
 
-    # data["gt_future_ee_states"]: (Ta, nee, 4*4+1)
-    Ta, nee, _ = data["gt_future_ee_states"].shape
-    weTs = data["gt_future_ee_states"][:, :, :16].view(Ta, nee, 4, 4)  # (Ta, nee, 4, 4)
+    # data["future_actions"]: (Ta, nee, 4*4+1)
+    Ta, nee, _ = data["future_actions"].shape
+    weTs = data["future_actions"][:, :, :16].view(Ta, nee, 4, 4)  # (Ta, nee, 4, 4)
 
-    nhist, nee, _ = data["history_ee_states"].shape
-    history_weTs = data["history_ee_states"][:, :, :16].view(nhist, nee, 4, 4)
+    nhist, nee, _ = data["history_actions"].shape
+    history_weTs = data["history_actions"][:, :, :16].view(nhist, nee, 4, 4)
 
     ceTs = (
         rearrange(torch.inverse(wcT), "ncam r c -> () () ncam r c") @ 
@@ -963,12 +953,12 @@ def visualize_dataset(
         
         bgrs = visualize_traj(
             data=out,
-            # future_ee_states=[out["gt_future_ee_states"]],
+            # future_ee_states=[out["future_actions"]],
             # colors=[(0, 255, 0)]
         )
         
         print("[INFO] future grippers = \n{}".format(
-            out["gt_future_ee_states"][:, out["valid_ee_mask"], -1].transpose(0, 1)))
+            out["future_actions"][:, out["valid_ee_mask"], -1].transpose(0, 1)))
         
         cv2.imshow("gt traj", bgrs)
         key = cv2.waitKey(0)

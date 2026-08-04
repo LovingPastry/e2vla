@@ -13,6 +13,7 @@ from .ensemble import TrajEnsembler
 from data_utils.dataset_base import DataSampler, DataConfig, gen_norm_xy_map, rbd
 from train_utils.lora import setup_lora, merge_lora_linear
 from train_utils.ckpt import check_objective
+from models.action_norm import build_action_normalizer
 from train_utils.ema_impl import ExponentialMovingAverage
 from data_utils.datasets import DATA_CONFIGS
 from .draw_traj import visualize_traj
@@ -35,7 +36,7 @@ def parse_config(ckpt_dir: str):
     print("[INFO] model = {}".format(model_name))
     print("[INFO] data config = {}".format(data_config))
 
-    return model_name, data_config, cfg.lora_rank
+    return model_name, data_config, cfg.lora_rank, cfg.action_norm_stats
 
 
 def load_model(path, device, use_ema: bool = False):
@@ -48,7 +49,8 @@ def load_model(path, device, use_ema: bool = False):
       4. merge LoRA into the base Linears -- inference then runs at zero LoRA overhead
          and the live model is a plain ActionExpert again
     """
-    model_name, data_config, cfg_lora_rank = parse_config(os.path.dirname(path))
+    model_name, data_config, cfg_lora_rank, cfg_norm_stats = parse_config(
+        os.path.dirname(path))
 
     ckpt = torch.load(path, map_location=device, weights_only=False)
 
@@ -58,7 +60,29 @@ def load_model(path, device, use_ema: bool = False):
     # read as DDIM; anything this repo trained carries it explicitly.
     check_objective(ckpt, what="checkpoint")
 
-    model: vla.VLA = getattr(vla, "vla_{}".format(model_name))().to(device)
+    # Action normalization, resolved the same way lora_rank is: the checkpoint's own
+    # record wins over the config json, which may have been overwritten by a later run
+    # in the same directory. Falling back to the json's path is only a convenience for
+    # checkpoints written before the stats were stamped in.
+    #
+    # Getting this wrong is undetectable at runtime -- the model would emit normalized
+    # units and the robot would execute them as metres -- so it is resolved once, here,
+    # and never re-derived downstream.
+    if "action_norm" in ckpt:
+        action_norm = build_action_normalizer(
+            ckpt["action_norm"], what="checkpoint action_norm")
+        source = "checkpoint"
+    else:
+        action_norm = build_action_normalizer(cfg_norm_stats, what=str(cfg_norm_stats))
+        source = "config json ({})".format(cfg_norm_stats)
+
+    if action_norm is None:
+        print("[INFO] No action normalization (from {})".format(source))
+    else:
+        print("[INFO] Action normalization from {}:\n{}".format(source, action_norm))
+
+    model: vla.VLA = getattr(vla, "vla_{}".format(model_name))(
+        action_norm=action_norm).to(device)
 
     # the checkpoint's own record wins over the config json, which may have been
     # overwritten by a later run in the same directory
@@ -219,7 +243,7 @@ class TrajPlanner(object):
                 batch dim of 1
         """
         (
-            obs_rgbs, obs_masks, obs_cam_poses, obs_ee_poses, 
+            rgbs, obs_cam_poses, obs_ee_poses,
             history_actions, future_actions, current_time, K, valid_ee_mask
         ) = DataSampler.sample_framedict(
             obs_traj=obs_frames,
@@ -234,23 +258,21 @@ class TrajPlanner(object):
             sample_dt=self.config.sample_dt,
             record_dt=self.config.record_dt,
             output_image_hw=self.config.output_image_hw,
-            enable_seg=self.config.enable_seg,
         )
 
-        T, ncam, C, H, W = obs_rgbs.shape
+        T, ncam, C, H, W = rgbs.shape
         norm_xys = gen_norm_xy_map(H, W, K).astype(np.float32)
         norm_xys = norm_xys[None].repeat(T, axis=0)  # (T, ncam, 2, H, W)
 
         obs_data = {
             "K": K,                                 # (ncam, 3, 3)
-            "obs_rgbs": obs_rgbs,                   # (T, ncam, 3, H, W)
-            "obs_masks": obs_masks,                 # (T, ncam, H, W)
+            "rgbs": rgbs,                           # (T, ncam, 3, H, W)
             "prompt_text": [self.prompt_text],      # [str]
             "obs_norm_xys": norm_xys,               # (To, ncam, 2, H, W)
             "obs_extrinsics": obs_cam_poses,        # (To, ncam, 4, 4)
-            "current_ee_pose": obs_ee_poses[-1],    # (nee, 4, 4)
-            "history_ee_states": history_actions,   # (nhist, nee, 17)
-            "gt_future_ee_states": future_actions,  # (Ta, nee, 17)
+            "ee_poses": obs_ee_poses[-1],           # (nee, 4, 4)
+            "history_actions": history_actions,     # (nhist, nee, 17)
+            "future_actions": future_actions,       # (Ta, nee, 17)
             "timestamps": np.array(current_time),   # scalar
             "valid_ee_mask": valid_ee_mask,         # (nee,)
         }
@@ -269,15 +291,14 @@ class TrajPlanner(object):
 
         with torch.inference_mode():
             actions: Tensor = self.model(
-                obs_rgbs=obs_data["obs_rgbs"], 
-                obs_masks=obs_data.get("obs_masks", None),
+                rgbs=obs_data["rgbs"],
                 obs_norm_xys=obs_data["obs_norm_xys"],
                 obs_extrinsics=obs_data["obs_extrinsics"],
                 prompt_text=obs_data["prompt_text"],
 
-                current_ee_pose=obs_data["current_ee_pose"],
-                history_ee_states=obs_data["history_ee_states"],
-                gt_future_ee_states=obs_data["gt_future_ee_states"], 
+                ee_poses=obs_data["ee_poses"],
+                history_actions=obs_data["history_actions"],
+                future_actions=obs_data["future_actions"], 
                 valid_ee_mask=obs_data["valid_ee_mask"],
                 inference=True,
                 fp16=True,
