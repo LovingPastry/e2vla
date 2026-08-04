@@ -14,11 +14,13 @@ class SiglipEncoder(nn.Module):
     def __init__(self):
         super().__init__()
 
-        run_fp16 = torch.cuda.is_bf16_supported()
+        run_fp16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        self.dtype = torch.bfloat16 if run_fp16 else torch.float32
+
         self.siglip = SiglipModel.from_pretrained(
             self.REPO_ID,
             attn_implementation="sdpa",
-            torch_dtype=torch.bfloat16 if run_fp16 else torch.float32,
+            torch_dtype=self.dtype,
         )
 
         self.processor = SiglipProcessor.from_pretrained(
@@ -68,7 +70,10 @@ class SiglipEncoder(nn.Module):
         return x
 
     def encode_images(self, rgb: Tensor):
-        pixel_values = self.image_tform(rgb)
+        pixel_values: Tensor = self.image_tform(rgb)
+        # v2.Normalize keeps the input dtype (fp32), while the weights were loaded as bf16 --
+        # the patch-embed conv raises on the mismatch, so cast here.
+        pixel_values = pixel_values.to(self.dtype)
         vision_outputs = self.siglip.vision_model(
             pixel_values=pixel_values,
             output_attentions=False,
