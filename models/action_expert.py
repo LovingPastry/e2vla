@@ -9,6 +9,7 @@ from typing import Optional, Tuple, Dict, List
 from .dit import DiT
 from .qformer import QFormerITM
 from .action_norm import ActionNormalizer
+from .action_space import ActionSpace, build_action_space
 from .layers.utils import simple_mlp
 from .layers.utils import concat_mask
 from .layers.pe import SinusoidalPosEmb, se3_inverse
@@ -189,9 +190,11 @@ class DiffusionHead(nn.Module):
     absolute position and the loss would barely notice.
     """
 
-    def __init__(self, hdim: int, num_heads: int, action_dim: int, num_layers: int,
+    def __init__(self, hdim: int, num_heads: int, action_space: ActionSpace, num_layers: int,
                  action_norm: Optional[ActionNormalizer] = None):
         super().__init__()
+        self.action_space = action_space
+        action_dim = action_space.action_dim
         self.action_dim = action_dim
         self.num_layers = num_layers
         # not a submodule assignment by accident: ActionNormalizer's buffers are
@@ -200,7 +203,12 @@ class DiffusionHead(nn.Module):
         # module attribute names are load-bearing: they are the checkpoint state_dict keys
         self.hist_enc = simple_mlp([action_dim-1, hdim, hdim], ln=True)
         self.traj_enc = simple_mlp([action_dim, hdim, hdim], ln=True)
-        self.abs_pos_enc = simple_mlp([3, hdim, hdim], ln=True)
+        # Only built for action spaces whose actions are SE(3) deltas. In joint space
+        # recovering the absolute ee position would need forward kinematics (a URDF this
+        # repo does not carry), and an unbuilt module keeps it out of the state_dict
+        # instead of leaving dead, gradient-less weights in every checkpoint.
+        self.abs_pos_enc = (simple_mlp([3, hdim, hdim], ln=True)
+                            if action_space.has_pose_geometry else None)
         self.traj_time_embed = SinusoidalPosEmb(hdim)
         self.denoising_time_embed = nn.Sequential(
             SinusoidalPosEmb(hdim),
@@ -219,8 +227,9 @@ class DiffusionHead(nn.Module):
         # constant offset, which defeats the point of starting these branches at zero:
         # `abs_pos_enc` must not perturb the features at init, and `act_head` must
         # predict exactly zero noise at init.
-        nn.init.zeros_(self.abs_pos_enc[-1].weight)
-        nn.init.zeros_(self.abs_pos_enc[-1].bias)
+        if self.abs_pos_enc is not None:
+            nn.init.zeros_(self.abs_pos_enc[-1].weight)
+            nn.init.zeros_(self.abs_pos_enc[-1].bias)
         nn.init.zeros_(self.act_head[-1].weight)
         nn.init.zeros_(self.act_head[-1].bias)
 
@@ -308,14 +317,15 @@ class DiffusionHead(nn.Module):
         # no_grad wraps only the geometry: the actions are the variable being denoised,
         # so this is treated as a coordinate lookup, not a differentiable path. The
         # abs_pos_enc call itself stays outside so its weights still get gradients.
-        with torch.no_grad():
-            seq_t3r6 = torch.cat(
-                [history[..., :9], noisy_actions[..., :9]], dim=1)  # (B, nhist+Ta, 9)
-            if self.action_norm is not None:
-                # back to metres / a real rotation before doing SE(3) algebra on it
-                seq_t3r6 = self.action_norm.unnormalize(seq_t3r6)
-            abs_pos = self.pos_rel2abs(cur_wcT, cur_weT, seq_t3r6)
-        seq_feats = seq_feats + self.abs_pos_enc(abs_pos)
+        if self.abs_pos_enc is not None:
+            with torch.no_grad():
+                seq_t3r6 = torch.cat(
+                    [history[..., :9], noisy_actions[..., :9]], dim=1)  # (B, nhist+Ta, 9)
+                if self.action_norm is not None:
+                    # back to metres / a real rotation before doing SE(3) algebra on it
+                    seq_t3r6 = self.action_norm.unnormalize(seq_t3r6)
+                abs_pos = self.pos_rel2abs(cur_wcT, cur_weT, seq_t3r6)
+            seq_feats = seq_feats + self.abs_pos_enc(abs_pos)
 
         with torch.autocast(
             time_embed.device.type,
@@ -346,11 +356,14 @@ class ActionExpert(nn.Module):
         diffusion_timesteps: int = 100,
         inference_timesteps: Optional[int] = None,
         action_norm: Optional[ActionNormalizer] = None,
+        action_space: Optional[str | ActionSpace] = None,
     ):
         super().__init__()
-        # q01/q99 normalization of the camera-relative action space. None reproduces the
-        # pre-normalization behaviour exactly. The same instance is handed to the head so
-        # both sides of the train/inference boundary use one set of statistics.
+        # None == the EE-pose space, i.e. the historical behaviour.
+        self.action_space = build_action_space(action_space)
+        # q01/q99 normalization of the action space. None reproduces the pre-normalization
+        # behaviour exactly. The same instance is handed to the head so both sides of the
+        # train/inference boundary use one set of statistics.
         if action_norm is not None and action_norm.action_dim != self.action_dim:
             raise ValueError(
                 "action stats cover {} channels but the model's action_dim is {}. The "
@@ -359,7 +372,7 @@ class ActionExpert(nn.Module):
         self.action_norm = action_norm
 
         self.context_encoder = ContextEncoder(hdim, num_heads, num_layers=num_context_layers)
-        self.dp_head = DiffusionHead(hdim, num_heads, self.action_dim,
+        self.dp_head = DiffusionHead(hdim, num_heads, self.action_space,
                                      num_layers=num_diffusion_layers,
                                      action_norm=action_norm)
 
@@ -378,8 +391,13 @@ class ActionExpert(nn.Module):
 
     @property
     def action_dim(self):
-        """Action layout in the camera frame: 3 translation + 6D rotation + 1 openness."""
-        return 10
+        """Model-side action width, set by the configured `ActionSpace`.
+
+        EE-pose: 10 (3 translation + 6D rotation + 1 openness, camera-relative).
+        Joint:   nq + 1. Note this differs from `state_dim`, the width the dataset hands
+        over (17 for EE-pose), which the two are no longer guaranteed to share.
+        """
+        return self.action_space.action_dim
 
     def iterative_denoise(
         self,
@@ -490,22 +508,22 @@ class ActionExpert(nn.Module):
                                 ).to(valid_ee_mask.device)
         flat_batch_size = len(batch_index)  # B'
 
-        # (B, nhist, Nee, 17) -> (B, Nee, nhist, 17) so the ee axis is maskable
-        history_action_cam = states2action(
+        # (B, nhist, Nee, state_dim) -> (B, Nee, nhist, state_dim) so the ee axis is maskable
+        history_action_cam = self.action_space.states2action(
             current_cam_pose[batch_index],
             ee_poses[valid_ee_mask],
             history_actions.transpose(1, 2)[valid_ee_mask],
             self.action_norm
-        )  # (B', nhist, 10)
+        )  # (B', nhist, action_dim)
 
         batch_size, action_horizon, num_ee, _ = future_actions.shape
         if not inference:
-            future_action_cam = states2action(
+            future_action_cam = self.action_space.states2action(
                 current_cam_pose[batch_index],
                 ee_poses[valid_ee_mask],
                 future_actions.transpose(1, 2)[valid_ee_mask],
                 self.action_norm
-            )  # (B', Ta, 10)
+            )  # (B', Ta, action_dim)
 
         # everything the denoiser needs that is constant across denoising steps
         fixed_inputs = dict(
@@ -523,19 +541,22 @@ class ActionExpert(nn.Module):
                 actions_shape=(flat_batch_size, action_horizon, self.action_dim),
                 fixed_inputs=fixed_inputs
             )  # (B', Ta, action_dim)
-            pred_future_actions = action2states(
+            pred_future_actions = self.action_space.action2states(
                 current_cam_pose[batch_index],  # (B', 4, 4)
                 ee_poses[valid_ee_mask],        # (B', 4, 4)
                 pred_actions,  # (B', Ta, action_dim)
                 self.action_norm
-            )  # (B', Ta, 4*4+1)
+            )  # (B', Ta, state_dim)
 
-            # scatter B' back to (B, Nee); invalid slots stay identity pose / zero gripper
+            # scatter B' back to (B, Nee); invalid slots get the action space's neutral
+            # fill (identity pose for EE, zeros for joints)
             pred_future_actions_full = pred_future_actions.new_zeros(
-                batch_size, num_ee, action_horizon, 4*4+1)
-            pred_future_actions_full[..., :16] = torch.eye(4).ravel().to(pred_future_actions)
+                batch_size, num_ee, action_horizon, self.action_space.state_dim)
+            pred_future_actions_full = self.action_space.init_invalid_states(
+                pred_future_actions_full)
             pred_future_actions_full[valid_ee_mask] = pred_future_actions
-            return pred_future_actions_full.transpose(1, 2).contiguous()  # (B, Ta, Nee, 17)
+            # (B, Ta, Nee, state_dim)
+            return pred_future_actions_full.transpose(1, 2).contiguous()
 
         ###################### Training ######################
         # sample noise
@@ -570,20 +591,11 @@ class ActionExpert(nn.Module):
         # pred_noise = pred_noise[debug_mask]
         # target = target[debug_mask]
 
-        # Loss is split per action channel only so the three terms can be weighted and
-        # logged separately -- with prediction_type="epsilon" all three slices are parts
-        # of the same standard normal, so the weights are pure loss shaping.
-        pos_loss = F.l1_loss(pred_noise[..., 0:3], target[..., 0:3], reduction="mean")
-        rot_loss = F.l1_loss(pred_noise[..., 3:9], target[..., 3:9], reduction="mean")
-        openness_loss = F.l1_loss(pred_noise[..., 9:10], target[..., 9:10], reduction="mean")
-
-        total_loss = 30 * pos_loss + 10 * rot_loss + 10 * openness_loss
-        metrics = {
-            "pos_loss": pos_loss.item(),
-            "rot_loss": rot_loss.item(),
-            "openness_loss": openness_loss.item(),
-            "total_loss": total_loss.item()
-        }
+        # Loss is split per action channel only so the terms can be weighted and logged
+        # separately -- with prediction_type="epsilon" every slice is part of the same
+        # standard normal, so the weights are pure loss shaping. The split itself is a
+        # property of the encoding, hence it lives on the action space.
+        total_loss, metrics = self.action_space.loss(pred_noise, target)
         return total_loss, metrics
 
 

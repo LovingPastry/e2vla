@@ -6,6 +6,9 @@ import inspect
 import traceback
 from typing import Dict
 from data_utils.dataset_base import DataConfig, H5DatasetMapBase
+# Re-exported so `TrainConfig.dataset_classes` can round-trip it by name: config
+# deserialisation resolves strings with getattr(datasets, NAME).
+from data_utils.dataset_real import RealBinDataset  # noqa: F401
 
 
 # __getitem__(self, i) of H5DatasetMapBase return a dict of Tensors (except for `prompt_text`),

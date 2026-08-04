@@ -12,8 +12,9 @@ from models import vla
 from .ensemble import TrajEnsembler
 from data_utils.dataset_base import DataSampler, DataConfig, gen_norm_xy_map, rbd
 from train_utils.lora import setup_lora, merge_lora_linear
-from train_utils.ckpt import check_objective
+from train_utils.ckpt import check_objective, check_action_layout
 from models.action_norm import build_action_normalizer
+from models.action_space import build_action_space
 from train_utils.ema_impl import ExponentialMovingAverage
 from data_utils.datasets import DATA_CONFIGS
 from .draw_traj import visualize_traj
@@ -36,7 +37,8 @@ def parse_config(ckpt_dir: str):
     print("[INFO] model = {}".format(model_name))
     print("[INFO] data config = {}".format(data_config))
 
-    return model_name, data_config, cfg.lora_rank, cfg.action_norm_stats
+    return (model_name, data_config, cfg.lora_rank, cfg.action_norm_stats,
+            cfg.action_space)
 
 
 def load_model(path, device, use_ema: bool = False):
@@ -49,8 +51,8 @@ def load_model(path, device, use_ema: bool = False):
       4. merge LoRA into the base Linears -- inference then runs at zero LoRA overhead
          and the live model is a plain ActionExpert again
     """
-    model_name, data_config, cfg_lora_rank, cfg_norm_stats = parse_config(
-        os.path.dirname(path))
+    (model_name, data_config, cfg_lora_rank, cfg_norm_stats,
+     cfg_action_space) = parse_config(os.path.dirname(path))
 
     ckpt = torch.load(path, map_location=device, weights_only=False)
 
@@ -59,6 +61,15 @@ def load_model(path, device, use_ema: bool = False):
     # and no later step could notice. Released checkpoints predate the stamp and are
     # read as DDIM; anything this repo trained carries it explicitly.
     check_objective(ckpt, what="checkpoint")
+
+    # Same guard one level down: an EE-pose and a joint checkpoint can have identical
+    # state_dict layouts, and picking the wrong one here means the robot executes joint
+    # angles as if they were metres. Resolved from the run's config json and verified
+    # against the checkpoint's own stamp.
+    action_space = build_action_space(cfg_action_space)
+    check_action_layout(ckpt, action_space.layout, what="checkpoint")
+    print("[INFO] action space = {} (layout '{}')"
+          .format(action_space.name, action_space.layout))
 
     # Action normalization, resolved the same way lora_rank is: the checkpoint's own
     # record wins over the config json, which may have been overwritten by a later run
@@ -70,10 +81,12 @@ def load_model(path, device, use_ema: bool = False):
     # and never re-derived downstream.
     if "action_norm" in ckpt:
         action_norm = build_action_normalizer(
-            ckpt["action_norm"], what="checkpoint action_norm")
+            ckpt["action_norm"], what="checkpoint action_norm",
+            expect_layout=action_space.layout)
         source = "checkpoint"
     else:
-        action_norm = build_action_normalizer(cfg_norm_stats, what=str(cfg_norm_stats))
+        action_norm = build_action_normalizer(cfg_norm_stats, what=str(cfg_norm_stats),
+                                              expect_layout=action_space.layout)
         source = "config json ({})".format(cfg_norm_stats)
 
     if action_norm is None:
@@ -82,7 +95,7 @@ def load_model(path, device, use_ema: bool = False):
         print("[INFO] Action normalization from {}:\n{}".format(source, action_norm))
 
     model: vla.VLA = getattr(vla, "vla_{}".format(model_name))(
-        action_norm=action_norm).to(device)
+        action_norm=action_norm, action_space=action_space).to(device)
 
     # the checkpoint's own record wins over the config json, which may have been
     # overwritten by a later run in the same directory

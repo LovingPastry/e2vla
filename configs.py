@@ -46,6 +46,17 @@ class TrainConfig(object):
     # checkpoint, so evaluation does not need this path to still exist.
     action_norm_stats: str | None = None
 
+    # Which action space the head predicts in; see models/action_space.py.
+    #   "ee_cam"  -- camera-relative SE(3) delta + openness (10 dim). The default and the
+    #                only space the released pretrain checkpoints were trained in.
+    #   "jointN"  -- absolute joint angles + openness (N+1 dim), "joint" == "joint7".
+    # This is not a knob to flip on an existing run: it changes action_dim, so hist_enc /
+    # traj_enc / act_head all change shape and no checkpoint crosses the boundary. It also
+    # invalidates action_norm_stats -- the layout stamp in the JSON is checked against it.
+    # Joint space additionally drops the DiffusionHead's absolute-position encoding
+    # (`abs_pos_enc`), which would need forward kinematics to reconstruct.
+    action_space: str = "ee_cam"
+
     bs: int = 32  # batch size
     workers: int = 4  # num_workers
     fp16: bool = True  # enable mixed precision training (fp32 and bfloat16)
@@ -188,4 +199,34 @@ CONFIGS["finetune_real"] = TrainConfig(
     save_interval=int(5e3),
     save_latest_interval=1000,
     max_iterations=int(20e3),
+)
+
+# Same real-robot setting as `finetune_real`, but the head predicts absolute joint angles
+# instead of camera-relative SE(3) deltas. Trades away three things and buys one:
+#   - no pretrained init: action_dim goes 10 -> 8, so hist_enc / traj_enc / act_head all
+#     change shape and no released checkpoint loads. This trains from scratch.
+#   - no absolute-position encoding in the head (needs forward kinematics from joints)
+#   - no PRoPE benefit from real extrinsics if the rig is uncalibrated
+#   + the output goes straight to the joint controller: no IK, and hand-eye calibration
+#     error stops being in the action path at all
+# max_iterations is raised over `finetune_real` because there is no pretrained init.
+CONFIGS["finetune_real_joint"] = TrainConfig(
+    dataset_classes=[datasets.RealBinDataset],
+    dataset_weights=[1],
+    sample_multiplex=1000,
+    action_space="joint7",
+    # Recompute per dataset; the layout stamp in the JSON is checked against action_space.
+    #   python -m data_prepare.compute_action_stats --config finetune_real_joint \
+    #       -o ./action_stats/real_joint7.json
+    action_norm_stats=None,
+    lora_rank=0,  # nothing to LoRA-adapt when training from scratch
+    bs=16,
+    max_lr=1e-4,
+    grad_clip=1.0,
+    num_warmup=int(2e3),
+    ema_enabled=True,
+    ema_start=int(2e3),
+    save_interval=int(5e3),
+    save_latest_interval=1000,
+    max_iterations=int(60e3),
 )

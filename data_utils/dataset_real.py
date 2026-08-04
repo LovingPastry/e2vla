@@ -22,6 +22,7 @@ from data_utils.dataset_base import (
     DataConfig, DataSampler, H5DatasetMapBase, gen_norm_xy_map,
 )
 from data_utils.h5io import default_intrinsics, identity_extrinsics
+from models.action_space import build_action_space
 
 
 def load_dicted_array(data_path: str, mode: str = "r") -> Dict[str, np.memmap]:
@@ -49,6 +50,17 @@ def compose_ee_gripper(ee_poses: np.ndarray, openness: np.ndarray) -> np.ndarray
         "openness {} 与 ee_poses {} 的 (T, nee) 不一致".format(openness.shape, ee_poses.shape)
     return np.concatenate([
         ee_poses.reshape(T, nee, 16),
+        openness.reshape(T, nee, 1),
+    ], axis=-1).astype(np.float32)
+
+
+def compose_joint_gripper(joints: np.ndarray, openness: np.ndarray) -> np.ndarray:
+    """(T, nee, nq) + (T, nee) -> (T, nee, nq+1)。关节空间下 `AbsJoint` 的 state 布局。"""
+    T, nee = joints.shape[:2]
+    assert openness.shape[:2] == (T, nee), \
+        "openness {} 与 joints {} 的 (T, nee) 不一致".format(openness.shape, joints.shape)
+    return np.concatenate([
+        joints,
         openness.reshape(T, nee, 1),
     ], axis=-1).astype(np.float32)
 
@@ -88,12 +100,21 @@ class RealBinDataset(H5DatasetMapBase):
     GRIPPER_MIN: float = 0.0
     GRIPPER_MAX: float = 1.5
     PROMPT_TEXT: str = "pick up the red cup and place it in the coffee machine"
+    # 动作空间，必须与 TrainConfig.action_space 一致，见 models/action_space.py
+    #   "joint7" -> history/future_actions 是 (T, nee, 8)，绝对关节角 + 夹爪
+    #   "ee_cam" -> (T, nee, 17)，展平 4x4 位姿 + 夹爪
+    ACTION_SPACE: str = "joint7"
+    # joint 数组里前多少列是手臂关节（其余是夹爪等）
+    NUM_JOINTS: int = 7
     # ---------------------------------------------------------------------------
 
     def __init__(self, traj_dirs: List[str]):
         super().__init__(traj_dirs)
         assert len(self.CAMERA_AXIS) == len(self.config.camera_names), \
             "CAMERA_AXIS 与 config.camera_names 数量不一致"
+        # 决定 history/future_actions 的宽度。必须与 TrainConfig.action_space 相同，
+        # 不一致会在 states2action 的 state_dim 断言处停下。
+        self.action_space = build_action_space(self.ACTION_SPACE)
         self._cache: Dict[int, Dict[str, np.memmap]] = {}
 
     @classmethod
@@ -182,14 +203,26 @@ class RealBinDataset(H5DatasetMapBase):
 
         openness = self.get_openness(traj)  # (L, nee)
 
-        def gather_actions(ind):
-            poses = np.asarray(all_ee_poses[ind], dtype=np.float32)
-            if poses.ndim == 3:
-                poses = poses[:, None]
-            return compose_ee_gripper(poses, openness[ind])  # (T, nee, 17)
+        if self.action_space.name.startswith("joint"):
+            # (L, nq_total) -> (L, nee, nq)。多臂时 joint 需要按 ee 切分，这里按单臂处理，
+            # 双臂请把 reshape 改成 (L, nee, nq)。
+            all_joints = np.asarray(traj["joint"], dtype=np.float32)[:, :self.NUM_JOINTS]
+            assert all_joints.shape[-1] == self.NUM_JOINTS, \
+                "joint 只有 {} 列，不足 NUM_JOINTS={}".format(
+                    all_joints.shape[-1], self.NUM_JOINTS)
+            all_joints = all_joints[:, None]  # (L, nee=1, nq)
 
-        history_actions = gather_actions(hist_ind)
-        future_actions = gather_actions(fut_ind)
+            def gather_actions(ind):
+                return compose_joint_gripper(all_joints[ind], openness[ind])
+        else:
+            def gather_actions(ind):
+                poses = np.asarray(all_ee_poses[ind], dtype=np.float32)
+                if poses.ndim == 3:
+                    poses = poses[:, None]
+                return compose_ee_gripper(poses, openness[ind])  # (T, nee, 17)
+
+        history_actions = gather_actions(hist_ind)   # (nhist, nee, state_dim)
+        future_actions = gather_actions(fut_ind)     # (Ta, nee, state_dim)
 
         # ---- 外参 -------------------------------------------------------------
         # NOTE 无手眼标定。identity 是唯一安全的填充值：ContextEncoder 会把所有相机 rebase
@@ -267,14 +300,15 @@ def check_contract(dataset: RealBinDataset, num_samples: int = 8):
     To, nhist, Ta = cfg.num_history_cameras, cfg.num_history_states, cfg.num_future_states
     Hout, Wout = cfg.output_image_hw
 
+    state_dim = dataset.action_space.state_dim
     expected = {
         "K": (ncam, 3, 3),
         "rgbs": (To, ncam, 3, Hout, Wout),
         "obs_norm_xys": (To, ncam, 2, Hout, Wout),
         "obs_extrinsics": (To, ncam, 4, 4),
         "ee_poses": (nee, 4, 4),
-        "history_actions": (nhist, nee, 17),
-        "future_actions": (Ta, nee, 17),
+        "history_actions": (nhist, nee, state_dim),
+        "future_actions": (Ta, nee, state_dim),
         "timestamps": (To,),
         "valid_ee_mask": (nee,),
     }
@@ -293,21 +327,33 @@ def check_contract(dataset: RealBinDataset, num_samples: int = 8):
         assert openness.min() >= 0.0 and openness.max() <= 1.0, \
             "夹爪开合度必须在 [0,1]，实得 [{:.3f}, {:.3f}]；检查 GRIPPER_MIN/MAX".format(
                 openness.min(), openness.max())
-        poses = out["future_actions"][..., :16].reshape(Ta, nee, 4, 4)
-        assert np.allclose(poses[..., 3, :], [0, 0, 0, 1], atol=1e-4), \
-            "位姿末行不是 [0,0,0,1]，ee_poses 可能不是行主序 4x4 齐次矩阵"
+        if dataset.action_space.layout == "cam_rel_t3r6_openness":
+            poses = out["future_actions"][..., :16].reshape(Ta, nee, 4, 4)
+            assert np.allclose(poses[..., 3, :], [0, 0, 0, 1], atol=1e-4), \
+                "位姿末行不是 [0,0,0,1]，ee_poses 可能不是行主序 4x4 齐次矩阵"
+        else:
+            # 关节角是绝对量，量纲错（角度 vs 弧度）在训练里不会报错，只会让归一化范围
+            # 大 57 倍。7 轴机械臂的关节角基本不会超出 [-2pi, 2pi]。
+            joints = out["future_actions"][..., :-1]
+            assert np.abs(joints).max() < 2 * np.pi + 1e-3, \
+                "关节角绝对值超过 2pi（最大 {:.3f}），大概率是角度制，应为弧度".format(
+                    np.abs(joints).max())
 
     print("[OK] 契约校验通过，{} 个样本".format(min(num_samples, len(dataset))))
 
 
 def stat_actions(dataset: RealBinDataset, count: int = 1000):
-    """打印相邻动作块的平移幅度，用来核对量纲（米 vs 毫米）。
+    """打印动作块首尾的变化幅度，用来核对量纲（EE：米 vs 毫米；关节：弧度 vs 角度）。
     真正喂给 --action_norm_stats 的统计量请用 data_prepare/compute_action_stats.py，
-    那条路径会跑 states2action，量的是模型实际的 10 维动作空间。"""
+    那条路径会跑 states2action，量的是模型实际的动作空间。"""
     deltas = []
     for i in range(min(count, len(dataset))):
-        pose = dataset[i]["future_actions"][:, 0, :16].reshape(-1, 4, 4)
-        deltas.append(np.abs(pose[-1, :3, 3] - pose[0, :3, 3]))
+        act = dataset[i]["future_actions"][:, 0]  # (Ta, state_dim)
+        if dataset.action_space.layout == "cam_rel_t3r6_openness":
+            pose = act[:, :16].reshape(-1, 4, 4)
+            deltas.append(np.abs(pose[-1, :3, 3] - pose[0, :3, 3]))
+        else:
+            deltas.append(np.abs(act[-1, :-1] - act[0, :-1]))
     deltas = np.stack(deltas, axis=0)
     print("mean:", deltas.mean(axis=0))
     print("std :", deltas.std(axis=0))

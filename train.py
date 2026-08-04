@@ -13,9 +13,10 @@ from torch.utils.tensorboard import SummaryWriter
 
 from models import vla
 from models.action_norm import build_action_normalizer
+from models.action_space import build_action_space
 from configs import CONFIGS, TrainConfig
 from train_utils.ckpt import (load_actor_weights, check_objective,
-                              check_action_norm, OBJECTIVE)
+                              check_action_norm, check_action_layout, OBJECTIVE)
 from train_utils.lora import setup_lora
 from train_utils.ema_impl import ExponentialMovingAverage
 from data_utils.dataset_base import get_dataloader, generate_sample_weights
@@ -110,8 +111,13 @@ class Trainer(object):
         # Built before the model: the normalizer is a constructor argument, because both
         # the dataset boundary (states2action/action2states) and the geometry inside the
         # diffusion head need the same statistics.
+        self.action_space = build_action_space(self.cfg.action_space)
+        print("[INFO] Action space: {} (layout '{}', action_dim={}, state_dim={})"
+              .format(self.action_space.name, self.action_space.layout,
+                      self.action_space.action_dim, self.action_space.state_dim))
         self.action_norm = build_action_normalizer(
-            self.cfg.action_norm_stats, what="action_norm_stats")
+            self.cfg.action_norm_stats, what="action_norm_stats",
+            expect_layout=self.action_space.layout)
         if self.action_norm is None:
             print("[INFO] No action normalization (action_norm_stats is unset): the head "
                   "denoises raw camera-relative actions.")
@@ -120,7 +126,8 @@ class Trainer(object):
                   .format(self.cfg.action_norm_stats, self.action_norm))
 
         self.model: vla.VLA = getattr(vla, "vla_" + self.cfg.model.strip())(
-            action_norm=self.action_norm).to(self.model_device)
+            action_norm=self.action_norm,
+            action_space=self.action_space).to(self.model_device)
 
         print("[INFO] Total {:.3f}M trainable parameters"
               .format(count_trainable(self.model) / 1e6))
@@ -148,6 +155,8 @@ class Trainer(object):
                               map_location=self.model_device,
                               weights_only=False)
             check_objective(ckpt, what="resume checkpoint")
+            check_action_layout(ckpt, self.action_space.layout,
+                                what="resume checkpoint")
             # A resume must continue the same optimisation problem, action space
             # included -- no legitimate reason for these to differ.
             check_action_norm(ckpt, self.action_norm, what="resume checkpoint",
@@ -171,6 +180,8 @@ class Trainer(object):
                               map_location=self.model_device,
                               weights_only=False)
             check_objective(ckpt, what="pretrained checkpoint")
+            check_action_layout(ckpt, self.action_space.layout,
+                                what="pretrained checkpoint")
             # Not strict: fine-tuning a released (unnormalized) pretrain checkpoint with
             # per-dataset q01/q99 statistics is a normal thing to want. It still gets a
             # loud warning, because doing it unintentionally is indistinguishable from
@@ -328,6 +339,9 @@ class Trainer(object):
                 # so it would load here without a single missing key. The released
                 # pretrain checkpoints predate this stamp; ours all carry it.
                 "objective": OBJECTIVE,
+                # same reasoning as `objective`: two action spaces with the same
+                # channel count produce identical state_dict layouts
+                "action_layout": self.action_space.layout,
                 # The action statistics are part of what the weights mean, so they
                 # travel with them. `infer_utils/planner.py` reads them back from here,
                 # which keeps evaluation correct even if the JSON has moved or the

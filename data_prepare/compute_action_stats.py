@@ -39,15 +39,22 @@ import numpy as np
 import torch
 
 from configs import CONFIGS, TrainConfig
-from models.action_expert import states2action
-from models.action_norm import ActionNormalizer, ACTION_LAYOUT
+from models.action_norm import ActionNormalizer
+from models.action_space import build_action_space
 from data_utils.dataset_base import get_dataloader, generate_sample_weights
 
 
-# names for the 10 channels, used only in the printed report
-CHANNEL_NAMES = ["tx", "ty", "tz",
-                 "r00", "r10", "r20", "r01", "r11", "r21",
-                 "openness"]
+# names for the report only. The EE-pose space has 10 fixed channels; a joint space is
+# nq joints + openness, so its names are generated.
+EE_CHANNEL_NAMES = ["tx", "ty", "tz",
+                    "r00", "r10", "r20", "r01", "r11", "r21",
+                    "openness"]
+
+
+def channel_names(action_space):
+    if action_space.layout == "cam_rel_t3r6_openness":
+        return EE_CHANNEL_NAMES
+    return ["q{}".format(i) for i in range(action_space.action_dim - 1)] + ["openness"]
 
 
 def parse_args(argv=None):
@@ -89,7 +96,7 @@ def collect_actions(cfg: TrainConfig, args) -> np.ndarray:
     """Draw windows and map them into the model's action space.
 
     Returns:
-        (N, 10) array of raw (unnormalized) camera-relative actions
+        (N, action_dim) array of raw (unnormalized) actions in the configured space
     """
     datasets = build_datasets(cfg)
     num_traj = sum(len(d) for d in datasets)
@@ -117,6 +124,9 @@ def collect_actions(cfg: TrainConfig, args) -> np.ndarray:
     )
 
     device = torch.device(args.device)
+    # exactly the encoding the model will train in; measuring any other one is measuring
+    # the wrong space
+    action_space = build_action_space(cfg.action_space)
     chunks: List[np.ndarray] = []
     seen = 0
 
@@ -136,13 +146,13 @@ def collect_actions(cfg: TrainConfig, args) -> np.ndarray:
         keys = ["future_actions"] if args.future_only else \
                ["history_actions", "future_actions"]
         for key in keys:
-            states = batch[key].to(device)  # (B, T, Nee, 17)
-            action = states2action(
+            states = batch[key].to(device)  # (B, T, Nee, state_dim)
+            action = action_space.states2action(
                 current_cam_pose[batch_index],
                 ee_poses[valid_ee_mask],
                 states.transpose(1, 2)[valid_ee_mask],
                 None,  # measuring the raw space is the whole point
-            )  # (B', T, 10)
+            )  # (B', T, action_dim)
             chunks.append(action.reshape(-1, action.shape[-1]).float().cpu().numpy())
 
         seen += extrinsics.shape[0]
@@ -160,10 +170,10 @@ def collect_actions(cfg: TrainConfig, args) -> np.ndarray:
     return actions
 
 
-def report(actions: np.ndarray, q01: np.ndarray, q99: np.ndarray):
+def report(actions: np.ndarray, q01: np.ndarray, q99: np.ndarray, names: List[str]):
     print("\n{:>9} {:>12} {:>12} {:>12} {:>12} {:>12}"
           .format("channel", "min", "q01", "q99", "max", "span"))
-    for i, name in enumerate(CHANNEL_NAMES[:actions.shape[1]]):
+    for i, name in enumerate(names[:actions.shape[1]]):
         span = q99[i] - q01[i]
         flag = "  <-- near-constant, will pass through unscaled" if span < 1e-6 else ""
         print("{:>9} {:>12.5f} {:>12.5f} {:>12.5f} {:>12.5f} {:>12.5f}{}"
@@ -174,7 +184,7 @@ def report(actions: np.ndarray, q01: np.ndarray, q99: np.ndarray):
     print("\nfraction outside [q01, q99] per channel (≈2% by construction; much more "
           "means a heavy tail that clipping will bite into):")
     print("  " + "  ".join("{}={:.3f}".format(n, f)
-                           for n, f in zip(CHANNEL_NAMES, outside)))
+                           for n, f in zip(names, outside)))
 
 
 def main(argv=None):
@@ -187,18 +197,23 @@ def main(argv=None):
                          .format(args.config, ", ".join(sorted(CONFIGS))))
     cfg = CONFIGS[args.config]
 
+    action_space = build_action_space(cfg.action_space)
+    print("[INFO] action space: {} (layout '{}', action_dim={})"
+          .format(action_space.name, action_space.layout, action_space.action_dim))
     actions = collect_actions(cfg, args)
     q01 = np.percentile(actions, 1, axis=0)
     q99 = np.percentile(actions, 99, axis=0)
-    report(actions, q01, q99)
+    report(actions, q01, q99, channel_names(action_space))
 
     normalizer = ActionNormalizer(
         q01=q01.tolist(),
         q99=q99.tolist(),
         clip=not args.no_clip,
+        layout=action_space.layout,
         meta={
             "config": args.config,
-            "layout": ACTION_LAYOUT,
+            "layout": action_space.layout,
+            "action_space": action_space.name,
             "datasets": [D.__name__ for D in cfg.dataset_classes],
             "dataset_weights": cfg.dataset_weights,
             "num_action_vectors": int(len(actions)),

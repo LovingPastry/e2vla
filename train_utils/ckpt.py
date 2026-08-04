@@ -54,6 +54,38 @@ def check_objective(ckpt: dict, what: str = "checkpoint"):
     return objective
 
 
+def check_action_layout(ckpt: dict, layout: str, what: str = "checkpoint"):
+    """Verify a checkpoint predicts in the action space this run is configured for.
+
+    Same failure mode as `check_objective`, one level down: `models/action_space.py`
+    offers an EE-pose space (10 channels) and a joint space (nq+1 channels). Those
+    usually differ in width, and then the state_dict layout check catches the mismatch on
+    its own. They do not always -- a 9-joint arm also lands on 10 -- and in that case
+    every tensor lines up by name and shape, the load reports a clean match, and the head
+    then denoises joint angles as if they were metres and a rotation.
+
+    Checkpoints written before this stamp existed are all EE-pose, hence the default.
+
+    Args:
+        ckpt: the loaded checkpoint dict
+        layout: `ActionSpace.layout` for the current run
+        what: label used in messages
+
+    Returns:
+        str, the checkpoint's action layout
+    """
+    from models.action_norm import ACTION_LAYOUT
+    stored = ckpt.get("action_layout", ACTION_LAYOUT)
+    if stored != layout:
+        raise ValueError(
+            "action space mismatch: the {} predicts in layout '{}', but this run is "
+            "configured for '{}'. Set `action_space` in the config to match, or start "
+            "from a checkpoint trained in the right space -- the two encodings can share "
+            "a channel count, in which case nothing downstream would notice."
+            .format(what, stored, layout))
+    return stored
+
+
 def check_action_norm(ckpt: dict, action_norm, what: str = "checkpoint",
                       strict: bool = True):
     """Verify a checkpoint's action normalization matches the one being used.

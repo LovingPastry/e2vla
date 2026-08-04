@@ -4,6 +4,7 @@ from torch import nn, Tensor
 from .vlm import VLM
 from .action_expert import ActionExpert
 from .action_norm import ActionNormalizer, build_action_normalizer
+from .action_space import ActionSpace, build_action_space
 
 
 class VLA(nn.Module):
@@ -17,8 +18,10 @@ class VLA(nn.Module):
         diffusion_timesteps: int = 100,
         inference_timesteps: int = 20,
         action_norm: Optional[ActionNormalizer | str | dict] = None,
+        action_space: Optional[str | ActionSpace] = None,
     ):
         super().__init__()
+        self.action_space = build_action_space(action_space)
         self.vlm = VLM()
         self.actor = ActionExpert(
             hdim=hdim,
@@ -27,7 +30,9 @@ class VLA(nn.Module):
             num_diffusion_layers=num_actor_diffusion_layers,
             diffusion_timesteps=diffusion_timesteps,
             inference_timesteps=inference_timesteps,
-            action_norm=build_action_normalizer(action_norm),
+            action_norm=build_action_normalizer(
+                action_norm, expect_layout=self.action_space.layout),
+            action_space=self.action_space,
         )
     
         self.reset_parameters()
@@ -129,6 +134,7 @@ def vla_tiny(
     diffusion_timesteps: int = 100,
     inference_timesteps: int = 20,
     action_norm: Optional[ActionNormalizer | str | dict] = None,
+    action_space: Optional[str | ActionSpace] = None,
 ):
     return VLA(
         hdim=192,
@@ -137,7 +143,8 @@ def vla_tiny(
         num_actor_diffusion_layers=4,
         diffusion_timesteps=diffusion_timesteps,
         inference_timesteps=inference_timesteps,
-        action_norm=action_norm
+        action_norm=action_norm,
+        action_space=action_space
     )
 
 
@@ -145,6 +152,7 @@ def vla_small(
     diffusion_timesteps: int = 100,
     inference_timesteps: int = 20,
     action_norm: Optional[ActionNormalizer | str | dict] = None,
+    action_space: Optional[str | ActionSpace] = None,
 ):
     return VLA(
         hdim=384,
@@ -153,7 +161,8 @@ def vla_small(
         num_actor_diffusion_layers=4,
         diffusion_timesteps=diffusion_timesteps,
         inference_timesteps=inference_timesteps,
-        action_norm=action_norm
+        action_norm=action_norm,
+        action_space=action_space
     )
 
 
@@ -161,6 +170,7 @@ def vla_base(
     diffusion_timesteps: int = 100,
     inference_timesteps: int = 20,
     action_norm: Optional[ActionNormalizer | str | dict] = None,
+    action_space: Optional[str | ActionSpace] = None,
 ):
     return VLA(
         hdim=768,
@@ -169,7 +179,8 @@ def vla_base(
         num_actor_diffusion_layers=4,
         diffusion_timesteps=diffusion_timesteps,
         inference_timesteps=inference_timesteps,
-        action_norm=action_norm
+        action_norm=action_norm,
+        action_space=action_space
     )
 
 

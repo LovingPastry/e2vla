@@ -41,8 +41,15 @@ from torch import nn, Tensor
 # Bumped only on an incompatible change to the JSON layout below.
 STATS_VERSION = 1
 
-# The action layout these statistics are defined over. Stamped into the JSON and checked
-# on load: a stats file computed for a different action encoding would apply silently.
+# The default action layout these statistics are defined over, i.e. the one the EE-pose
+# action space uses. Stamped into the JSON and checked on load: a stats file computed for
+# a different action encoding would apply silently.
+#
+# Since `models/action_space.py` introduced a second action space (absolute joint angles),
+# the layout is no longer a constant of the code -- it is a property of the configured
+# `ActionSpace`, whose `.layout` string is what actually gets stamped and checked. This
+# name stays as the default so pre-existing stats files (which are all EE-pose) and every
+# caller that does not care keep working unchanged.
 ACTION_LAYOUT = "cam_rel_t3r6_openness"
 
 # Channels whose q99-q01 is below this are treated as constant and left untouched
@@ -90,8 +97,10 @@ class ActionNormalizer(nn.Module):
         clip: bool = True,
         clip_dims: Optional[Sequence[int]] = None,
         meta: Optional[dict] = None,
+        layout: str = ACTION_LAYOUT,
     ):
         super().__init__()
+        self.layout = layout
         q01 = torch.as_tensor(list(q01), dtype=torch.float32)
         q99 = torch.as_tensor(list(q99), dtype=torch.float32)
         if q01.shape != q99.shape or q01.ndim != 1:
@@ -118,7 +127,11 @@ class ActionNormalizer(nn.Module):
 
         D = q01.numel()
         if clip_dims is None:
-            clip_dims = DEFAULT_CLIP_DIMS if D == 10 else tuple(range(D))
+            # Keyed on the layout, not on D: the 6D-rotation carve-out below is a property
+            # of the EE-pose encoding, and a joint space with 9 joints would also be
+            # 10-dim while needing every channel clipped.
+            clip_dims = (DEFAULT_CLIP_DIMS if (layout == ACTION_LAYOUT and D == 10)
+                         else tuple(range(D)))
         clip_dims = tuple(int(i) for i in clip_dims)
         if any(i < 0 or i >= D for i in clip_dims):
             raise ValueError("clip_dims {} out of range for a {}-dim action"
@@ -174,7 +187,7 @@ class ActionNormalizer(nn.Module):
     def to_dict(self):
         return {
             "version": STATS_VERSION,
-            "layout": ACTION_LAYOUT,
+            "layout": self.layout,
             "action_dim": self.action_dim,
             "clip": self.clip,
             "clip_dims": list(self.clip_dims),
@@ -184,25 +197,34 @@ class ActionNormalizer(nn.Module):
         }
 
     @classmethod
-    def from_dict(cls, d: dict, what: str = "action stats"):
+    def from_dict(cls, d: dict, what: str = "action stats",
+                  expect_layout: str = ACTION_LAYOUT):
+        """`expect_layout` is the configured `ActionSpace.layout`. It defaults to the
+        EE-pose layout so pre-existing callers and stats files are unaffected."""
         version = d.get("version", STATS_VERSION)
         if version != STATS_VERSION:
             raise ValueError("{}: stats version {} but this code writes version {}"
                              .format(what, version, STATS_VERSION))
+        # A file with no "layout" key predates the second action space, so it is EE-pose.
+        # That default is only safe against ACTION_LAYOUT -- against any other expectation
+        # an unstamped file is exactly the silent-misapplication case this guards.
         layout = d.get("layout", ACTION_LAYOUT)
-        if layout != ACTION_LAYOUT:
+        if layout != expect_layout:
             raise ValueError(
                 "{}: statistics were computed for action layout '{}', but the model uses "
-                "'{}'. Recompute with data_prepare/compute_action_stats.py."
-                .format(what, layout, ACTION_LAYOUT))
+                "'{}'. The two encodings can have identical channel counts, so nothing "
+                "downstream would notice. Recompute with "
+                "data_prepare/compute_action_stats.py under the right --config."
+                .format(what, layout, expect_layout))
         return cls(q01=d["q01"], q99=d["q99"], clip=d.get("clip", True),
-                   clip_dims=d.get("clip_dims", None), meta=d.get("meta", {}))
+                   clip_dims=d.get("clip_dims", None), meta=d.get("meta", {}),
+                   layout=layout)
 
     @classmethod
-    def from_json(cls, path: str):
+    def from_json(cls, path: str, expect_layout: str = ACTION_LAYOUT):
         with open(path, "r", encoding="utf-8") as fp:
             d = json.load(fp)
-        return cls.from_dict(d, what=path)
+        return cls.from_dict(d, what=path, expect_layout=expect_layout)
 
     def to_json(self, path: str):
         import os
@@ -219,7 +241,7 @@ class ActionNormalizer(nn.Module):
         if other is None:
             return False
         if (self.action_dim != other.action_dim or self.clip != other.clip
-                or self.clip_dims != other.clip_dims):
+                or self.clip_dims != other.clip_dims or self.layout != other.layout):
             return False
         return bool(
             torch.allclose(self.q01, other.q01.to(self.q01), atol=atol) and
@@ -227,20 +249,27 @@ class ActionNormalizer(nn.Module):
         )
 
 
-def build_action_normalizer(stats: Optional[str | dict], what: str = "action stats"):
+def build_action_normalizer(stats: Optional[str | dict], what: str = "action stats",
+                            expect_layout: str = ACTION_LAYOUT):
     """Make an `ActionNormalizer` from a JSON path or an already-loaded dict.
 
     Returns None for a None/empty input, which is the "no normalization" mode and
     reproduces the behaviour of this repo before q01/q99 normalization existed.
+
+    `expect_layout` should be the configured `ActionSpace.layout`; a stats file stamped
+    with anything else is refused.
     """
     if stats is None or stats == "":
         return None
     if isinstance(stats, ActionNormalizer):
+        if stats.layout != expect_layout:
+            raise ValueError("{}: normalizer layout '{}' but the model uses '{}'"
+                             .format(what, stats.layout, expect_layout))
         return stats
     if isinstance(stats, dict):
-        return ActionNormalizer.from_dict(stats, what=what)
+        return ActionNormalizer.from_dict(stats, what=what, expect_layout=expect_layout)
     if isinstance(stats, str):
-        return ActionNormalizer.from_json(stats)
+        return ActionNormalizer.from_json(stats, expect_layout=expect_layout)
     raise TypeError("unsupported action stats type: {}".format(type(stats)))
 
 
