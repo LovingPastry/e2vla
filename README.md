@@ -247,7 +247,23 @@ CUDA_VISIBLE_DEVICES=x python train.py \
 
 本节介绍如何用少量真机演示数据微调(约 50-100 条 episode,单机器人、单任务)。
 
-**推荐从预训练 checkpoint 出发,但这不是硬性要求** —— 在 50-100 条演示上做单任务行为克隆是标准做法(Diffusion Policy、ACT 都是这个量级的模型和数据)。把它当成一个实验问题:如果能跑两次 20k 步,直接测一下。
+## 先选一条路:末端位姿 还是 关节角
+
+这是第一个决定,而且**决定之后不能中途改** —— 它改变 `action_dim`,`hist_enc` / `traj_enc` / `act_head` 全部换形状,没有 checkpoint 能跨过这条边界。
+
+| | `action_space="ee_cam"`(默认) | `action_space="joint7"` |
+| --- | --- | --- |
+| 模型输出 | 相机系下的 SE(3) 增量 + 夹爪,10 维 | 绝对关节角 + 夹爪,nq+1 维 |
+| 预训练权重 | **可用**,发布的 ckpt 都是这个空间 | **不可用**,只能从头训 |
+| 相机标定 | 必需(动作定义在相机系) | 不进入动作链路,只影响 PRoPE |
+| 逆运动学 | 执行时需要 | 不需要,直接下发关节控制器 |
+| 头部绝对位置编码 | 有 | 无(需要正运动学才能复原) |
+| 数据格式 | HDF5(§1) | HDF5 或 memmap/bin(§1b) |
+| 部署 | 已支持(§4) | **尚未支持**,见 §4 的说明 |
+
+单任务真机上关节角常常更好用:动作直接是控制器的输入,标定误差不进入动作表示。代价是放弃预训练——这是主要成本,详见下面这段。走这条路请通读 §3.7。
+
+**走 `ee_cam` 的话,推荐从预训练 checkpoint 出发,但这不是硬性要求** —— 在 50-100 条演示上做单任务行为克隆是标准做法(Diffusion Policy、ACT 都是这个量级的模型和数据)。把它当成一个实验问题:如果能跑两次 20k 步,直接测一下。
 
 预训练 checkpoint 具体带来什么:可训练参数的 60% 在 `ContextEncoder` 里,它的职责是通过 PRoPE 融合多路相机视角,再经 QFormer 瓶颈压缩。学会利用相对相机几何是这个架构中最吃数据的部分,也是迁移性最好的部分 —— 比扩散头本身更值得迁移。预训练数据配比以 DROID 为主(带标定外参的真实 Franka 数据),所以一台类似的 7-DoF 机械臂 + 第三人称相机 + 腕部相机属于近域。
 
@@ -257,16 +273,17 @@ CUDA_VISIBLE_DEVICES=x python train.py \
 
 ## 0. 前置条件
 
-**标定好的相机外参是必需的,而且缺了会静默失败。** Context encoder 使用 PRoPE,它消费 `^{world}_{cam}T`,而且动作空间本身就定义在相机系下(`space_ee2cam`)。注意 PRoPE 和 RoPE 都是无参数的,所以切换 `pe_type` **不会**改变 `state_dict` —— checkpoint 依然会"加载成功",但位置编码的含义已经完全变了。症状:训练就是不收敛。录数据前先标定相机。
+**`ee_cam` 下,标定好的相机外参是必需的,而且缺了会静默失败。** Context encoder 使用 PRoPE,它消费 `^{world}_{cam}T`,而且动作空间本身就定义在相机系下(`space_ee2cam`)。走 `joint7` 的话外参不进入动作链路,没有标定也能训 —— 但那时 `obs_extrinsics` 应当**整条轨迹全填单位阵**(退化成 base 系,自洽),绝不要填一半真一半假,并且要关掉 `shuffle_cameras`,否则两路几何上无法区分的相机被随机换序只是在加噪声。注意 PRoPE 和 RoPE 都是无参数的,所以切换 `pe_type` **不会**改变 `state_dict` —— checkpoint 依然会"加载成功",但位置编码的含义已经完全变了。症状:训练就是不收敛。录数据前先标定相机。
 
 每一帧你需要有:
 
 | 量 | 形状 | 说明 |
 | --- | --- | --- |
-| 末端位姿 | `(4, 4)` | `^{world}_{ee}T`,齐次矩阵 |
+| 末端位姿 | `(4, 4)` | `^{world}_{ee}T`,齐次矩阵。`ee_cam` 的监督目标;`joint7` 下仍需提供(用作 `cur_weT` 条件) |
+| 关节角 | `(nq,)` | **弧度**。仅 `joint7` 需要,是它的监督目标 |
 | 夹爪开合度 | 标量 | 归一化到 `[0, 1]`,0 = 闭合,1 = 张开 |
 | 每路相机 RGB | `(H, W, 3)` | uint8 |
-| 相机外参 | `(4, 4)` | `^{world}_{cam}T`,逐帧(腕部相机会动) |
+| 相机外参 | `(4, 4)` | `^{world}_{cam}T`,逐帧(腕部相机会动)。无标定时全填单位阵 |
 | 相机内参 | `(3, 3)` | 针孔 `K`,每条 episode 内固定 |
 | 时间戳 | 标量 | 秒,单调递增 |
 
@@ -325,16 +342,55 @@ class RealRobot(H5DatasetMapBase):
 
 `sample_dt` 必须是真实的墙钟周期。它决定预测的 chunk 往前覆盖多久:`sample_dt * sample_state_gaps * num_future_states` 秒 —— 默认配置下是 2.13 秒。
 
+## 2b. 如果数据是 memmap/bin 而不是 HDF5
+
+上面的 h5 路径依赖 h5py 的惰性随机读:`H5DatasetMapBase.__getitem__` 每次只打开文件切几帧,`datavis.py` 和 `compute_action_stats.py` 也走同一条路。自己录的数据如果是「每条轨迹一个目录 + `metadata.json` 描述若干 `NAME.bin` 的 dtype/shape」,不需要转成 h5,也不需要改 `dataset_base.py` —— 需要对齐的只是 `__getitem__` 的**输出契约**:
+
+| key | shape | 说明 |
+| --- | --- | --- |
+| `rgbs` | `(To, ncam, 3, H, W)` | **float32 且已 /255**,不是 uint8 |
+| `K` | `(ncam, 3, 3)` | 必须对应 resize **之后**的 H/W |
+| `obs_norm_xys` | `(To, ncam, 2, H, W)` | 由 `gen_norm_xy_map(H, W, K)` 生成 |
+| `obs_extrinsics` | `(To, ncam, 4, 4)` | `^{world}_{cam}T` |
+| `ee_poses` | `(nee, 4, 4)` | 只要最新一帧 |
+| `history_actions` | `(nhist, nee, state_dim)` | `state_dim` 由动作空间决定 |
+| `future_actions` | `(Ta, nee, state_dim)` | 同上 |
+| `timestamps` | `(To,)` | |
+| `valid_ee_mask` | `(nee,)` | bool |
+| `prompt_text` | str | |
+
+`data_utils/dataset_real.py` 里的 `RealBinDataset` 就是这样一个实现,直接改它的四个标注字段即可:`CAMERA_AXIS`(bin 里相机的轴顺序)、`IS_BGR`、`GRIPPER_MIN/MAX`(夹爪宽度到 `[0,1]` 的线性映射)、`ACTION_SPACE` / `NUM_JOINTS`。
+
+它继承 `H5DatasetMapBase`(尽管完全覆盖了 `__getitem__`),因为 `concat_datasets` 要读 `cam_num` / `ee_num` 并回写 `pad2ncam` / `pad2nee`,`compute_action_stats` 要用 `skip_rgb`。基类的 `h5_filelist` 在这里存的是轨迹目录。
+
+跑自带的契约校验:
+
+```bash
+python -m data_utils.dataset_real
+```
+
+它逐键校验形状,外加三个语义检查:`rgbs` 是否已除 255、夹爪是否在 `[0,1]`、以及按动作空间分支的量纲检查(EE 查位姿末行是否 `[0,0,0,1]`,关节查绝对值是否超过 2π——角度制/弧度制搞反在训练时完全不报错,只会让归一化范围大 57 倍)。
+
+两点与 h5 路径的有意差异:memmap 路径**不做时间插值**(真机等间隔录制,直接按索引采样,`timestamps` 由 `index * record_dt` 合成);录制帧率不稳的话要改回按时间戳插值。以及无标定时 `obs_extrinsics` 全填 identity —— 这时 PRoPE 退化为 no-op、动作退化到 base 系,仍然自洽,但两路相机在几何上完全不可区分,所以必须 `shuffle_cameras=False`。
+
 ## 3. 微调
 
 ```bash
+# ee_cam:从预训练权重出发
 CUDA_VISIBLE_DEVICES=0 python train.py \
   --config finetune_real \
   --pretrained_ckpt ./checkpoints/E2VLA/PRETRAIN_EXP_NAME/ckpt_xxxxxxx.pt \
   -s MY_ROBOT_EXP
+
+# joint7:从头训,不能传 --pretrained_ckpt
+CUDA_VISIBLE_DEVICES=0 python train.py \
+  --config finetune_real_joint \
+  -s MY_ROBOT_JOINT_EXP
 ```
 
-`finetune_real` 预设与 LIBERO 那几个的差别都源于数据量更小:20k 步而不是 70k,`max_lr=5e-5` 而不是 `1e-4`,开启 `grad_clip=1.0`,`bs=16`,EMA 从第 1k 步开启。`sample_multiplex=1000` 把 episode 列表膨胀,让一个 "epoch" 有可用的长度。此外它默认 `lora_rank=16`,见下一节。
+`finetune_real_joint` 与 `finetune_real` 的差别都源于「没有预训练初始化」:`lora_rank=0`(冻结一个随机初始化的基座没有意义)、`max_lr=1e-4` 而不是 `5e-5`、`max_iterations=60k` 而不是 `20k`。传了 `--pretrained_ckpt` 会在 `check_action_layout` 处直接报错,不会静默加载。
+
+`finetune_real` 预设(`ee_cam`)与 LIBERO 那几个的差别都源于数据量更小:20k 步而不是 70k,`max_lr=5e-5` 而不是 `1e-4`,开启 `grad_clip=1.0`,`bs=16`,EMA 从第 1k 步开启。`sample_multiplex=1000` 把 episode 列表膨胀,让一个 "epoch" 有可用的长度。此外它默认 `lora_rank=16`,见下一节。
 
 Checkpoint 加载行为:
 - `--pretrained_ckpt` 默认**只加载权重**(`pretrained_weights_only=True`)。微调是一个新的优化问题:`current_iters` 归零、LR 从零重新 warmup,继承预训练的 Adam 动量会让最初几步的更新大于预期。传 `--pretrained_weights_only False` 恢复旧行为。
@@ -391,7 +447,7 @@ LoRA 注入 `ContextEncoder` 中所有注意力投影(`to_q`/`to_k`/`to_v` 及�
 
 - 顺序错了会抛 `RuntimeError` 并列出所有不匹配的 key,**不会静默地只加载一半**。
 - Checkpoint 里存了 `lora_rank` 字段。续训时如果它和当前 config 不一致,会直接报错而不是加载失败。
-- **`lora_rank > 0` 时必须传 `--pretrained_ckpt`**,否则直接拒绝运行:LoRA 冻结的基座权重如果本身是随机初始化的,等于 60% 的参数被永久卡在初始化状态。
+- **`lora_rank > 0` 时必须传 `--pretrained_ckpt`**,否则直接拒绝运行:LoRA 冻结的基座权重如果本身是随机初始化的,等于 60% 的参数被永久卡在初始化状态。**这条也就意味着关节空间用不了 LoRA** —— 没有可加载的预训练权重,`finetune_real_joint` 因此设 `lora_rank=0`。
 - 部署时的 merge 必须在 EMA `copy_to` **之后**:EMA 的 shadow 参数就是 LoRA 因子本身,先 merge 会把 EMA 权重丢掉。
 
 ### 部署时的开销:零(LoRA)
@@ -406,7 +462,7 @@ LoRA 注入 `ContextEncoder` 中所有注意力投影(`to_q`/`to_k`/`to_v` 及�
 
 ### 为什么
 
-模型的动作不是数据集里的绝对位姿,而是 `space_ee2cam` 产出的**相机系相对量**:3 维平移 + 6D 旋转 + 夹爪开合,共 10 维。这 10 个通道的量纲差得很远 —— 平移是米(约 `1e-2`),而一个接近单位阵的 delta 的 6D 旋转是 `[1, 0, 0, 0, 1, 0]`,两个通道钉在 1 附近、四个钉在 0 附近。DDIM 从 `N(0, I)` 采样并预测 epsilon,隐含假设被去噪的干净数据是单位尺度的,现状并不满足。
+模型的动作不是数据集里给的原始状态。`ee_cam` 下它是 `space_ee2cam` 产出的**相机系相对量**:3 维平移 + 6D 旋转 + 夹爪开合,共 10 维;`joint7` 下是绝对关节角 + 夹爪,共 8 维。下面以 `ee_cam` 为例——这 10 个通道的量纲差得很远 —— 平移是米(约 `1e-2`),而一个接近单位阵的 delta 的 6D 旋转是 `[1, 0, 0, 0, 1, 0]`,两个通道钉在 1 附近、四个钉在 0 附近。DDIM 从 `N(0, I)` 采样并预测 epsilon,隐含假设被去噪的干净数据是单位尺度的,现状并不满足。
 
 用分位数而不是均值/方差:遥操作数据里有罕见的大跳变(跟踪丢失、操作员复位),标准差会被这些尾巴主导,反而把真正重要的那 98% 的运动压扁。
 
@@ -414,8 +470,13 @@ LoRA 注入 `ContextEncoder` 中所有注意力投影(`to_q`/`to_k`/`to_v` 及�
 
 ```bash
 # 1. 统计。必须对着将要训练的那个 config 算 —— 统计量是 config 的属性,不是磁盘上数据的属性
+#    (它读 config 的 action_space,在对应空间里测量;此时 action_norm_stats 应仍为 None)
 python -m data_prepare.compute_action_stats --config finetune_libero_10 \
   -o ./action_stats/libero_10.json
+
+# 关节空间同理
+python -m data_prepare.compute_action_stats --config finetune_real_joint \
+  -o ./action_stats/real_joint7.json
 
 # 2. 训练时指向它
 CUDA_VISIBLE_DEVICES=0 python train.py --config finetune_libero_10 \
@@ -430,12 +491,50 @@ CUDA_VISIBLE_DEVICES=0 python train.py --config finetune_libero_10 \
 ### 几个不显然但重要的点
 
 - **统计量不可跨数据集复用。** 它是在相机系相对动作上算的,依赖 DataConfig(哪几个相机、`sample_state_gaps`、未来时域、是否 shuffle 相机)。换一个微调集就重算一次。
-- **clip 不作用于旋转通道**(`DEFAULT_CLIP_DIMS = (0, 1, 2, 9)`)。平移和开合度是度量量,超界意味着危险的跳变,该 clip;6D 旋转要经过 `rotation_6d_to_matrix` 的 Gram-Schmidt,是「看方向、不看模长」的量,超界无害,而 clip 会把整个越界半空间塌缩到同一个角点 —— 一旦两个 3 维向量共线,Gram-Schmidt 会返回一个带零行的矩阵,那根本不是旋转矩阵。未训练的模型第一次前向就能走到这个状态。
+- **统计量按动作空间打了 layout 戳,不可跨空间复用。** json 里的 `"layout"` 字段(`cam_rel_t3r6_openness` 或 `abs_joint7_openness`)在加载时严格比对。这不是多余的谨慎:两个空间的通道数可能撞车(9 轴机械臂的关节空间也是 10 维),那时每个张量的名字和形状都对得上,加载报告「干净匹配」,然后模型把关节角当成米和旋转去去噪。没有 `"layout"` 键的旧文件一律按 `ee_cam` 读(它们都是)。
+- **clip 不作用于旋转通道**(`DEFAULT_CLIP_DIMS = (0, 1, 2, 9)`),这是 `ee_cam` 专有的;关节空间每一维都是度量量,全部参与 clip。平移和开合度是度量量,超界意味着危险的跳变,该 clip;6D 旋转要经过 `rotation_6d_to_matrix` 的 Gram-Schmidt,是「看方向、不看模长」的量,超界无害,而 clip 会把整个越界半空间塌缩到同一个角点 —— 一旦两个 3 维向量共线,Gram-Schmidt 会返回一个带零行的矩阵,那根本不是旋转矩阵。未训练的模型第一次前向就能走到这个状态。
 - **近似常数的通道会被自动跳过**(`q99 - q01 < 1e-6` 时 scale=1、offset=0),不会除以 0。脚本会在表格里把这些通道标出来 —— 看到它先怀疑是不是采样窗口太少,而不是数据真的退化。
 - **归一化不改变任何张量的名字和形状。** 一个在归一化动作上训练的 checkpoint,加载到没有 normalizer 的模型里会**零缺失 key 地加载成功**,loss 曲线看着正常,然后机器人执行的动作差了大约一个仿射的倒数。因此统计量会被写进 checkpoint 的 `action_norm` 字段,`train_utils/ckpt.py:check_action_norm` 在续训时严格比对(不一致直接报错),从预训练 ckpt 微调时降级为大声警告(拿官方无归一化的 ckpt 配上自己数据的分位数微调是合理操作,但不该是无意中发生的)。这和 `objective` 那个 stamp 防的是同一类问题。
 - 推理侧的解析顺序和 `lora_rank` 一致:**checkpoint 里的记录优先于 config json**,因为同一个目录下的 json 可能被后来的 run 覆盖掉。
 
+## 3.7 动作空间:关节角 vs 末端位姿
+
+`TrainConfig.action_space` 选择模型在哪个空间里去噪,实现在 `models/action_space.py`。两个空间是并存的策略对象,`ee_cam` 的行为与引入这个开关之前逐行等价。
+
+| | `ee_cam` | `joint7` |
+| --- | --- | --- |
+| `state_dim`(数据集给的) | 17 = 展平 4x4 + 夹爪 | nq+1 = 8 |
+| `action_dim`(模型内部) | 10 = 3 平移 + 6D 旋转 + 夹爪 | 8 |
+| `layout` 戳 | `cam_rel_t3r6_openness` | `abs_joint7_openness` |
+| loss 切分 | pos / rot / openness | joint / openness |
+
+注意 `state_dim` 和 `action_dim` 是两个数。在 `ee_cam` 下它们分别是 17 和 10,`space_ee2cam` 是中间的转换;`joint7` 下两者相等,但代码里仍然分开,不要混用。
+
+### 为什么关节角用绝对值而不是增量
+
+这与 `ee_cam` 的取向相反,是有意的。EE 那边预测增量,是因为绝对世界位姿依赖标定、跨 episode 不可比;关节角本身就在机器人自己的坐标系里,绝对值天然可比,而增量会把误差逐步累积到轨迹末端。ACT / Diffusion Policy 这一系的关节空间实现也都是绝对目标。
+
+要改成增量的话,覆盖 `AbsJoint` 的 `states2action` / `action2states` 即可,但**必须同时改 `layout` 字符串**,否则旧的统计文件会静默套用到新编码上。
+
+### 关节空间放弃了什么
+
+1. **预训练权重。** `action_dim` 从 10 变成 8,`hist_enc` / `traj_enc` / `act_head` 全部换形状,没有 checkpoint 能跨过去。这是主要成本 —— 可训练参数的 60% 在 `ContextEncoder` 里,它学的多视角几何融合本来是迁移性最好的部分。视觉 backbone 仍然是冻结的预训练权重,所以「从头训」不等于「从随机视觉特征开始」,但 ContextEncoder 确实要重新学。
+2. **头部的绝对位置编码。** `DiffusionHead.pos_rel2abs` 把预测的 t3r6 还原成相机系下的末端绝对位置,再作为一路附加位置编码加回特征。关节角要做这件事需要正运动学(得有 URDF/DH 参数),所以 `joint7` 下 `abs_pos_enc` 根本不建 —— 不是建了不用,是不进 `state_dict`,免得每个 checkpoint 里躺着一堆拿不到梯度的死权重。有 DH 参数的话,在 `AbsJoint` 里实现 FK 并把 `has_pose_geometry` 打开就能补回来。
+3. **LoRA。** 见 §3.5,`lora_rank > 0` 必须配 `--pretrained_ckpt`。
+
+换来的是:模型输出直接就是关节控制器的输入,不过逆运动学,手眼标定误差也不再进入动作链路。
+
+### 防串用的两道戳
+
+`layout` 会同时写进统计 json 和 checkpoint(`action_layout` 字段),在 `build_action_normalizer` 和 `train_utils/ckpt.py:check_action_layout` 两处校验。理由和 `objective = "ddim"` 那个戳完全一样:两个空间的通道数可能撞车(9 轴机械臂的关节空间也是 10 维),那时**每个张量的名字和形状都对得上**,权重零缺失 key 地加载、布局检查报告干净匹配,然后模型开始输出垃圾。名字和形状分辨不了,只有这个戳能。
+
+早于这两个戳的文件一律按 `ee_cam` 读 —— 它们确实都是。
+
 ## 4. 部署
+
+> **关节空间目前只支持到训练,部署链路还没改。** `TrajPlanner` 的动作解码是 17 维 SE(3) 专用的:`_make_empty_action` 写死 `16+1` 并填单位阵,`get_action` 做 `reshape(actions[..., :16], (..., 4, 4))` 后返回 `future_ee_poses`,`ensemble_traj` 也是按位置 + 旋转分别插值的。用 `joint7` 的 checkpoint 起 `remote_service`,模型本身会正确构建(`load_model` 已经读 config 的 `action_space` 并校验 checkpoint 的 layout 戳),但 `get_action` 会在 reshape 处炸掉 —— 8 维状态没法 reshape 成 4x4。要补的是:`_make_empty_action` 按 `state_dim` 分配、`get_action` 按动作空间分支返回关节目标而不是位姿、以及一个关节空间的 ensembler(关节角可以直接线性平均,比 SE(3) 那套简单)。
+>
+> 下面这节描述的是 `ee_cam` 的部署流程。
 
 和 LIBERO 一样的三进程结构,只是客户端喂的是真实观测而不是仿真器。启动命名服务和策略服务:
 
@@ -452,7 +551,7 @@ CUDA_VISIBLE_DEVICES=0 python -m infer_utils.remote_service \
 
 ```python
 controller = get_shm_proxy("MY_ROBOT", ns_host="localhost", ns_port=9090)
-controller.set_config("RealRobot")     # 按数据集类名索引
+controller.set_config("RealRobot")     # 按数据集类名索引;bin 数据集是 "RealBinDataset"
 controller.reset()                     # 每条 episode 之间必须调用
 controller.set_prompt("pick up the red block")
 

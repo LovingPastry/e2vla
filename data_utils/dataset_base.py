@@ -126,9 +126,16 @@ class DataSampler(object):
         record_dt: Optional[float] = None,
         output_image_hw: Optional[Tuple[int, int]] = None,
         pad2ncam: int = -1,
-        pad2nee: int = -1
+        pad2nee: int = -1,
+        skip_rgb: bool = False
     ):
         """
+        `skip_rgb` mirrors `sample_hdf5`: it leaves the images unresized (and K unscaled)
+        for callers that only want the pose/action outputs. This parameter was referenced
+        in the body without being declared, so every call raised NameError -- which took
+        `TrajPlanner._make_data_for_infer`, i.e. the whole real-robot inference path, down
+        with it.
+
         obs_traj is a list of dict containing necessary keys listed as followings.
         - ee_pose: np.ndarray of shape (4, 4) or (nee, 4, 4), ^{world}_{ee} T
         - gripper: float or np.ndarray of shape (nee,), value from [0 (close), 1 (open)]
