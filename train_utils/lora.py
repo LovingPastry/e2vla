@@ -3,6 +3,7 @@ import torch
 from typing import List, Sequence, Tuple
 from torch import nn, Tensor
 from models.layers.mha import MySimpleMHA
+from models.conv_tower import CONV_BRANCH_KEYS
 
 
 class LoraLinear(nn.Module):
@@ -66,7 +67,15 @@ def replace_with_lora_linear(model: nn.Module, r: int):
 # absorb the distribution shift that low-rank updates alone adapt to slowly. The two
 # learned embeddings are tiny (64x768 and 768) and are the model's only handle on
 # "which query slot" and "which camera is the main one".
-LORA_KEEP_TRAINABLE = ("norm", ".bias", "qformer.queries", "main_cam_embed")
+#
+# CONV_BRANCH_KEYS is here for a different reason: LoRA decomposes an *update* around a
+# pretrained base, and the conv branch has no pretrained base inside this model -- it is
+# new in this run. Freezing it would leave it at its initialisation while every log line
+# still reported it as part of the model, which is precisely the silent failure this
+# repo's stamps exist to prevent. So a `lora_rank > 0 + conv_tower` run adapts the trunk
+# by low rank and trains the branch densely, which is the intended combination.
+LORA_KEEP_TRAINABLE = (("norm", ".bias", "qformer.queries", "main_cam_embed")
+                       + CONV_BRANCH_KEYS)
 
 
 def setup_lora(module: nn.Module, rank: int, keep_trainable=LORA_KEEP_TRAINABLE):

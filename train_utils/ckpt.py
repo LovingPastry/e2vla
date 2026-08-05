@@ -15,7 +15,7 @@ which is what `check_objective` below (and its siblings for the action space, th
 normalization and the VLM's LoRA) are for.
 """
 
-from typing import Dict
+from typing import Dict, Sequence
 from torch import nn, Tensor
 
 
@@ -309,6 +309,7 @@ def load_actor_weights(
     weights: Dict[str, Tensor],
     strict: bool = True,
     what: str = "checkpoint",
+    allow_missing_prefixes: Sequence[str] = (),
 ):
     """Load pretrained action-expert weights, reporting exactly what happened.
 
@@ -321,6 +322,13 @@ def load_actor_weights(
             and `context_encoder.post_attn`'s FFN. Those layers then stay randomly
             initialised and must be trained.
         what: label used in messages
+        allow_missing_prefixes: key prefixes the model may legitimately have and the
+            checkpoint legitimately lack -- a module this run added that no released
+            checkpoint could contain, currently only the conv branch. The narrow
+            alternative to `strict=False`: this permits *exactly* those tensors to start
+            from their initialisation, while an unexpected key, a shape change, or a
+            missing key anywhere else still raises. `strict=False` would wave all of them
+            through together, which is a much bigger claim than the one being made here.
 
     Returns:
         CkptCompatReport
@@ -333,6 +341,23 @@ def load_actor_weights(
         print("[INFO] {}: state_dict layout matches ({} tensors, names and shapes)."
               .format(what, len(report.matched)))
         actor.load_state_dict(_strip_prefix(weights, "actor."))
+        return report
+
+    new_modules = [n for n in report.missing
+                   if any(n.startswith(p) for p in allow_missing_prefixes)]
+    if (allow_missing_prefixes and not report.unexpected and not report.mismatched
+            and len(new_modules) == len(report.missing)):
+        print("[INFO] {}: {} tensors matched. {} tensors belong to modules this run adds "
+              "and the checkpoint cannot contain; they keep their initialisation and are "
+              "trained:".format(what, len(report.matched), len(new_modules)))
+        for prefix in allow_missing_prefixes:
+            n = sum(1 for k in new_modules if k.startswith(prefix))
+            if n:
+                print("           {}* ({} tensors)".format(prefix, n))
+        actor.load_state_dict(
+            {k: v for k, v in _strip_prefix(weights, "actor.").items()
+             if k in report.matched},
+            strict=False)
         return report
 
     message = "{} does not match the model:\n{}".format(what, report.summary())

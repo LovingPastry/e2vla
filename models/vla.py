@@ -5,6 +5,12 @@ from .vlm import VLM
 from .action_expert import ActionExpert, DEFAULT_OBJECTIVE
 from .action_norm import ActionNormalizer, build_action_normalizer
 from .action_space import ActionSpace, build_action_space
+from .conv_tower import CONV_LR_KEYS
+
+
+def _is_conv_branch(name: str):
+    """Does this parameter belong to the trainable conv branch's own LR group?"""
+    return any(key in name for key in CONV_LR_KEYS)
 
 
 class VLA(nn.Module):
@@ -24,6 +30,9 @@ class VLA(nn.Module):
         objective: str = DEFAULT_OBJECTIVE,
         flow_time_sampling: str = "uniform",
         flow_time_alpha: float = 1.5,
+        # "none" / None keeps the original two-tower vision path. Anything else adds a
+        # trainable CNN branch inside the ContextEncoder -- see models/conv_tower.py.
+        conv_tower: Optional[str] = None,
     ):
         super().__init__()
         self.action_space = build_action_space(action_space)
@@ -42,8 +51,9 @@ class VLA(nn.Module):
             objective=objective,
             flow_time_sampling=flow_time_sampling,
             flow_time_alpha=flow_time_alpha,
+            conv_tower=conv_tower,
         )
-    
+
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -54,24 +64,56 @@ class VLA(nn.Module):
                     nn.init.zeros_(m.bias)
     
     def parameter_groups(self):
-        decay = []
-        no_decay = []
+        """Trainable parameters split into (decay, no_decay, conv_decay, conv_no_decay).
+
+        The conv split exists because the branch is on a different footing from the rest:
+        the trunk is warm-started from a pretrained checkpoint and wants small steps, the
+        conv tower starts from ImageNet weights on a new domain and wants larger ones.
+        `train.py` gives the two conv groups `max_lr * conv_tower_lr_scale`. Both stay
+        empty when no conv tower is configured, so the optimizer is unchanged.
+
+        Inside the conv tower, norm parameters are identified by module *type* rather than
+        by name: BatchNorm's affines are called `...bn1.weight`, which the "norm" substring
+        rule below does not match, and weight-decaying a normalization scale is not what
+        anyone wants.
+
+        That type check is deliberately scoped to `conv_tower` and NOT applied model-wide,
+        even though the same argument would justify it there. Applying it globally moves 10
+        existing LayerNorm weights out of `decay` -- `simple_mlp` builds them inside an
+        `nn.Sequential`, so they are named `proj_v.0.1.weight`, with no "norm" anywhere in
+        the string. Two things break if they move: `optimizer.load_state_dict` compares
+        group *sizes*, so every checkpoint written before this existed stops resuming; and
+        the tower-less baseline this branch is supposed to be measured against quietly
+        stops being the same run. Fixing that is a separate change with its own migration.
+        """
+        conv_norm_ids = {
+            id(p)
+            for name, m in self.named_modules()
+            if "conv_tower" in name
+            and isinstance(m, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d, nn.GroupNorm))
+            for p in m.parameters(recurse=False)
+        }
+
+        decay, no_decay = [], []
+        conv_decay, conv_no_decay = [], []
 
         for name, param in self.named_parameters():
             if not param.requires_grad:
                 continue
 
             if (
-                name.endswith(".bias") or 
-                "norm" in name.lower() or 
-                "qformer.queries" in name
+                name.endswith(".bias") or
+                "norm" in name.lower() or
+                "qformer.queries" in name or
+                id(param) in conv_norm_ids
             ):
-                no_decay.append(param)
+                bucket = conv_no_decay if _is_conv_branch(name) else no_decay
             else:
-                decay.append(param)
-        
-        return decay, no_decay
-    
+                bucket = conv_decay if _is_conv_branch(name) else decay
+            bucket.append(param)
+
+        return decay, no_decay, conv_decay, conv_no_decay
+
     def forward(
         self, 
         rgbs: Tensor,
@@ -156,6 +198,7 @@ def _build_vla(
     objective: str = DEFAULT_OBJECTIVE,
     flow_time_sampling: str = "uniform",
     flow_time_alpha: float = 1.5,
+    conv_tower: Optional[str] = None,
 ):
     hdim, num_heads = VLA_SIZES[size]
     return VLA(
@@ -170,6 +213,7 @@ def _build_vla(
         objective=objective,
         flow_time_sampling=flow_time_sampling,
         flow_time_alpha=flow_time_alpha,
+        conv_tower=conv_tower,
     )
 
 

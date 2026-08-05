@@ -10,6 +10,7 @@ from train_utils.lora import VLM_LORA_TARGETS, DEFAULT_VLM_LORA_TARGETS
 # -- a second list would drift, and the failure of a drifted list is a config that
 # validates and then blows up (or worse, silently falls back) inside the model.
 from models.action_expert import OBJECTIVES, FLOW_TIME_SAMPLING
+from models.conv_tower import CONV_TOWERS
 
 
 @dataclass
@@ -62,6 +63,29 @@ class TrainConfig(object):
     # string rather than anything that transfers. Ignored when vlm_lora_rank == 0.
     vlm_lora_targets: List[str] = field(
         default_factory=lambda: list(DEFAULT_VLM_LORA_TARGETS))
+
+    # A trainable CNN branch running alongside the frozen ViTs (models/conv_tower.py).
+    # "none" is the original architecture, bit for bit: nothing is constructed and no
+    # state_dict key appears.
+    #
+    # This is the cheap answer to the problem `vlm_lora_rank` answers expensively. Both
+    # exist because a real rig's images are out of DINOv2's and SigLIP's distribution; the
+    # difference is that this adds ~2.9M new parameters and one shallow conv stack instead
+    # of taping the whole backward graph of two ViTs. The branch reads raw pixels, so it
+    # can learn the low-level statistics -- lighting, gripper texture, a featureless table
+    # -- that a patch-16 ViT discards. Expect step time to roughly double at 256x256 and
+    # activation memory to rise; the frozen backbones are untouched either way.
+    #
+    # It only makes sense with `--pretrained_ckpt`, where the fusion layer's [I | 0]
+    # initialisation makes step 0 identical to the tower-less model. From scratch it is
+    # just extra parameters. The new tensors are allowed to be missing from a pretrained
+    # checkpoint without weakening `pretrained_strict` -- see train.py.
+    conv_tower: str = "none"
+    # Learning rate for the conv branch, as a multiple of `max_lr`. The trunk is
+    # warm-started and wants small steps; the branch is ImageNet-initialised on a new
+    # domain and wants larger ones. Only affects the optimizer, never the model, so it is
+    # deliberately absent from `model_kwargs()`. Ignored when conv_tower == "none".
+    conv_tower_lr_scale: float = 1.0
 
     # Path to a q01/q99 action-statistics JSON, produced by
     #   python -m data_prepare.compute_action_stats --config THIS_CONFIG -o PATH
@@ -192,7 +216,36 @@ class TrainConfig(object):
     dataset_weights: List[float] | None = None  # len = len(datasets)
     sample_multiplex: int = 1   # set this to a large number (e.g. 1000) if the total number of samples are small
 
+    # --- logging (TensorBoard) ------------------------------------------------------
+    # How often the averaged scalars are written. Everything cheap -- losses, the `diag/*`
+    # model diagnostics, grad norms, throughput -- goes out at this rate and costs nothing
+    # measurable, so there is no reason to raise it.
     log_interval: int = 100
+
+    # Run the FULL sampling loop on the current batch and report the resulting action
+    # error in physical units (`sample/pos_err_m`, `sample/rot_err_deg`, ...). This is the
+    # only training-time number that is on the same scale as rollout success: the training
+    # loss measures a single denoising step, which can keep improving while the integrated
+    # trajectory does not. Costs one extra forward plus `inference_timesteps` head
+    # evaluations, so it is interval-gated; 500-1000 is cheap in practice. 0 disables it.
+    #
+    # Measured on the training batch -- there is no validation split in this repo -- so
+    # read it as "can the sampler reproduce what it was trained on", not as generalization.
+    log_sample_interval: int = 0
+
+    # Write the batch's input images (all cameras of the latest frame) and its prompt to
+    # TensorBoard. Worth switching on for the first few thousand iterations of any new
+    # dataset: it is the cheapest check that the /255 scaling, the camera ORDER (camera 0
+    # defines the whole action frame) and the prompt text are what you think they are.
+    # 0 disables it.
+    log_image_interval: int = 0
+
+    # Per-tensor weight/gradient histograms. Off by default -- it is the only logging knob
+    # here with a visible cost (both step time and event-file size), and it answers a
+    # question the `gnorm/*` scalars usually already answer. Use it when a specific layer
+    # is suspected of saturating or dying. 0 disables it.
+    log_hist_interval: int = 0
+
     save_interval: int = int(100e3)  # ckpt are named as ckpt_{iter}.pt, set <0 to disable this
     save_latest_interval: int = 2000  # ckpt are named as ckpt_latest.pt
     max_iterations: int = int(600e3)
@@ -225,7 +278,19 @@ class TrainConfig(object):
                 "vlm_lora_rank={} but vlm_lora_targets is empty, which would adapt "
                 "nothing. Set targets or set the rank back to 0."
                 .format(self.vlm_lora_rank))
-    
+
+        if self.conv_tower not in CONV_TOWERS:
+            raise ValueError(
+                "unknown conv_tower '{}'; valid choices are {}"
+                .format(self.conv_tower, list(CONV_TOWERS)))
+        if self.conv_tower_lr_scale <= 0:
+            raise ValueError(
+                "conv_tower_lr_scale must be positive, got {}. A scale of 0 would put the "
+                "branch in the optimizer and never move it, which looks exactly like "
+                "training it."
+                .format(self.conv_tower_lr_scale))
+
+
     def model_kwargs(self) -> Dict:
         """The subset of this config that `models/vla.py:vla_*` takes.
 
@@ -243,9 +308,17 @@ class TrainConfig(object):
             inference_timesteps=(self.inference_timesteps or None),
             flow_time_sampling=self.flow_time_sampling,
             flow_time_alpha=self.flow_time_alpha,
+            # Must be here, not just in train.py: the branch's tensors ARE in the
+            # checkpoint, so an evaluation run that rebuilt the model without it would
+            # fail on load -- loudly, but only after the backbones and the simulator are
+            # already up. Older config jsons have no such key and fall back to "none".
+            conv_tower=self.conv_tower,
         )
 
-    def dump(self, path: str):
+    def to_json(self) -> str:
+        """The exact text `dump` writes. Split out so the same rendering can go into the
+        TensorBoard run without a second serialisation path to drift from this one --
+        the config shown next to the curves has to be the config the checkpoint carries."""
         items = asdict(self)
         dataset_classes = items["dataset_classes"]
         for i, D in enumerate(dataset_classes):
@@ -253,11 +326,13 @@ class TrainConfig(object):
                 dataset_classes[i] = D.__name__
             else:
                 assert isinstance(D, str)
-        
+        return json.dumps(items, ensure_ascii=False, indent=4)
+
+    def dump(self, path: str):
         save_folder = os.path.dirname(path)
         os.makedirs(save_folder, exist_ok=True)
         with open(path, "w", encoding="utf-8") as fp:
-            json.dump(items, fp, ensure_ascii=False, indent=4)
+            fp.write(self.to_json())
     
     @classmethod
     def load(cls, path: str):
@@ -360,6 +435,44 @@ CONFIGS["finetune_real"] = TrainConfig(
     max_iterations=int(20e3),
 )
 
+# The two conv-branch variants of `finetune_real`. They exist as a pair because which one
+# wins is an empirical question, and `finetune_real` itself is the third arm: run all three
+# off the SAME pretrain checkpoint and compare success rates.
+#
+#   finetune_real           LoRA trunk,      no branch    <- baseline
+#   finetune_real_conv      trunk fully open, branch      <- most capacity
+#   finetune_real_conv_lora LoRA trunk,       branch      <- closest to the usual practice
+#                                                            of "freeze/adapt what is
+#                                                            pretrained, fully train what
+#                                                            is new"
+#
+# Both need --pretrained_ckpt. The branch's tensors are absent from a released checkpoint,
+# which train.py allows by name without weakening pretrained_strict; every other mismatch
+# still raises. Halve `bs` if the conv branch does not fit -- it keeps activations for the
+# backward pass at full image resolution, unlike the frozen ViTs.
+#
+# conv_tower_lr_scale=2.0 is a starting point, not a tuned value: the trunk warm-starts at
+# 5e-5 and the ImageNet-initialised branch runs at 1e-4.
+CONFIGS["finetune_real_conv"] = replace(
+    CONFIGS["finetune_real"],
+    dataset_classes=[datasets.RealRobot],
+    dataset_weights=[1],
+    vlm_lora_targets=list(DEFAULT_VLM_LORA_TARGETS),
+    lora_rank=0,
+    conv_tower="resnet18",
+    conv_tower_lr_scale=2.0,
+)
+
+CONFIGS["finetune_real_conv_lora"] = replace(
+    CONFIGS["finetune_real"],
+    dataset_classes=[datasets.RealRobot],
+    dataset_weights=[1],
+    vlm_lora_targets=list(DEFAULT_VLM_LORA_TARGETS),
+    lora_rank=16,
+    conv_tower="resnet18",
+    conv_tower_lr_scale=2.0,
+)
+
 # Same real-robot setting as `finetune_real`, but the head predicts absolute joint angles
 # instead of camera-relative SE(3) deltas. Trades away two things and buys one:
 #   - no absolute-position encoding in the head (needs forward kinematics from joints)
@@ -424,10 +537,41 @@ def _flow_variant(base: TrainConfig, **overrides) -> TrainConfig:
 # unchanged, so an ablation against the DDIM preset of the same name is apples-to-apples
 # on data, schedule and model size.
 #
-# What is NOT possible: fine-tuning a released (DDIM) pretrain checkpoint with one of
-# these. The two objectives share an identical state_dict layout, so the load would
-# succeed silently -- `check_objective` refuses it instead. Either pretrain with
-# `pretrain_flow` first, or train the fine-tune from scratch (raise max_iterations if so).
+# A released (DDIM) pretrain checkpoint does NOT load into one of these by default: the two
+# objectives share an identical state_dict layout, so the load would succeed silently and
+# `check_objective` refuses it instead. The deliberate path is
+# `--pretrained_ignore_objective True`, which transfers the trunk and re-zeroes `act_head`'s
+# output Linear (see train.py). Pretraining with `pretrain_flow` first, or training the
+# fine-tune from scratch with a raised max_iterations, are the other two options.
 CONFIGS["pretrain_flow"] = _flow_variant(CONFIGS["pretrain"])
 CONFIGS["finetune_libero_10_flow"] = _flow_variant(CONFIGS["finetune_libero_10"])
 CONFIGS["finetune_real_flow"] = _flow_variant(CONFIGS["finetune_real"])
+
+# Flow + the trainable conv branch + everything densely trained, FROM SCRATCH.
+#
+# Every knob that differs from `finetune_real_conv` below differs for the same reason: that
+# preset is sized for warm-starting off a pretrain checkpoint, and this one has nothing to
+# warm-start from. The schedule is copied from `finetune_real_joint`, which is the repo's
+# other from-scratch real-robot preset.
+#
+#   python train.py --config finetune_real_conv_flow -s EXP
+#
+# `conv_tower_lr_scale` back to 1.0 is the one worth understanding. Its 2.0 in
+# `finetune_real_conv` exists because there the trunk is warm-started and wants small steps
+# while the ImageNet-initialised branch wants larger ones. From scratch that asymmetry is
+# gone -- the trunk is random too -- and if anything the branch is now the ONLY part of the
+# model carrying pretrained weights, so speeding it up relative to everything else is
+# backwards. One learning rate for the whole model until there is a measurement saying
+# otherwise.
+#
+# `flow_time_sampling` stays "uniform" (rectified flow's own choice). Reach for
+# "logitnormal" or "beta" only if few-step sampling looks under-converged; see README §3.8.
+CONFIGS["finetune_real_conv_flow"] = _flow_variant(
+    CONFIGS["finetune_real_conv"],
+    conv_tower_lr_scale=1.0,
+    # from-scratch schedule: finetune_real's 5e-5 / 1e3 / 20e3 are fine-tuning numbers
+    max_lr=1e-4,
+    num_warmup=int(2e3),
+    ema_start=int(2e3),
+    max_iterations=int(60e3),
+)

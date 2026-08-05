@@ -9,6 +9,7 @@ from typing import Optional, Tuple, Dict, List
 from .dit import DiT
 from .qformer import QFormerITM
 from .action_norm import ActionNormalizer
+from .conv_tower import build_conv_tower, TOTAL_STRIDE as CONV_TOTAL_STRIDE
 from .action_space import ActionSpace, build_action_space
 from .layers.utils import simple_mlp
 from .layers.utils import concat_mask
@@ -39,6 +40,85 @@ DEFAULT_OBJECTIVE = "ddim"
 # How the flow time t is drawn during training. t = 0 is pure noise, t = 1 is data.
 FLOW_TIME_SAMPLING = ("uniform", "logitnormal", "beta")
 
+# How many noise-level buckets `diffusion_diagnostics` splits the regression error over.
+DIAG_NOISE_BINS = 4
+
+
+@torch.no_grad()
+def diffusion_diagnostics(
+    pred: Tensor,
+    target: Tensor,
+    noise_level: Tensor,
+    actions: Optional[Tensor] = None,
+    num_bins: int = DIAG_NOISE_BINS,
+) -> Dict[str, float]:
+    """Per-step scalars the loss curve cannot show. Keys are prefixed `diag/`.
+
+    The loss is one number averaged over everything, and the three ways this head goes
+    wrong all leave it looking healthy:
+
+    * **collapse to the mean.** A head that ignores its time conditioning still minimises
+      the loss -- it just predicts one averaged field, and samples blur toward the mean
+      action. `diag/pred_std` decaying away from `diag/target_std` is that happening, and
+      `diag/cos_sim` (scale-free, so unaffected by the loss weights) stalling near 0 is
+      the same thing seen from the other side.
+    * **one end of the path untrained.** `diag/loss_noise_b{i}` splits the *unweighted* L1
+      by how corrupted the input was: bin 0 is nearly clean, bin `num_bins - 1` nearly
+      pure noise. A high-noise bin that never comes down means every sampler step
+      inherits its error; that is the case `flow_time_sampling="beta"` exists for.
+    * **saturated normalization.** `diag/act_clip_frac` is the fraction of target channels
+      outside [-1, 1]. With `action_norm_stats` set those are exactly the actions falling
+      outside the q01/q99 range the statistics were fitted on -- a few percent is normal,
+      a large fraction means the stats came from a different dataset or a different
+      config, which nothing else in the pipeline reports.
+
+    Args:
+        pred / target: (B, Ta, action_dim), whatever the objective regresses.
+        noise_level: (B,) in [0, 1], 0 = clean, 1 = pure noise. Under DDIM that is
+            `timesteps / num_train_timesteps`; under flow it is `1 - t`.
+        actions: (B, Ta, action_dim), the clean (normalized) chunk. Optional.
+
+    Everything is stacked into one tensor before the single `.tolist()`, so this costs one
+    GPU sync rather than one per scalar.
+    """
+    pred = pred[..., :target.shape[-1]].float()
+    target = target.float()
+
+    err = (pred - target).abs().mean(dim=(1, 2))  # (B,) unweighted, per sample
+    cos = F.cosine_similarity(pred.flatten(1), target.flatten(1), dim=1)  # (B,)
+
+    bins = (noise_level.float() * num_bins).long().clamp(0, num_bins - 1)
+    bin_sum = torch.zeros(num_bins, device=err.device, dtype=err.dtype)
+    bin_cnt = torch.zeros(num_bins, device=err.device, dtype=err.dtype)
+    bin_sum.index_add_(0, bins, err)
+    bin_cnt.index_add_(0, bins, torch.ones_like(err))
+
+    scalars = [err.mean(), cos.mean(), pred.std(), target.std()]
+    if actions is not None:
+        act = actions.float()
+        scalars.append(act.abs().amax())
+        scalars.append((act.abs() > 1.0).float().mean())
+    num_head = len(scalars)
+
+    values = torch.cat([torch.stack(scalars), bin_sum, bin_cnt]).tolist()
+
+    out = {
+        "diag/abs_err": values[0],
+        "diag/cos_sim": values[1],
+        "diag/pred_std": values[2],
+        "diag/target_std": values[3],
+    }
+    if actions is not None:
+        out["diag/act_absmax"] = values[4]
+        out["diag/act_clip_frac"] = values[5]
+    for i in range(num_bins):
+        count = values[num_head + num_bins + i]
+        if count > 0:
+            # Empty bins are omitted rather than logged as 0: a bucket that no sample
+            # landed in is not an error of zero.
+            out["diag/loss_noise_b{}".format(i)] = values[num_head + i] / count
+    return out
+
 
 class ContextEncoder(nn.Module):
     """Frozen VLM features -> a short, fixed-length context for the diffusion head.
@@ -56,14 +136,29 @@ class ContextEncoder(nn.Module):
       * PRoPE(extrinsics)  -- multiplicative, applied inside attention; makes attention
         between two patches depend on the *relative* pose of their cameras.
       * `main_cam_embed`   -- marks camera 0, the frame actions are expressed in.
+
+    `conv_tower` optionally adds a third, *trainable* vision stream (see
+    `models/conv_tower.py`) which is concatenated with the summed ViT stream and fused by
+    `proj_fuse`. The frozen sum is left exactly as it was: the dino+siglip relationship is
+    what a pretrained trunk learned, so the new modality joins from the side rather than
+    inside it.
     """
 
-    def __init__(self, hdim: int, num_heads: int, num_layers: int):
+    def __init__(self, hdim: int, num_heads: int, num_layers: int,
+                 conv_tower: Optional[str] = None, conv_dim: int = 256):
         super().__init__()
         self.proj_v = nn.ModuleList([
             simple_mlp([768, hdim, hdim], ln=True),  # for dinov2 vision embeds
             simple_mlp([768, hdim, hdim], ln=True),  # for siglip vision embeds
         ])
+        # Appended as index 2 so `proj_v.0.*` / `proj_v.1.*` keep their names: a pretrained
+        # checkpoint still matches them tensor for tensor.
+        self.conv_tower = build_conv_tower(conv_tower, out_dim=conv_dim)
+        if self.conv_tower is not None:
+            self.proj_v.append(simple_mlp([conv_dim, hdim, hdim], ln=True))
+            self.proj_fuse = nn.Linear(2 * hdim, hdim)
+        else:
+            self.proj_fuse = None
         self.proj_l = nn.ModuleList([
             simple_mlp([768, hdim, hdim], ln=True)  # for siglip language embeds
         ])
@@ -82,6 +177,18 @@ class ContextEncoder(nn.Module):
         # zero both weight and bias, otherwise pe2d is a random constant offset at init
         nn.init.zeros_(self.proj_pe[-1].weight)
         nn.init.zeros_(self.proj_pe[-1].bias)
+
+        if self.proj_fuse is not None:
+            # [I | 0]: at init the fusion returns the ViT sum untouched, so a model with a
+            # conv tower is functionally identical to one without and a pretrained trunk
+            # warm-starts exactly. Same trick as proj_pe above and as LoRA's zero-init B.
+            # It is strictly more expressive than the sum it starts as -- summing the two
+            # streams is the special case [I | I].
+            hdim = self.proj_fuse.out_features
+            with torch.no_grad():
+                self.proj_fuse.weight.copy_(torch.cat(
+                    [torch.eye(hdim), torch.zeros(hdim, hdim)], dim=1))
+                self.proj_fuse.bias.zero_()
 
     def forward(
         self,
@@ -120,6 +227,36 @@ class ContextEncoder(nn.Module):
         cam0_extr_ref = torch.inverse(obs_extrinsics[:, -1:, 0:1]) @ obs_extrinsics  # (B, To, Ncam, 4, 4)
         x_v: Tensor = self.proj_v[0](vl_feature["vision_embeds"][0]) + \
                       self.proj_v[1](vl_feature["vision_embeds"][1])  # (B, Ncam, Lv, C)
+        if self.conv_tower is not None:
+            # Checked before the tower runs, not after: the token count is fully decided
+            # by the image size and the tower's fixed stride, and the conv stack is the
+            # most expensive thing in this forward -- no reason to pay for it first.
+            # A mismatch here is not a broadcast bug waiting to happen (`cat` would raise
+            # too), it is a misconfigured `output_image_hw`, so say so.
+            img_h, img_w = vl_obs["rgb"].shape[-2:]
+            num_conv_tok = (img_h // CONV_TOTAL_STRIDE) * (img_w // CONV_TOTAL_STRIDE)
+            if num_conv_tok != x_v.shape[-2]:
+                raise RuntimeError(
+                    "conv_tower would produce {} tokens per camera but the ViTs produced "
+                    "{}. The tower downsamples by {}x and does not resize its input, so "
+                    "the dataset's output_image_hw must be {}x the ViT patch grid "
+                    "(16x16), i.e. (256, 256). Got rgb {}x{}."
+                    .format(num_conv_tok, x_v.shape[-2], CONV_TOTAL_STRIDE,
+                            CONV_TOTAL_STRIDE, img_h, img_w))
+            # The trainable branch reads the raw pixels, not the frozen features, and only
+            # the latest frame -- matching what `VLM` hands over in `vision_embeds`.
+            # Autocast for the same reason pre_attn/post_attn have it: proj_v runs outside
+            # those blocks, so without it the conv stack would run in fp32.
+            with torch.autocast(
+                x_v.device.type,
+                torch.bfloat16 if fp16 else torch.float32
+            ):
+                x_cnn = self.proj_v[2](self.conv_tower(vl_obs["rgb"][:, -1]))
+                x_v = self.proj_fuse(torch.cat([x_v, x_cnn.to(x_v.dtype)], dim=-1))
+            # Back to fp32, which is what the tower-less path hands to `x_v + pe2d`.
+            # Keeping the dtypes identical is what makes the [I | 0] warm start exact
+            # rather than merely close.
+            x_v = x_v.float()
         x_l: Tensor = self.proj_l[0](vl_feature["lang_embeds"][0])    # (B, Ncam, La, C)
         norm_xy_ds = vl_feature["norm_xy_ds"]  # (B, Ncam, Lv, 2)
         mask_l = vl_feature["lang_mask"]  # (B, La)
@@ -412,6 +549,7 @@ class ActionExpert(nn.Module):
         objective: str = DEFAULT_OBJECTIVE,
         flow_time_sampling: str = "uniform",
         flow_time_alpha: float = 1.5,
+        conv_tower: Optional[str] = None,
     ):
         super().__init__()
         if objective not in OBJECTIVES:
@@ -435,7 +573,8 @@ class ActionExpert(nn.Module):
                 .format(action_norm.action_dim, self.action_dim))
         self.action_norm = action_norm
 
-        self.context_encoder = ContextEncoder(hdim, num_heads, num_layers=num_context_layers)
+        self.context_encoder = ContextEncoder(hdim, num_heads, num_layers=num_context_layers,
+                                              conv_tower=conv_tower)
         self.dp_head = DiffusionHead(hdim, num_heads, self.action_space,
                                      num_layers=num_diffusion_layers,
                                      action_norm=action_norm)
@@ -744,6 +883,10 @@ class ActionExpert(nn.Module):
             # [0, diffusion_timesteps), see `head_time`
             pred = self.dp_head(self.head_time(t), noisy_actions, **fixed_inputs)
             target = future_action_cam - noise
+            # what `diffusion_diagnostics` buckets by: 0 = clean, 1 = pure noise. Flow's
+            # t runs the other way (t = 1 is data), hence the flip -- same convention as
+            # `head_time`, so the bins mean the same thing under both objectives.
+            noise_level = 1.0 - t
         else:
             # sample a random timestep
             timesteps = torch.randint(
@@ -761,6 +904,7 @@ class ActionExpert(nn.Module):
 
             pred = self.dp_head(timesteps, noisy_actions, **fixed_inputs)
             target = get_target(future_action_cam, noise, timesteps, self.noise_scheduler)
+            noise_level = timesteps.float() / self.noise_scheduler.config.num_train_timesteps
 
         # # drop too aggresive actions
         # debug_gt_ee_pose = future_actions.transpose(1, 2)[valid_ee_mask][..., :16].reshape(flat_batch_size, -1, 4, 4)
@@ -784,6 +928,11 @@ class ActionExpert(nn.Module):
         # fine, but it does mean the two objectives' loss values are NOT comparable --
         # judge a flow run by its rollout, not by putting its curve next to a DDIM one.
         total_loss, metrics = self.action_space.loss(pred, target)
+        # Logging-only. Keys carry a "diag/" prefix, which is how `train.py` tells them
+        # apart from the loss terms: the console line stays the loss terms only, while
+        # TensorBoard gets both.
+        metrics.update(diffusion_diagnostics(pred, target, noise_level,
+                                             actions=future_action_cam))
         return total_loss, metrics
 
 

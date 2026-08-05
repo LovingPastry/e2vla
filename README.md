@@ -188,7 +188,7 @@ CUDA_VISIBLE_DEVICES=x python train.py --config pretrain -s EXPERIMENT_NAME
 ```bash
 CUDA_VISIBLE_DEVICES=x python train.py --config pretrain_extra -s EXPERIMENT_NAME
 ```
-日志保存到 `./logs/E2VLA/EXPERIMENT_NAME`,checkpoint 保存到 `./checkpoints/E2VLA/EXPERIMENT_NAME`。
+日志保存到 `./logs/E2VLA/EXPERIMENT_NAME`(TensorBoard,写了什么见 §3.9),checkpoint 保存到 `./checkpoints/E2VLA/EXPERIMENT_NAME`。
 
 我们上传了两个 checkpoint,见 [这里](https://drive.google.com/drive/folders/1rMpj7ry4YObLciNdPjY9DiZ-JpT7uG_q?usp=sharing)。
 
@@ -503,6 +503,71 @@ CONFIGS["finetune_real_joint_vlmlora"] = TrainConfig(
 - **部署时不 merge**,与 ActionExpert 相反。主干是 bf16,而 `round_bf16(W + AB)` 无论 `AB` 多小都会在 `W` 上引入约 `3.3e-3` 的相对误差。实测(768 宽的 bf16 Linear):一个对输出影响为 `2.3e-3` 的 LoRA,merge 会再叠上 `2.7e-3` 的误差 —— 适配量整个埋进舍入噪声;再小十倍时只有 36% 的 `AB` 能从舍入里活下来。所以推理保留 `LoraLinear`,代价是每个注意力投影多一次 rank-r 矩阵乘(相对 ViT 前向可以忽略),换来评测与训练算的是同一个函数。
 - **主干里所有 `no_grad` 都变成了条件式的**(`models/layers/utils.py:maybe_no_grad`)。没开 LoRA 时行为逐位不变,走的还是原来的 `no_grad`;开了之后只有被适配的那个塔解除 `no_grad`。这一步不是可选的:原来那个无条件的 `no_grad` 会把 LoRA 因子静默地从计算图里摘掉 —— 参数照样在优化器里、照样进 checkpoint,只是永远不动,而且不报任何错。
 
+## 3.5b 可训练的卷积旁路(`conv_tower`,默认关闭)
+
+`vlm_lora_rank` 和它解决的是同一个问题 —— 预训练特征来自网络图片,真机的光照、遮挡视野的夹爪、没有纹理的桌面在那个分布之外 —— 但代价完全不同。`vlm_lora_rank` 要为两个 ViT 的每个相机、每个样本保留全部激活做反传;`conv_tower` 只是在旁边加一条 **2.9M 参数、完全可训练**的浅层 CNN,两个主干仍然一动不动地冻着。
+
+结构在 `models/conv_tower.py`:ResNet18 **只取到 `layer2`**(`layer3`/`layer4` 根本不构造),直接吃数据集出来的 RGB 原图,不做任何 resize。`256×256` 输入经 `conv1 → maxpool → layer1 → layer2`(共 /8)再过一个 stride-2 的 head conv,落到 `16×16 = 256` token —— 与两个 ViT 的 patch 数一致。留前两段而不是整个网络,是因为浅层带的是边缘、纹理、局部颜色统计,恰好是 patch-16 的 ViT 丢掉的、也恰好是几百条示教就能学出来的;深层语义那一端冻结的 ViT 本来就做得好。
+
+```bash
+# 两个现成预设,都需要 --pretrained_ckpt
+python train.py --config finetune_real_conv \
+  --pretrained_ckpt ./checkpoints/E2VLA/PRETRAIN/ckpt_xxxxxxx.pt -s FT_CONV
+python train.py --config finetune_real_conv_lora \
+  --pretrained_ckpt ./checkpoints/E2VLA/PRETRAIN/ckpt_xxxxxxx.pt -s FT_CONV_LORA
+```
+
+| 预设 | `lora_rank` | `conv_tower` | 说明 |
+| --- | ---: | --- | --- |
+| `finetune_real` | 16 | `none` | 基线 |
+| `finetune_real_conv` | 0 | `resnet18` | 主干全开 + 旁路 |
+| `finetune_real_conv_lora` | 16 | `resnet18` | LoRA 主干 + 全量训练旁路 |
+
+三个都用同一个预训练 checkpoint 跑,才是可比的对照。
+
+### 融合方式,以及为什么预训练权重仍然精确可用
+
+`ContextEncoder` 原来是 `proj_v[0](dinov2) + proj_v[1](siglip)`。加旁路后变成:
+
+```python
+x_sem = proj_v[0](dinov2) + proj_v[1](siglip)     # 一个字没改
+x_cnn = proj_v[2](conv_tower(rgb))                 # 新增,追加为 index 2
+x_v   = proj_fuse(cat([x_sem, x_cnn], dim=-1))     # 新增
+```
+
+两点是刻意的:
+
+- **dino+siglip 的相加保持原样**,新模态从旁边 concat 进来。那个相加关系正是预训练主干学到的东西。追加成 `proj_v[2]` 也意味着 `proj_v.0.*` / `proj_v.1.*` 的 key 一个都没变。
+- **`proj_fuse` 初始化成 `[I | 0]`**,所以 `x_v ≡ x_sem`,第 0 步与不带旁路的模型**逐位相同**(实测 `max|Δ| = 0`)。这与 `proj_pe` 的零初始化、LoRA 的 `B` 零初始化是同一个手法。concat 之后再融合严格比相加更有表达力 —— 相加只是 `[I | I]` 这一个特例。
+
+因此从官方 checkpoint 微调时**不需要** `--pretrained_strict False`。`load_actor_weights` 新增了 `allow_missing_prefixes`,`train.py` 按 `CONV_BRANCH_KEYS` 填进去:只有这三个新模块允许缺失,其它任何 missing / unexpected / 形状不符照样抛。日志会明确列出来:
+
+```
+[INFO] pretrained checkpoint: 146 tensors matched. 74 tensors belong to modules this run
+       adds and the checkpoint cannot contain; they keep their initialisation and are trained:
+           context_encoder.conv_tower.* (66 tensors)
+           context_encoder.proj_v.2.* (6 tensors)
+           context_encoder.proj_fuse.* (2 tensors)
+```
+
+### 学习率单开一组
+
+主干是热启动的(想小步走),旁路是 ImageNet 初始化后要适配新域的(想大步走),共用一个 `max_lr` 两头不讨好。`conv_tower_lr_scale` 给旁路单独一组 `lr = max_lr * scale`(两个预设都是 `2.0`,是起点不是调好的值)。scheduler 是 `LambdaLR`,按各组自己的 base_lr 等比缩放,所以这个比例在整个 warmup/constant 过程中保持不变。
+
+注意 `proj_fuse` **不在**这一组里 —— 它是 `[I | 0]` 起步的,用旁路那个更大的学习率会在头几步就把精确热启动撕掉,它属于主干的节奏。
+
+### 三个必须知道的行为
+
+- **和 LoRA 共存是成立的,而且是预期用法。** `setup_lora` 会把 `ContextEncoder` 里除因子和白名单外的一切冻结,所以 `CONV_BRANCH_KEYS` 被加进了 `LORA_KEEP_TRAINABLE`。不加的话旁路会**静默地冻在 ImageNet 初始权重上**,而所有日志仍然把它算作模型的一部分。新加的模块没有可供低秩分解的预训练基底,只能全量训。
+- **`conv_tower` 必须留在 `model_kwargs()` 里。** 旁路的张量是**进** checkpoint 的,而 `infer_utils/planner.py` 只能从 dump 出来的 config json 知道要不要重建它。漏了会在 `load_state_dict` 处报错 —— 报得很响,但要等到主干和仿真器都起来之后。
+- **没有新增 checkpoint 戳,这是刻意的。** 其它四个戳存在的理由是"张量名和形状完全相同、只有语义不同";旁路带来的是**新 key**,`CkptCompatReport` 会逐条列名、`planner.py` 的严格 `load_state_dict` 会直接拒绝,再加一个戳是冗余。
+
+### 代价
+
+参数 +2.9M(相对 102.3M 可训练参数约 +2.8%),但**真正的代价是步时和显存**:`layer1` 在 `64×64` 分辨率上跑。按 FLOPs 估算(未实测)前向加反传会让 step time 涨到 1.5~2 倍,激活显存同步上升 —— 第一次跑请自己记一下这两个数。跑不下就先砍 `bs`。
+
+另外一个已知且刻意不修的性质:本卷积栈的 token `p` 中心落在输入像素 `16p`,而 ViT 的 patch `p` 覆盖 `[16p, 16p+16)`、中心在 `16p+7.5` —— 半个格子的偏移,ResNet stem 换任何 padding 都消不掉。`proj_pe` 和后面的注意力足以吸收半个 patch 的平移,而且这条支路本来就是训出来的。
+
 ## 3.6 动作归一化(q01/q99)
 
 默认**关闭**,`action_norm_stats` 不设就是历史行为。开启后,模型动作空间的每个通道按其 1%/99% 分位数线性映射到 `[-1, 1]`。
@@ -677,7 +742,54 @@ python train.py --config finetune_libero_10_flow \
 
 ### 两种 objective 的 loss 数值不可比
 
-`action_space.loss` 的 30/10/10 权重在两种目标下性质不同:epsilon 目标的每一段都是同一个标准正态的切片,权重纯粹是 loss 整形;flow 的目标 `action - noise` 带着动作空间自己的量纲,同一组权重就顺带成了(粗糙的)量纲补偿。把两条 loss 曲线并排看没有意义,判断 flow 跑得好不好要看 rollout。
+`action_space.loss` 的 30/10/10 权重在两种目标下性质不同:epsilon 目标的每一段都是同一个标准正态的切片,权重纯粹是 loss 整形;flow 的目标 `action - noise` 带着动作空间自己的量纲,同一组权重就顺带成了(粗糙的)量纲补偿。把两条 loss 曲线并排看没有意义,判断 flow 跑得好不好要看 rollout —— 或者看 §3.9 的 `sample/*`,那组数是跨 objective 可比的。
+
+## 3.9 训练监控(TensorBoard)
+
+```bash
+tensorboard --logdir ./logs/E2VLA
+```
+
+命令行这边是一条 tqdm 进度条(整个 run 一条,按 `max_iterations` 计,不是每个 epoch 一条;`-c` 续训会从 checkpoint 的迭代数接着走),后缀实时显示各 loss 分项和 lr。进度条画在 **stderr**,循环里其它输出走 `tqdm.write` 到 **stdout**:NaN 跳过、`Save to …`、`sample/*`,以及每 `log_interval` 一行完整的 `[INFO] iter/max | 各项 loss`(和 TensorBoard 写点、平均值清零是同一个边界)。所以 `python train.py > train.log` 得到的是干净的低频日志,进度条留在终端上。
+
+
+
+写出的标签按前缀分组,除 `sample/`、`data/rgb`、直方图外都是默认开启、且开销可忽略的:
+
+| 分组 | 内容 | 它回答的问题 |
+| --- | --- | --- |
+| `train/` | `total_loss` 和各分项(`pos_loss` / `rot_loss` / `joint_loss` / `openness_loss`) | 原有行为,标签没变 |
+| `diag/` | `cos_sim`、`pred_std` / `target_std`、`loss_noise_b0..3`、`act_absmax` / `act_clip_frac` | loss 看着正常但模型其实坏了的那几种情况,见下 |
+| `optim/` | `lr`、`grad_norm`、`clip_frac`、`param_norm`、`update_norm`、`update_ratio`、`grad_scale` | 学习率选得对不对;梯度裁剪是不是一直在生效 |
+| `gnorm/` | 按模块分的梯度范数:`context_encoder` / `dp_head` / `vlm_lora` / `conv_tower` / `total` | "loss 不动了"到底是哪一半不动了 |
+| `perf/` | `it_per_sec`、`samples_per_sec`、`data_wait_ms`、`step_ms`、`gpu_mem_gb`、`nan_skip_frac` | 是不是在等 dataloader(那要调 `workers`,和模型无关) |
+| `progress/` | `epoch`、`samples_seen` | 迭代数之外的进度 |
+| `data/` | `valid_ee`,以及可选的输入图像与 prompt | 喂进去的到底是什么 |
+| `sample/` | `pos_err_m` / `rot_err_deg` / `grip_acc`(关节空间是 `joint_err_rad` 等) | **默认关闭**,见下 |
+| TEXT 页 | 解析后的完整 config、可训练参数表、这次运行的来源(预训练 ckpt / resume / 数据集) | 三个月后回来对比两次运行时唯一需要的东西 |
+
+三个可选开关(都在 `TrainConfig` 里,命令行可以直接覆盖):
+
+```bash
+# 每 500 步跑一次完整采样,按物理单位报告动作误差
+python train.py --config finetune_real -s EXP --log_sample_interval 500
+# 前期确认输入没问题:每 1000 步存一张各相机的输入图 + prompt
+python train.py --config finetune_real -s EXP --log_image_interval 1000
+# 逐张量的权重/梯度直方图,只在怀疑某层饱和或死掉时开
+python train.py --config finetune_real -s EXP --log_hist_interval 5000
+```
+
+### `sample/*`:唯一和 rollout 同量纲的训练期指标
+
+训练 loss 衡量的是**单步去噪**回归得准不准,它可以一直降,而积分出来的整条轨迹并没有变好;两种 objective 的 loss 更是彼此不可比(§3.8)。`log_sample_interval > 0` 时会在当前 batch 上跑完整的采样循环,把结果解码回世界坐标系,报告米 / 度 / 夹爪准确率 —— 和评测同量纲,而且跨 objective、跨 `action_norm` 配置都可比。代价是一次额外前向加 `inference_timesteps` 次 head 调用,所以按间隔跑,500~1000 基本不影响吞吐。
+
+两点提醒:它测的是训练 batch(本仓库没有验证集划分),所以读作"采样器能不能复现它训过的东西",泛化仍然要跑 `examples/libero/eval.py`;开了 EMA 时它测的是在线权重,不是部署用的 EMA 影子。
+
+### `diag/*`:loss 正常但模型不对的三种情况
+
+* **塌成均值。** head 如果无视时间条件,只学一个平均场,loss 照样降(平均场确实是个极小点),采样出来的动作则糊向均值。表现是 `diag/pred_std` 逐渐偏离 `diag/target_std`,以及尺度无关(因而不受 loss 权重影响)的 `diag/cos_sim` 卡在 0 附近不涨。
+* **路径的一端没训到。** `diag/loss_noise_b0..3` 把**未加权**的 L1 按输入被污染的程度分了四桶,b0 接近干净、b3 接近纯噪声。高噪声桶一直降不下来,意味着采样的每一步都在继承这个误差 —— `flow_time_sampling="beta"` 就是为这种情况准备的(§3.8)。
+* **归一化饱和。** `diag/act_clip_frac` 是目标落在 [-1, 1] 之外的比例。配了 `action_norm_stats` 时,那正好是落在 q01/q99 之外的动作:百分之几是正常的,比例很大说明统计文件来自别的数据集或别的 config(§3.6),而这件事没有任何别的地方会报出来。
 
 ## 4. 部署
 

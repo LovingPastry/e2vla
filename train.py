@@ -1,15 +1,16 @@
 import os
 import sys
+import time
 import tyro
 import torch
 import envars
 import argparse
 import torch.amp
+from tqdm import tqdm
 from typing import Dict
 from datetime import datetime
 from torch import Tensor, optim
 from diffusers.optimization import get_scheduler
-from torch.utils.tensorboard import SummaryWriter
 
 from models import vla
 from models.action_norm import build_action_normalizer
@@ -21,7 +22,21 @@ from train_utils.ckpt import (load_actor_weights, check_objective,
                               load_vlm_lora_weights)
 from train_utils.lora import setup_lora, setup_vlm_lora, lora_state_dict
 from train_utils.ema_impl import ExponentialMovingAverage
+from train_utils.tb_logger import (TBLogger, grad_norms, param_norm,
+                                   adamw_update_norm, trainable_param_table)
+from models.conv_tower import CONV_BRANCH_KEYS
 from data_utils.dataset_base import get_dataloader, generate_sample_weights
+
+
+def conv_branch_prefixes(cfg: TrainConfig):
+    """state_dict prefixes (relative to `actor`) of the modules the conv branch adds.
+
+    Empty when no branch is configured, so the pretrained load stays byte-for-byte the
+    strict one it always was.
+    """
+    if cfg.conv_tower == "none":
+        return ()
+    return tuple("context_encoder.{}.".format(k) for k in CONV_BRANCH_KEYS)
 
 
 def init_train_config():
@@ -64,6 +79,11 @@ class AverageMeter(object):
             return 0
         else:
             return self.sum / self.count
+
+
+def _every(iters: int, interval: int) -> bool:
+    """`interval <= 0` means the feature is off, not "every iteration"."""
+    return interval > 0 and (iters % interval == 0)
 
 
 def count_trainable(m: torch.nn.Module):
@@ -158,8 +178,7 @@ class Trainer(object):
         )
 
         self.save = False
-        self.writer = None
-        
+
         # ckpt loading priority: conti > pretrained_ckpt
         #
         # These two are NOT the same operation:
@@ -251,9 +270,13 @@ class Trainer(object):
             check_action_norm(ckpt, self.action_norm, what="pretrained checkpoint",
                               strict=False)
             # Load into the PLAIN model first: released checkpoints have no LoRA keys.
+            # The conv branch is new in this run, so a released checkpoint cannot carry
+            # it. Naming those keys keeps `pretrained_strict` True -- everything else
+            # still has to line up exactly.
             load_actor_weights(self.model.actor, ckpt["weights"],
                                strict=self.cfg.pretrained_strict,
-                               what="pretrained checkpoint")
+                               what="pretrained checkpoint",
+                               allow_missing_prefixes=conv_branch_prefixes(self.cfg))
             if cross_objective:
                 # After the load, not before: `load_actor_weights` writes act_head like
                 # any other tensor, so this has to undo it rather than pre-empt it.
@@ -305,11 +328,29 @@ class Trainer(object):
         if save:
             self.save = save
 
-        decay, no_decay = self.model.parameter_groups()
-        self.optimizer = optim.AdamW([
+        decay, no_decay, conv_decay, conv_no_decay = self.model.parameter_groups()
+        groups = [
             {"params": decay, "lr": self.cfg.max_lr, "weight_decay": self.cfg.wd},
-            {"params": no_decay, "lr": self.cfg.max_lr, "weight_decay": 0.0}
-        ])
+            {"params": no_decay, "lr": self.cfg.max_lr, "weight_decay": 0.0},
+        ]
+        # Appended only when non-empty, and that is not a tidiness choice: `-c` resume
+        # calls `optimizer.load_state_dict`, which requires the same NUMBER of param
+        # groups it was saved with. Two unconditional empty groups would make every
+        # checkpoint written before the conv branch existed unresumable.
+        #
+        # `constant_with_warmup` is a LambdaLR, so it scales each group by a factor of
+        # that group's own base lr -- the ratio below holds for the whole schedule.
+        if conv_decay or conv_no_decay:
+            conv_lr = self.cfg.max_lr * self.cfg.conv_tower_lr_scale
+            groups += [
+                {"params": conv_decay, "lr": conv_lr, "weight_decay": self.cfg.wd},
+                {"params": conv_no_decay, "lr": conv_lr, "weight_decay": 0.0},
+            ]
+            n_conv = sum(p.numel() for p in conv_decay + conv_no_decay)
+            print("[INFO] conv branch: {:.3f}M parameters in their own param groups at "
+                  "lr {:.2e} ({}x max_lr)"
+                  .format(n_conv / 1e6, conv_lr, self.cfg.conv_tower_lr_scale))
+        self.optimizer = optim.AdamW(groups)
         params = [p for p in self.model.parameters() if p.requires_grad]
         self.ema = ExponentialMovingAverage(params, decay=self.cfg.ema_decay)
 
@@ -364,8 +405,32 @@ class Trainer(object):
         )
         if conti:
             self.scheduler.load_state_dict(ckpt["scheduler"])
-        
+
         self._is_first_save = True
+
+        # Opened here rather than lazily at the first log: the run's own description --
+        # the resolved config, what ended up trainable, where the weights came from -- is
+        # worth having in the event file even for a run that dies in its first hundred
+        # iterations, which is exactly when you go looking for it.
+        self.logger = TBLogger(os.path.join(self.LOG_DIR, self.save) if self.save else None)
+        self.logger.text("config", "```json\n{}\n```".format(self.cfg.to_json()),
+                         self.current_iters)
+        self.logger.text("params", trainable_param_table(self.model), self.current_iters)
+        self.logger.text("run", "\n".join([
+            "* launched: `{}`".format(self.launch_time_str),
+            "* action space: `{}` (layout `{}`)".format(self.action_space.name,
+                                                        self.action_space.layout),
+            "* objective: `{}`".format(self.cfg.objective),
+            "* action_norm: `{}`".format(
+                "none" if self.action_norm is None else self.cfg.action_norm_stats),
+            "* resumed from: `{}`".format(conti or "-"),
+            "* pretrained_ckpt: `{}`".format(self.cfg.pretrained_ckpt or "-"),
+            "* datasets: {}".format(", ".join("`{}`".format(D.__name__)
+                                              for D in self.cfg.dataset_classes)),
+        ]), self.current_iters)
+
+        # Wall-clock anchor for perf/it_per_sec; reset at every log interval.
+        self._interval_start = time.perf_counter()
 
     @classmethod
     def preprocess_data(
@@ -397,16 +462,138 @@ class Trainer(object):
 
         return total_loss, metrics
 
-    def log_metrics(self, metrics: dict):
-        if self.save:
-            if self.writer is None:
-                log_dir = os.path.join(self.LOG_DIR, self.save)
-                os.makedirs(log_dir, exist_ok=True)
-                self.writer = SummaryWriter(log_dir)
-            self.writer.add_scalar(
-                "lr", self.scheduler.get_last_lr()[0], self.current_iters)
-            for key, val in metrics.items():
-                self.writer.add_scalar(key, val, self.current_iters)
+    def _clip_grad(self):
+        """Clip the gradient if configured, returning its PRE-clip norm (None if not).
+
+        `clip_grad_norm_` computes that norm on its way to the scale factor, so logging it
+        costs nothing extra. With clipping disabled nothing is computed here -- `gnorm/*`
+        in `log_metrics` reports the same quantity at the log interval, and computing it
+        every iteration just to average it is not worth a second pass over 102M gradients.
+        """
+        if self.cfg.grad_clip <= 0:
+            return None
+        total = torch.nn.utils.clip_grad_norm_(self.model.parameters(),
+                                               self.cfg.grad_clip)
+        return float(total)
+
+    @torch.no_grad()
+    def sampled_action_metrics(self, data: Dict[str, Tensor]) -> Dict[str, float]:
+        """Run the full sampler on `data` and report the action error in physical units.
+
+        The training loss scores ONE denoising step against its target; this scores the
+        trajectory that comes out of the whole loop, in metres and degrees. The two come
+        apart in both directions -- a head can keep improving its epsilon regression while
+        the integrated chunk drifts, and the flow/DDIM losses are not even comparable to
+        each other while these numbers are -- so this is the closest thing to a rollout
+        that does not need a simulator.
+
+        On the training batch, since this repo has no validation split. It answers "can
+        the sampler reproduce what it was trained on", which is the failure that comes
+        first; generalization still needs `examples/libero/eval.py`.
+
+        Measured on the live weights, not the EMA shadow. With `ema_enabled` the deployed
+        policy is the shadow, so read this as a trend rather than as a prediction of what
+        `remote_service --ema` will do.
+        """
+        was_training = self.model.training
+        self.model.eval()
+        pred = self.model(
+            rgbs=data["rgbs"],
+            obs_norm_xys=data["obs_norm_xys"],
+            obs_extrinsics=data["obs_extrinsics"],
+            prompt_text=data["prompt_text"],
+
+            ee_poses=data["ee_poses"],
+            history_actions=data["history_actions"],
+            future_actions=data["future_actions"],
+            valid_ee_mask=data["valid_ee_mask"],
+            inference=True,
+            fp16=self.scaler.is_enabled(),
+        )  # (B, Ta, Nee, state_dim)
+        if was_training:
+            self.model.train()
+
+        # Same flattening the model does internally: (B, Ta, Nee, D) -> (B', Ta, D) over
+        # the valid end-effectors only. Invalid slots hold the action space's placeholder
+        # fill, which would otherwise contribute a meaningless error.
+        mask = data["valid_ee_mask"]
+        pred_states = pred.transpose(1, 2)[mask]
+        gt_states = data["future_actions"].transpose(1, 2)[mask]
+        errors = self.action_space.state_error(pred_states.float(), gt_states.float())
+        return {"sample/" + k: v for k, v in errors.items()}
+
+    def log_metrics(self, averages: Dict[str, "AverageMeter"], data: Dict[str, Tensor]):
+        """Everything that goes out once per `log_interval`.
+
+        `averages` holds whatever the loop accumulated, keyed two ways: a bare name is a
+        loss term and lands under `train/`, a name that already contains a "/" carries its
+        own TensorBoard group (`diag/`, `optim/`, `perf/`) and is passed through. Point-in-
+        time quantities -- norms, memory, the LR -- are read here rather than averaged,
+        because their value at the moment of logging is the meaningful one.
+        """
+        if not self.logger.enabled:
+            return
+
+        step = self.current_iters
+        scalars = {(k if "/" in k else "train/" + k): v.avg()
+                   for k, v in averages.items()}
+
+        # LR per optimizer group: with a conv tower the groups no longer share one value,
+        # and "the LR" silently becoming group 0's is how a scaled branch goes unnoticed.
+        lrs = self.scheduler.get_last_lr()
+        scalars["optim/lr"] = lrs[0]
+        for i, lr in enumerate(lrs[1:], start=1):
+            if lr != lrs[0]:
+                scalars["optim/lr_g{}".format(i)] = lr
+
+        pnorm = param_norm(self.model)
+        unorm = adamw_update_norm(self.optimizer)
+        scalars["optim/param_norm"] = pnorm
+        scalars["optim/update_norm"] = unorm
+        if pnorm > 0:
+            # The number to tune `max_lr` against: ~1e-3 is the healthy band, and it is
+            # readable long before the loss says anything.
+            scalars["optim/update_ratio"] = unorm / pnorm
+        if self.scaler.is_enabled():
+            scalars["optim/grad_scale"] = self.scaler.get_scale()
+
+        # Gradients survive until the next zero_grad(), so they are still the ones that
+        # produced the step logged above.
+        scalars.update(grad_norms(self.model))
+
+        elapsed = time.perf_counter() - self._interval_start
+        if elapsed > 0:
+            iters = self.cfg.log_interval
+            scalars["perf/it_per_sec"] = iters / elapsed
+            scalars["perf/samples_per_sec"] = iters * self.cfg.bs / elapsed
+        if torch.cuda.is_available():
+            scalars["perf/gpu_mem_gb"] = torch.cuda.max_memory_allocated() / (1 << 30)
+            torch.cuda.reset_peak_memory_stats()
+
+        scalars["progress/epoch"] = self.last_ep + 1
+        scalars["progress/samples_seen"] = self.current_iters * self.cfg.bs
+        scalars["data/valid_ee"] = float(data["valid_ee_mask"].sum(-1).float().mean())
+
+        self.logger.scalars(scalars, step)
+        self._interval_start = time.perf_counter()
+
+    def log_inputs(self, data: Dict[str, Tensor]):
+        """The batch's images and prompt, as the model sees them.
+
+        Deliberately taken from `data` *after* `preprocess_data`, i.e. the exact tensor
+        that entered the model: this is the check that catches a missing /255, a BGR
+        dataset, and -- most importantly -- cameras in the wrong order, since camera 0
+        defines the frame every action is expressed in. Camera 0 is the leftmost tile and
+        must be the third-person view.
+        """
+        if not self.logger.enabled:
+            return
+        rgbs = data["rgbs"]              # (B, To, ncam, 3, H, W)
+        images = rgbs[0, -1]             # latest frame of the first sample, (ncam, 3, H, W)
+        self.logger.image_grid("data/rgb_cam0..N", images, step=self.current_iters)
+        prompt = data.get("prompt_text", None)
+        if isinstance(prompt, (list, tuple)) and prompt:
+            self.logger.text("data/prompt", str(prompt[0]), self.current_iters)
 
     def save_model(self, fname: str, best_score: float, latest_score: float):
         if self.save and self._is_first_save:
@@ -460,49 +647,100 @@ class Trainer(object):
             if self.cfg.ema_enabled:
                 to_save["ema"] = self.ema.state_dict()
             torch.save(to_save, os.path.join(ckpt_dir, fname))
-            print("[INFO] Save to {}".format(os.path.join(ckpt_dir, fname)))
+            # tqdm.write, not print: this fires from inside the training loop, and a bare
+            # print would be overwritten by the next redraw of the progress bar.
+            tqdm.write("[INFO] Save to {}".format(os.path.join(ckpt_dir, fname)))
 
     def fitting(self):
         averages = {}
         self.model.train()
+
+        def record(key, value):
+            if key not in averages:
+                averages[key] = AverageMeter()
+            averages[key].append(value)
+
+        # One bar over the whole run rather than one per epoch: `max_iterations` is what
+        # the loop actually terminates on, and an epoch bar would restart its ETA every
+        # pass over the loader. `initial` picks up where a resumed checkpoint left off.
+        # The bar lives on stderr (tqdm's default) while every message below goes through
+        # `tqdm.write` to stdout, so `python train.py > train.log` keeps a clean log of the
+        # [INFO] lines and leaves the redrawing bar on the terminal.
+        pbar = tqdm(initial=self.current_iters, total=self.cfg.max_iterations,
+                    desc="train", unit="it", dynamic_ncols=True, smoothing=0.1)
+
         while self.current_iters <= self.cfg.max_iterations:
+            data_start = time.perf_counter()
             for data in self.train_loader:
+                # Time spent blocked on the loader, not on the GPU. When this is a large
+                # fraction of the step, the fix is `workers` / `sample_multiplex` / the
+                # HDF5 layout -- nothing about the model -- and no other curve says so.
+                data_wait = time.perf_counter() - data_start
+                step_start = time.perf_counter()
+
                 self.current_iters += 1
                 self.optimizer.zero_grad()
                 loss, metrics = self.compute_metrics(data)
 
                 if torch.isnan(loss) or torch.isinf(loss):
-                    print("[INFO] NaN or Inf occured in loss, skip")
+                    tqdm.write("[INFO] NaN or Inf occured in loss, skip")
                     self.current_iters -= 1
+                    # Counted rather than only printed: a handful of skips is normal, a
+                    # rising rate is a run that is quietly training on fewer samples than
+                    # its iteration counter claims.
+                    record("perf/nan_skip_frac", 1.0)
+                    data_start = time.perf_counter()
                     continue
+                record("perf/nan_skip_frac", 0.0)
+
+                # A scaled gradient's norm is off by the scaler's current factor, which
+                # itself moves around -- so unscale before anything reads it. Free when
+                # clipping already does it; on a log iteration without clipping do it
+                # anyway, since `gnorm/*` is about to walk the gradients.
+                is_log_iter = (self.current_iters % self.cfg.log_interval == 0)
 
                 if self.scaler.is_enabled():
                     self.scaler.scale(loss).backward()
-                    if self.cfg.grad_clip > 0:
+                    if self.cfg.grad_clip > 0 or is_log_iter:
                         self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
+                    grad_norm = self._clip_grad()
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
                     loss.backward()
-                    if self.cfg.grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
+                    grad_norm = self._clip_grad()
                     self.optimizer.step()
                 self.scheduler.step()
+
+                if grad_norm is not None:
+                    record("optim/grad_norm", grad_norm)
+                    if self.cfg.grad_clip > 0:
+                        # How often clipping actually binds. Permanently at 1.0 means the
+                        # threshold, not the LR, is setting the step size.
+                        record("optim/clip_frac",
+                               float(grad_norm > self.cfg.grad_clip))
 
                 if self.current_iters >= self.cfg.ema_start and self.cfg.ema_enabled:
                     self.ema.update()
 
+                record("perf/data_wait_ms", data_wait * 1e3)
+                record("perf/step_ms", (time.perf_counter() - step_start) * 1e3)
+
                 print_strings = []
                 for key, val in metrics.items():
-                    if key not in averages:
-                        averages[key] = AverageMeter()
-                    averages[key].append(val)
-                    print_strings.append("{} = {:.3e}".format(key, averages[key].avg()))
+                    record(key, val)
+                    # The `diag/*` diagnostics go to TensorBoard only; putting a dozen
+                    # extra numbers on the bar would push the losses off the line.
+                    if "/" not in key:
+                        print_strings.append("{} = {:.3e}".format(key, averages[key].avg()))
+                print_strings.append("lr = {:.3e}".format(self.scheduler.get_last_lr()[0]))
 
-                print("[INFO] {}/{} | {} | lr = {:.3e}".format(
-                    self.current_iters, self.cfg.max_iterations, " | ".join(print_strings),
-                    self.scheduler.get_last_lr()[0]))
+                # Set the postfix before advancing, so `update()`'s own redraw already
+                # carries this iteration's numbers. Stepping the bar to `current_iters`
+                # instead of by 1 keeps it honest across the NaN skip above, which rolls
+                # the counter back.
+                pbar.set_postfix_str(" | ".join(print_strings), refresh=False)
+                pbar.update(self.current_iters - pbar.n)
 
                 ### save ckpt and log
                 if self.current_iters % self.cfg.save_latest_interval == 0:
@@ -526,19 +764,50 @@ class Trainer(object):
                 if (self.current_iters % self.cfg.save_interval == 0) and (self.cfg.save_interval > 0):
                     avg_metrics = {k: v.avg() for k, v in averages.items()}
                     latest_score = avg_metrics["total_loss"]
-                    self.save_model("ckpt_{:0>7d}.pt".format(self.current_iters), 
+                    self.save_model("ckpt_{:0>7d}.pt".format(self.current_iters),
                                     self.best_score, latest_score)
-                
-                if self.current_iters % self.cfg.log_interval == 0:
-                    avg_metrics = {"train/"+k: v.avg() for k, v in averages.items()}
-                    self.log_metrics(avg_metrics)
+
+                # Before log_metrics, so the sampled errors land on the same step as the
+                # losses that produced them. Runs the sampler, hence its own interval --
+                # and hence `logger.enabled`, so a run without -s does not pay for a
+                # measurement with nowhere to go.
+                if (self.logger.enabled
+                        and _every(self.current_iters, self.cfg.log_sample_interval)):
+                    sampled = self.sampled_action_metrics(data)
+                    self.logger.scalars(sampled, self.current_iters)
+                    tqdm.write("[INFO] sampled action error | {}".format(" | ".join(
+                        "{} = {:.4f}".format(k.split("/")[-1], v)
+                        for k, v in sampled.items())))
+
+                if _every(self.current_iters, self.cfg.log_image_interval):
+                    self.log_inputs(data)
+
+                if _every(self.current_iters, self.cfg.log_hist_interval):
+                    # Before zero_grad() on the next iteration, so the gradients logged
+                    # are the ones that produced the latest step.
+                    self.logger.histograms(self.model, self.current_iters)
+
+                if is_log_iter:
+                    # The bar redraws in place and leaves no history, so keep the old
+                    # per-iteration line -- once per `log_interval`, on the same interval
+                    # boundary the averages are reset at, so what is written is exactly
+                    # the window that just went to TensorBoard.
+                    tqdm.write("[INFO] {}/{} | {}".format(
+                        self.current_iters, self.cfg.max_iterations,
+                        " | ".join(print_strings)))
+                    self.log_metrics(averages, data)
                     for key in averages.keys():
                         averages[key].reset()
-                
+
                 if self.current_iters > self.cfg.max_iterations:
                     break
-            
+
+                data_start = time.perf_counter()
+
             self.last_ep += 1
+
+        pbar.close()
+        self.logger.close()
 
 
 if __name__ == "__main__":

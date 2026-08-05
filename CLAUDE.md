@@ -38,6 +38,26 @@ Logs → `./logs/E2VLA/EXP` (TensorBoard), checkpoints → `./checkpoints/E2VLA/
 (`ckpt_latest.pt`, `ckpt_best.pt`, `ckpt_{iter:07d}.pt`, plus a `{launchtime}.json` config dump
 that `infer_utils/planner.py` reads back at inference).
 
+What gets logged is documented in README §3.9; `train_utils/tb_logger.py` holds everything
+that has to walk the parameter tree. Tags are grouped by prefix — `train/` losses, `diag/`
+model diagnostics, `optim/` + `gnorm/` optimisation health, `perf/` throughput, `sample/`
+open-loop action error in metres/degrees. Three knobs are off by default because they cost
+something: `log_sample_interval` (runs the full sampler), `log_image_interval`,
+`log_hist_interval`. **`sample/*` is the only training-time number comparable across
+objectives** — DDIM and flow losses are not (see below).
+
+A metric key containing "/" is TensorBoard-only; the console shows the bare-named loss
+terms. That is how `ActionExpert.forward` returns `diag/*` alongside the loss dict
+without flooding stdout.
+
+The console is a single tqdm bar over `max_iterations` (not per epoch), carrying those
+loss terms plus the LR in its postfix. The bar redraws in place on **stderr**; everything
+else in the loop goes through `tqdm.write` to **stdout** — NaN skips, `Save to …`,
+`sample/*`, and one full `[INFO] iter/max | losses` line per `log_interval`, on the same
+boundary the averages reset at. So `python train.py > train.log` keeps a clean, low-rate
+log and leaves the bar on the terminal. Any new print inside `fitting()` must be
+`tqdm.write`, or the bar's next redraw eats it.
+
 ### Data conversion — separate conda envs
 
 Each converter needs its own env because the source SDKs conflict; all write HDF5 into
@@ -99,6 +119,10 @@ latest frame is used (`[:, -1]`) even though tensors carry a history axis.
   cross-attn to language, with **PRoPE** (multiplicative camera-pose PE) → QFormer compresses to
   64 queries → `post_attn`. Camera poses are rebased onto camera 0 at the latest timestep so the
   world origin never leaks in; `main_cam_embed` tags camera 0's tokens.
+  Optionally a *third*, **trainable** vision stream (`TrainConfig.conv_tower`, off by default):
+  `models/conv_tower.py` runs ResNet18 truncated after `layer2` over the raw RGB and
+  `proj_fuse` concatenates it with the ViT sum. See "Things that fail silently" below —
+  `proj_fuse` is `[I | 0]`-initialised, so turning it on does not perturb a pretrained trunk.
 - `DiffusionHead`: DDIM epsilon prediction (`diffusion_timesteps=100`, 20 inference steps). Two
   distinct "times" — the denoising step (adaLN/FiLM condition) and the position inside the chunk
   (additive sinusoidal). History and the noisy chunk are concatenated into one sequence; only the
@@ -171,9 +195,33 @@ work around them.
   Action-expert LoRA is merged at deploy (zero overhead); VLM LoRA is deliberately **not** merged —
   bf16 rounding would swallow the adaptation.
 - **Two `lora` knobs, different scopes**: `lora_rank` adapts `ContextEncoder` attention projections
-  (+ LayerNorm affines, biases, `qformer.queries`, `main_cam_embed`); `vlm_lora_rank` adapts the
-  frozen ViTs themselves and is the most expensive switch in the repo — configure it from a preset
-  in `configs.py`, halve `bs`, and expect any frozen-feature cache to become invalid.
+  (+ LayerNorm affines, biases, `qformer.queries`, `main_cam_embed`, and the conv branch);
+  `vlm_lora_rank` adapts the frozen ViTs themselves and is the most expensive switch in the repo —
+  configure it from a preset in `configs.py`, halve `bs`, and expect any frozen-feature cache to
+  become invalid.
+- **`conv_tower` needs no checkpoint stamp, and that is deliberate.** The other four stamps exist
+  because the offending checkpoint has *identical* tensor names and shapes; the conv branch instead
+  adds new keys, which `CkptCompatReport` names one by one and `planner.py`'s strict
+  `load_state_dict` refuses. Three consequences worth knowing:
+  - It has its own escape hatch, **not** `pretrained_strict=False`. `load_actor_weights` takes
+    `allow_missing_prefixes`, which `train.py` fills from `CONV_BRANCH_KEYS` — so the branch may be
+    absent from a released checkpoint while every *other* mismatch still raises. Reaching for
+    `--pretrained_strict False` here would wave all of them through at once.
+  - `conv_tower` must stay in `TrainConfig.model_kwargs()`. It is the only route by which
+    `infer_utils/planner.py` learns to rebuild the branch; the branch's tensors *are* in the
+    checkpoint, so forgetting it fails at load — loudly, but only after the simulator is up.
+  - Under `lora_rank > 0` the branch would otherwise be frozen at its ImageNet init by
+    `setup_lora`'s blanket freeze, so `CONV_BRANCH_KEYS` is in `LORA_KEEP_TRAINABLE`. A newly
+    added module has no pretrained base for a low-rank update to decompose around.
+  - `parameter_groups()`'s by-module-type norm detection is scoped to `conv_tower` on purpose,
+    even though the trunk has the same problem (`simple_mlp`'s LayerNorms are named
+    `proj_v.0.1.weight` — no "norm" substring — so they get weight decay today). Widening it
+    moves 10 existing tensors between groups, and `optimizer.load_state_dict` compares group
+    *sizes*: every pre-existing checkpoint would stop resuming, and the tower-less baseline
+    would silently stop being the same run. Fix it separately, with a migration.
+  `proj_fuse` is `[I | 0]` at init, which makes step 0 bit-identical to the tower-less model —
+  verify that before trusting a run, because it is what "the pretrained trunk still transfers"
+  actually rests on.
 - **Action stats do not transfer.** They are computed over the *model's* action space, so they
   depend on the config (action space, cameras, sampling gaps, horizon), not on the data on disk.
   Recompute per fine-tuning set. Clipping deliberately skips the 6D rotation channels
