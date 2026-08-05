@@ -575,3 +575,51 @@ CONFIGS["finetune_real_conv_flow"] = _flow_variant(
     ema_start=int(2e3),
     max_iterations=int(60e3),
 )
+
+# The joint-space counterpart: absolute joint angles instead of camera-relative SE(3),
+# flow instead of DDIM, plus the trainable conv branch. Everything dense (lora_rank=0).
+#
+#   CUDA_VISIBLE_DEVICES=0 python train.py --config finetune_real_joint_conv_flow \
+#     --pretrained_ckpt ./checkpoints/E2VLA/pretrain/0927_e2vla_base_pretrain/ckpt_0600000.pt \
+#     -s EXP
+#
+# The three `pretrained_ignore_*` / `pretrained_strict` values are baked in rather than
+# left on the command line, because this preset only makes sense warm-started and all
+# three are then mandatory -- `train.py` raises if you set ignore_action_layout while
+# pretrained_strict is still True. Measured against the released (ee_cam, DDIM) pretrain
+# checkpoint, 101.726M of 104.692M (97.2%) transfers; what does not is
+#   - 4 shape mismatches, 0.018M: hist_enc.0 / traj_enc.0 / act_head.3 (weight+bias) are
+#     bound to the action encoding, which is 8-dim here and 10-dim there
+#   - 6 unexpected keys: `dp_head.abs_pos_enc`, which joint space does not build at all
+#     (recovering ee position from joint angles needs forward kinematics)
+#   - 74 missing keys, 2.951M: the conv branch, new in this run
+#
+# Note what `pretrained_strict=False` costs here, since it is the thing this repo
+# otherwise avoids: `load_actor_weights`'s `allow_missing_prefixes` path requires a clean
+# report apart from the named prefixes, and crossing action layouts is not clean. So the
+# conv branch's missing keys are waved through together with the layout mismatches instead
+# of being named separately. That is unavoidable on this path -- read the per-tensor report
+# it prints and check the mismatches are exactly the four above.
+#
+# WARNING: joint checkpoints are training-only. `infer_utils/planner.py` decodes 17-dim
+# SE(3) unconditionally, so this builds fine in `remote_service` and then crashes at the
+# `reshape(..., 4, 4)`. See CLAUDE.md.
+CONFIGS["finetune_real_joint_conv_flow"] = _flow_variant(
+    CONFIGS["finetune_real_joint"],
+    conv_tower="resnet18",
+    # Back to 2.0, unlike finetune_real_conv_flow above: there the trunk was random too, so
+    # there was nothing to run the branch faster *than*. Here the trunk is warm-started and
+    # wants small steps while the ImageNet-initialised branch wants larger ones.
+    conv_tower_lr_scale=2.0,
+    # Mandatory for this path; see the block comment.
+    pretrained_strict=False,
+    pretrained_ignore_action_layout=True,
+    pretrained_ignore_objective=True,
+    # finetune_real_joint's 1e-4 / 2e3 / 60e3 are sized for training from scratch, which its
+    # own comment says to halve when starting from a pretrained trunk. These are the
+    # warm-start numbers; raise max_iterations again if the loss is still moving.
+    max_lr=5e-5,
+    num_warmup=int(1e3),
+    ema_start=int(1e3),
+    max_iterations=int(30e3),
+)
