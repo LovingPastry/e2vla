@@ -19,7 +19,7 @@ from configs import CONFIGS, TrainConfig
 from models.action_expert import DEFAULT_OBJECTIVE
 from train_utils.ckpt import (load_actor_weights, check_objective,
                               check_action_norm, check_action_layout, check_vlm_lora,
-                              load_vlm_lora_weights)
+                              check_context_encoder, load_vlm_lora_weights)
 from train_utils.lora import setup_lora, setup_vlm_lora, lora_state_dict
 from train_utils.ema_impl import ExponentialMovingAverage
 from train_utils.tb_logger import (TBLogger, grad_norms, param_norm,
@@ -163,6 +163,7 @@ class Trainer(object):
                   .format(self.cfg.action_norm_stats, self.action_norm))
 
         print("[INFO] Generative objective: {}".format(self.cfg.objective))
+        print("[INFO] Context encoder: {}".format(self.cfg.context_encoder))
         self.model: vla.VLA = getattr(vla, "vla_" + self.cfg.model.strip())(
             action_norm=self.action_norm,
             action_space=self.action_space,
@@ -193,6 +194,8 @@ class Trainer(object):
                               map_location=self.model_device,
                               weights_only=False)
             check_objective(ckpt, self.cfg.objective, what="resume checkpoint")
+            check_context_encoder(ckpt, self.cfg.context_encoder,
+                                  what="resume checkpoint")
             check_action_layout(ckpt, self.action_space.layout,
                                 what="resume checkpoint")
             # A resume must continue the same optimisation problem, action space
@@ -244,6 +247,12 @@ class Trainer(object):
                           .format(stored, self.cfg.objective))
             else:
                 check_objective(ckpt, self.cfg.objective, what="pretrained checkpoint")
+            # No ignore-flag for this one, deliberately. The other stamps guard against
+            # loads that would otherwise succeed silently; this one guards a load that is
+            # mostly meaningless -- the four encoders share only the projection stem, so
+            # "transfer the trunk" has nothing to transfer.
+            check_context_encoder(ckpt, self.cfg.context_encoder,
+                                  what="pretrained checkpoint")
             if self.cfg.pretrained_ignore_action_layout:
                 stored = ckpt.get("action_layout", "cam_rel_t3r6_openness")
                 if stored != self.action_space.layout:
@@ -421,6 +430,9 @@ class Trainer(object):
             "* action space: `{}` (layout `{}`)".format(self.action_space.name,
                                                         self.action_space.layout),
             "* objective: `{}`".format(self.cfg.objective),
+            "* context encoder: `{}` (language: {}, camera params: {})".format(
+                self.cfg.context_encoder, self.model.uses_language,
+                self.model.uses_camera_params),
             "* action_norm: `{}`".format(
                 "none" if self.action_norm is None else self.cfg.action_norm_stats),
             "* resumed from: `{}`".format(conti or "-"),
@@ -591,7 +603,11 @@ class Trainer(object):
         rgbs = data["rgbs"]              # (B, To, ncam, 3, H, W)
         images = rgbs[0, -1]             # latest frame of the first sample, (ncam, 3, H, W)
         self.logger.image_grid("data/rgb_cam0..N", images, step=self.current_iters)
-        prompt = data.get("prompt_text", None)
+        # Only when the model actually reads it. The dataset still carries a prompt under
+        # a vision-action encoder, and logging it there would put a string in TensorBoard
+        # that has no effect on anything -- the exact kind of thing that gets read as
+        # evidence the instruction was used.
+        prompt = data.get("prompt_text", None) if self.model.uses_language else None
         if isinstance(prompt, (list, tuple)) and prompt:
             self.logger.text("data/prompt", str(prompt[0]), self.current_iters)
 
@@ -624,6 +640,11 @@ class Trainer(object):
                 # so it would load here without a single missing key. The released
                 # pretrain checkpoints predate this stamp; ours all carry it.
                 "objective": self.cfg.objective,
+                # Which network these tensors belong to, and with it which modalities the
+                # policy reads. Mostly redundant with the state_dict layout -- the four
+                # encoders have different module trees -- but `pretrained_strict=False`
+                # exists and would wave the difference through. See check_context_encoder.
+                "context_encoder": self.cfg.context_encoder,
                 # same reasoning as `objective`: two action spaces with the same
                 # channel count produce identical state_dict layouts
                 "action_layout": self.action_space.layout,

@@ -13,7 +13,8 @@ from .ensemble import TrajEnsembler
 from data_utils.dataset_base import DataSampler, DataConfig, gen_norm_xy_map, rbd
 from train_utils.lora import setup_lora, setup_vlm_lora, merge_lora_linear
 from train_utils.ckpt import (check_objective, check_action_layout,
-                             load_vlm_lora_weights, read_vlm_lora_spec)
+                             check_context_encoder, load_vlm_lora_weights,
+                             read_vlm_lora_spec)
 from models.action_norm import build_action_normalizer
 from models.action_space import build_action_space
 from train_utils.ema_impl import ExponentialMovingAverage
@@ -75,6 +76,12 @@ def load_model(path, device, use_ema: bool = False):
     check_objective(ckpt, cfg.objective, what="checkpoint")
     print("[INFO] objective = {} ({} sampler steps)"
           .format(cfg.objective, cfg.inference_timesteps or "default"))
+
+    # Which network to build, and with it which modalities to feed. Same reasoning as
+    # above: the config json says what to construct, the checkpoint says what the weights
+    # are, and the two disagreeing means the json was overwritten by a later run.
+    check_context_encoder(ckpt, cfg.context_encoder, what="checkpoint")
+    print("[INFO] context encoder = {}".format(cfg.context_encoder))
 
     # Same guard one level down: an EE-pose and a joint checkpoint can have identical
     # state_dict layouts, and picking the wrong one here means the robot executes joint
@@ -232,7 +239,15 @@ class TrajPlanner(object):
         """
         Args:
             prompt_text (str):
+
+        A no-op as far as the policy is concerned when the checkpoint uses a
+        vision-action context encoder: `VLA.forward` drops the prompt and the SigLIP text
+        tower was never built. Still accepted, so `examples/libero/eval.py` and the RPC
+        service work unchanged against either kind of checkpoint.
         """
+        if prompt_text is not None and not self.model.uses_language:
+            print("[INFO] this checkpoint's context encoder ('{}') reads no language; "
+                  "the prompt is ignored.".format(self.model.context_encoder_name))
         self.prompt_text = prompt_text
         return self
     
@@ -324,8 +339,15 @@ class TrajPlanner(object):
         )
 
         T, ncam, C, H, W = rgbs.shape
-        norm_xys = gen_norm_xy_map(H, W, K).astype(np.float32)
-        norm_xys = norm_xys[None].repeat(T, axis=0)  # (T, ncam, 2, H, W)
+        if self.model.uses_camera_params:
+            norm_xys = gen_norm_xy_map(H, W, K).astype(np.float32)
+            norm_xys = norm_xys[None].repeat(T, axis=0)  # (T, ncam, 2, H, W)
+        else:
+            # `VLA.forward` would drop it anyway; not building it saves an H*W*2 map per
+            # camera per control step. K itself stays in `obs_data` -- `draw_traj` needs
+            # it to project the predicted trajectory back onto the image, which is a
+            # visualisation, not an input.
+            norm_xys = None
 
         obs_data = {
             "K": K,                                 # (ncam, 3, 3)
@@ -425,7 +447,7 @@ class TrajPlanner(object):
             future_time (np.ndarray): shape (Ta,)
             traj_img (np.ndarray | None): shape (H, Ncam*W, C) if not compressed else (nbytes,)
         """
-        assert self.prompt_text is not None, \
+        assert self.prompt_text is not None or not self.model.uses_language, \
             "No prompt set; call set_prompt() before get_action()."
 
         with self.obs_lock:

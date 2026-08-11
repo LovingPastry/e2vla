@@ -480,16 +480,29 @@ class DataSampler(object):
         )
 
 
-def gen_norm_xy_map(H: int, W: int, K: np.ndarray):
+def gen_norm_xy_map(H: int, W: int, K: Optional[np.ndarray] = None, ncam: int = 1):
     """
     Args:
         H (int): image height
         W (int): image width
-        K (np.ndarray): (Ncam, 3, 3), or (3, 3) for a single camera
+        K (np.ndarray | None): (Ncam, 3, 3), or (3, 3) for a single camera. None falls
+            back to `h5io.default_intrinsics`, replicated across `ncam` cameras.
+        ncam (int): number of cameras, read *only* on the K=None path -- a fabricated K
+            carries no camera count of its own.
 
     Returns:
         norm_xy (np.ndarray): (Ncam, 2, H, W)
     """
+    if K is None:
+        # Unlike the `preprocess_images` route -- which builds K at the raw resolution
+        # and transforms it through resize/crop -- this one is fabricated directly at the
+        # output (H, W), so it is self-consistent by construction. All the caveats in
+        # `h5io.default_intrinsics` still apply: fine as the positional encoding
+        # `proj_pe` consumes, fabricated for anything metric, and it makes cameras with
+        # genuinely different FOVs indistinguishable. Warned once per (H, W).
+        h5io._warn_default_intrinsics("gen_norm_xy_map, {}x{}".format(H, W))
+        K = np.tile(h5io.default_intrinsics(H, W)[None], (ncam, 1, 1))
+
     K = np.asarray(K)
     if K.ndim == 2:
         # A bare (3, 3) reaches here whenever K did not come through

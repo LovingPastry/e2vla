@@ -1,20 +1,17 @@
 import torch
 import torch.nn.functional as F
 
-from einops import rearrange
 from torch import nn, Tensor
 from diffusers import DDIMScheduler
 from typing import Optional, Tuple, Dict, List
 
 from .dit import DiT
-from .qformer import QFormerITM
 from .action_norm import ActionNormalizer
-from .conv_tower import build_conv_tower, TOTAL_STRIDE as CONV_TOTAL_STRIDE
-from .action_space import ActionSpace, build_action_space
+from .action_space import ActionSpace, build_action_space, reference_cam_pose
+from .context_encoder import (build_context_encoder, CONTEXT_ENCODERS,
+                              DEFAULT_CONTEXT_ENCODER)
 from .layers.utils import simple_mlp
-from .layers.utils import concat_mask
-from .layers.pe import SinusoidalPosEmb, se3_inverse
-from .layers.attn_dn import FFWSelfAttentionLayers, init_xncoder
+from .layers.pe import SinusoidalPosEmb
 from .layers.rot_transforms import matrix_to_rotation_6d, rotation_6d_to_matrix
 
 
@@ -118,212 +115,6 @@ def diffusion_diagnostics(
             # landed in is not an error of zero.
             out["diag/loss_noise_b{}".format(i)] = values[num_head + i] / count
     return out
-
-
-class ContextEncoder(nn.Module):
-    """Frozen VLM features -> a short, fixed-length context for the diffusion head.
-
-    Pipeline: project both vision backbones into hdim and sum -> add the 2D coordinate
-    PE -> `pre_attn` (self-attn over all cameras' patches, cross-attn to language, with
-    camera-pose PRoPE) -> QFormer compresses Ncam*Lv patches to 64 queries -> `post_attn`.
-
-    The compression is not optional: with Ncam cameras at Lv patches each, feeding the
-    raw tokens to every denoising step of the head would dominate inference cost.
-
-    Three positional encodings do three different jobs here:
-      * `proj_pe(norm_xy)` -- additive, absolute position on the image plane.
-        zero-initialised so it does not perturb the frozen features early in training.
-      * PRoPE(extrinsics)  -- multiplicative, applied inside attention; makes attention
-        between two patches depend on the *relative* pose of their cameras.
-      * `main_cam_embed`   -- marks camera 0, the frame actions are expressed in.
-
-    `conv_tower` optionally adds a third, *trainable* vision stream (see
-    `models/conv_tower.py`) which is concatenated with the summed ViT stream and fused by
-    `proj_fuse`. The frozen sum is left exactly as it was: the dino+siglip relationship is
-    what a pretrained trunk learned, so the new modality joins from the side rather than
-    inside it.
-    """
-
-    def __init__(self, hdim: int, num_heads: int, num_layers: int,
-                 conv_tower: Optional[str] = None, conv_dim: int = 256):
-        super().__init__()
-        self.proj_v = nn.ModuleList([
-            simple_mlp([768, hdim, hdim], ln=True),  # for dinov2 vision embeds
-            simple_mlp([768, hdim, hdim], ln=True),  # for siglip vision embeds
-        ])
-        # Appended as index 2 so `proj_v.0.*` / `proj_v.1.*` keep their names: a pretrained
-        # checkpoint still matches them tensor for tensor.
-        self.conv_tower = build_conv_tower(conv_tower, out_dim=conv_dim)
-        if self.conv_tower is not None:
-            self.proj_v.append(simple_mlp([conv_dim, hdim, hdim], ln=True))
-            self.proj_fuse = nn.Linear(2 * hdim, hdim)
-        else:
-            self.proj_fuse = None
-        self.proj_l = nn.ModuleList([
-            simple_mlp([768, hdim, hdim], ln=True)  # for siglip language embeds
-        ])
-        self.proj_pe = simple_mlp([2, hdim, hdim], ln=True)  # for normalized coordinates
-
-        self.main_cam_embed = nn.Parameter(torch.zeros(hdim))
-        self.pre_attn = DiT(hdim, num_heads, num_layers//2, use_adaln=False, 
-                            pe_type="prope")  # actually, it is not a DiT but self-cross attention module
-        self.qformer = QFormerITM(hdim, num_heads, num_layers=1, num_queries=64)
-        self.post_attn = FFWSelfAttentionLayers(hdim, num_heads, num_layers//2, use_adaln=False,
-                                                bias=True, qk_norm=True, ffn_expansion=2)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        init_xncoder(self.post_attn.num_layers, self.post_attn)
-        # zero both weight and bias, otherwise pe2d is a random constant offset at init
-        nn.init.zeros_(self.proj_pe[-1].weight)
-        nn.init.zeros_(self.proj_pe[-1].bias)
-
-        if self.proj_fuse is not None:
-            # [I | 0]: at init the fusion returns the ViT sum untouched, so a model with a
-            # conv tower is functionally identical to one without and a pretrained trunk
-            # warm-starts exactly. Same trick as proj_pe above and as LoRA's zero-init B.
-            # It is strictly more expressive than the sum it starts as -- summing the two
-            # streams is the special case [I | I].
-            hdim = self.proj_fuse.out_features
-            with torch.no_grad():
-                self.proj_fuse.weight.copy_(torch.cat(
-                    [torch.eye(hdim), torch.zeros(hdim, hdim)], dim=1))
-                self.proj_fuse.bias.zero_()
-
-    def forward(
-        self,
-        vl_obs: Dict[str, Tensor],
-        vl_feature: Dict[str, Tensor], 
-        fp16: bool
-    ):
-        """
-        Args:
-            vl_obs (Dict[str, Tensor]):
-                - rgb: (B, To, ncam, 3, H, W)
-                - norm_xy: (B, To, ncam, 2, H, W), coordinates in normalized camera plane
-                - text: List (length=B) of prompt
-                - extrinsics: (B, To, ncam, 4, 4), ^{world}_{camera} T
-            
-            vl_feature (Dict[str, Tensor]):
-                - norm_xy_ds: (B, Ncam, Lv, 2)
-                - vision_embeds: List (length=num_layer) of (B, Ncam, Lv, C)
-                - lang_embeds: List (length=num_layer) of (B, La, C)
-                - lang_mask: (B, La)
-                - extrinsics: (B, Ncam, 4, 4)
-
-            fp16: if True, use bfloat16
-        
-        Returns
-        -------
-            context: (B, Ncam*Lt, hdim)
-            context_mask: (B, Ncam*Lt)
-        """
-        batch_size, _, num_cam, _, _, _ = vl_obs["rgb"].shape
-        obs_extrinsics = vl_obs["extrinsics"]  # (B, To, Ncam, 4, 4)
-
-        # Rebase every camera pose onto camera 0 at the latest timestep. PRoPE only ever
-        # uses relative poses, so the absolute world origin must not leak in -- otherwise
-        # the model overfits to each dataset's arbitrary world frame.
-        cam0_extr_ref = torch.inverse(obs_extrinsics[:, -1:, 0:1]) @ obs_extrinsics  # (B, To, Ncam, 4, 4)
-        x_v: Tensor = self.proj_v[0](vl_feature["vision_embeds"][0]) + \
-                      self.proj_v[1](vl_feature["vision_embeds"][1])  # (B, Ncam, Lv, C)
-        if self.conv_tower is not None:
-            # Checked before the tower runs, not after: the token count is fully decided
-            # by the image size and the tower's fixed stride, and the conv stack is the
-            # most expensive thing in this forward -- no reason to pay for it first.
-            # A mismatch here is not a broadcast bug waiting to happen (`cat` would raise
-            # too), it is a misconfigured `output_image_hw`, so say so.
-            img_h, img_w = vl_obs["rgb"].shape[-2:]
-            num_conv_tok = (img_h // CONV_TOTAL_STRIDE) * (img_w // CONV_TOTAL_STRIDE)
-            if num_conv_tok != x_v.shape[-2]:
-                raise RuntimeError(
-                    "conv_tower would produce {} tokens per camera but the ViTs produced "
-                    "{}. The tower downsamples by {}x and does not resize its input, so "
-                    "the dataset's output_image_hw must be {}x the ViT patch grid "
-                    "(16x16), i.e. (256, 256). Got rgb {}x{}."
-                    .format(num_conv_tok, x_v.shape[-2], CONV_TOTAL_STRIDE,
-                            CONV_TOTAL_STRIDE, img_h, img_w))
-            # The trainable branch reads the raw pixels, not the frozen features, and only
-            # the latest frame -- matching what `VLM` hands over in `vision_embeds`.
-            # Autocast for the same reason pre_attn/post_attn have it: proj_v runs outside
-            # those blocks, so without it the conv stack would run in fp32.
-            with torch.autocast(
-                x_v.device.type,
-                torch.bfloat16 if fp16 else torch.float32
-            ):
-                x_cnn = self.proj_v[2](self.conv_tower(vl_obs["rgb"][:, -1]))
-                x_v = self.proj_fuse(torch.cat([x_v, x_cnn.to(x_v.dtype)], dim=-1))
-            # Back to fp32, which is what the tower-less path hands to `x_v + pe2d`.
-            # Keeping the dtypes identical is what makes the [I | 0] warm start exact
-            # rather than merely close.
-            x_v = x_v.float()
-        x_l: Tensor = self.proj_l[0](vl_feature["lang_embeds"][0])    # (B, Ncam, La, C)
-        norm_xy_ds = vl_feature["norm_xy_ds"]  # (B, Ncam, Lv, 2)
-        mask_l = vl_feature["lang_mask"]  # (B, La)
-
-        # camera pose as multiplicative positional encoding (PRoPE)
-        num_patch = x_v.shape[-2]
-        extrinsic_wcT = cam0_extr_ref[:, -1]  # (B, Ncam, 4, 4), select the latest frame
-        # Invert once here, on (B, Ncam, 4, 4). PRoPE needs the inverse for every query
-        # token in every layer; inverting after the expand would redo the same Ncam
-        # matrices Lv times per layer. se3_inverse is the analytic rigid-transform
-        # inverse -- valid because cam0_extr_ref is a product of rigid transforms.
-        extrinsic_cwT = se3_inverse(extrinsic_wcT)  # (B, Ncam, 4, 4)
-
-        def expand_to_tokens(extr: Tensor):
-            """(B, Ncam, 4, 4) -> (B, Ncam*Lv, 4, 4): every patch inherits its camera's
-            pose. `expand` keeps this a view, so no Lv-fold memory blowup."""
-            extr = extr[:, :, None, :, :].expand(batch_size, num_cam, num_patch, 4, 4)
-            return rearrange(extr, "b n l r c -> b (n l) r c")
-
-        extrinsic_pe = expand_to_tokens(extrinsic_wcT)
-        extrinsic_pe_inv = expand_to_tokens(extrinsic_cwT)
-
-        # flatten cameras into the token axis: attention runs over all views jointly
-        x_v = rearrange(x_v, "b n l c -> b (n l) c")
-        pe2d = rearrange(self.proj_pe(norm_xy_ds), "b n l c -> b (n l) c")
-
-        # SA before qformer
-        with torch.autocast(
-            x_v.device.type,
-            torch.bfloat16 if fp16 else torch.float32
-        ):
-            x_v: Tensor = self.pre_attn(
-                x=x_v + pe2d,  # additive 2D positional encoding
-                x_pe=extrinsic_pe,
-                x_mask=None,  # every vision patch is valid
-                conds=[x_l],
-                cond_masks=[mask_l],
-                films=None,
-                x_pe_inv=extrinsic_pe_inv
-            )
-
-        # tag camera 0's tokens: actions live in its frame, so the head must be able to
-        # tell which view defines "forward". clone() because pre_attn's output may be a
-        # view and the next line writes in place.
-        x_v = x_v.clone()
-        num_patch_flat = x_v.shape[1] // num_cam
-        x_v[:, :num_patch_flat] = x_v[:, :num_patch_flat] + self.main_cam_embed
-
-        with torch.autocast(
-            x_v.device.type, 
-            torch.bfloat16 if fp16 else torch.float32
-        ):
-            query, x_l, _ = self.qformer(
-                x_vision=x_v,
-                mask_vision=None,
-                x_text=x_l,
-                mask_text=mask_l,
-            )
-
-            query = self.post_attn(
-                query=query,
-            )[-1]
-        
-        cond = torch.cat([query, x_l], dim=1)
-        cond_mask = concat_mask(mask0=None, mask1=mask_l,
-                                L0=query.shape[1], L1=x_l.shape[1])
-        return cond, cond_mask
 
 
 class DiffusionHead(nn.Module):
@@ -550,11 +341,15 @@ class ActionExpert(nn.Module):
         flow_time_sampling: str = "uniform",
         flow_time_alpha: float = 1.5,
         conv_tower: Optional[str] = None,
+        context_encoder: str = DEFAULT_CONTEXT_ENCODER,
     ):
         super().__init__()
         if objective not in OBJECTIVES:
             raise ValueError("unknown objective '{}'; valid choices are {}"
                              .format(objective, list(OBJECTIVES)))
+        if context_encoder not in CONTEXT_ENCODERS:
+            raise ValueError("unknown context_encoder '{}'; valid choices are {}"
+                             .format(context_encoder, list(CONTEXT_ENCODERS)))
         if flow_time_sampling not in FLOW_TIME_SAMPLING:
             raise ValueError("unknown flow_time_sampling '{}'; valid choices are {}"
                              .format(flow_time_sampling, list(FLOW_TIME_SAMPLING)))
@@ -573,8 +368,25 @@ class ActionExpert(nn.Module):
                 .format(action_norm.action_dim, self.action_dim))
         self.action_norm = action_norm
 
-        self.context_encoder = ContextEncoder(hdim, num_heads, num_layers=num_context_layers,
-                                              conv_tower=conv_tower)
+        self.context_encoder_name = context_encoder
+        self.context_encoder = build_context_encoder(
+            context_encoder, hdim=hdim, num_heads=num_heads,
+            num_layers=num_context_layers, conv_tower=conv_tower)
+        # The one combination that loads, runs and then means nothing: a camera-relative
+        # action space needs `^{world}T_{cam}` for every sample, and a vision-action
+        # encoder is built precisely so no calibration reaches the model. Substituting
+        # identity silently would redefine what the checkpoint's actions mean without
+        # changing a single tensor -- exactly the failure mode `action_layout` exists to
+        # prevent -- so it is refused here instead.
+        if (self.action_space.uses_camera_pose
+                and not self.context_encoder.uses_camera_params):
+            raise ValueError(
+                "context_encoder='{}' reads no camera parameters, but action_space '{}' "
+                "(layout '{}') expresses every action in camera 0's frame, which needs "
+                "the extrinsics. Use action_space='ee_base' (the same encoding rebased "
+                "onto the robot's own frame) or a joint space."
+                .format(context_encoder, self.action_space.name,
+                        self.action_space.layout))
         self.dp_head = DiffusionHead(hdim, num_heads, self.action_space,
                                      num_layers=num_diffusion_layers,
                                      action_norm=action_norm)
@@ -756,18 +568,19 @@ class ActionExpert(nn.Module):
     ):
         """
         Args:
-            vl_obs (Dict[str, Tensor]):
+            vl_obs (Dict[str, Tensor]): the language and camera-parameter entries are
+                None under a vision-action context encoder -- see `models/vlm.py`
                 - rgb: (B, To, ncam, 3, H, W)
-                - norm_xy: (B, To, ncam, 2, H, W), coordinates in normalized camera plane
-                - text: List (length=B) of prompt
-                - extrinsics: (B, To, ncam, 4, 4), ^{world}_{camera} T
-            
+                - norm_xy: (B, To, ncam, 2, H, W) or None
+                - text: List (length=B) of prompt, or None
+                - extrinsics: (B, To, ncam, 4, 4) or None, ^{world}_{camera} T
+
             vl_feature (Dict[str, Tensor]):
-                - norm_xy_ds: (B, Ncam, Lv, 2)
+                - norm_xy_ds: (B, Ncam, Lv, 2) or None
                 - vision_embeds: List (length=num_layer) of (B, Ncam, Lv, C)
-                - lang_embeds: List (length=num_layer) of (B, La, C)
-                - lang_mask: (B, La)
-                - extrinsics: (B, Ncam, 4, 4)
+                - lang_embeds: List (length=num_layer) of (B, La, C), or None
+                - lang_mask: (B, La) or None
+                - extrinsics: (B, Ncam, 4, 4) or None
 
             ee_poses: (B, Nee, 4, 4), ^{world}_{ee} T
             history_actions: (B, nhist, Nee, 4*4+1), in world frame,
@@ -791,10 +604,13 @@ class ActionExpert(nn.Module):
             loss (Tensor): scalar tensor
             metrics (Dict[str, Tensor]): metrics for logging
         """
-        # camera 0 at the latest timestep is the reference frame for the whole action
-        # representation -- ContextEncoder builds its PRoPE relative to the same camera
-        latest_cam_poses = vl_obs["extrinsics"][:, -1]  # (B, Ncam, 4, 4)
-        current_cam_pose = latest_cam_poses[:, 0]  # first camera, (B, 4, 4)
+        # The frame the whole action representation is expressed in. Under "ee_cam" that
+        # is camera 0 at the latest timestep -- the same camera `VLContextEncoder` builds
+        # its PRoPE relative to. Under a camera-free action space it is the identity, and
+        # `vl_obs["extrinsics"]` is not read at all (it is None in that case).
+        current_cam_pose = reference_cam_pose(
+            self.action_space, vl_obs["extrinsics"],
+            batch_size=vl_obs["rgb"].shape[0], like=ee_poses)  # (B, 4, 4)
 
         # patch features as current observation context in diffusion
         cond, cond_mask = self.context_encoder(
@@ -1098,28 +914,25 @@ def get_target(actions: Tensor, noise: Tensor, timesteps: Tensor, scheduler: DDI
 
 
 def count_parameters():
-    model = ActionExpert(
-        hdim=256,
-        num_heads=4,
-        num_context_layers=8,
-        num_diffusion_layers=4,
-        diffusion_timesteps=100,
-    )
+    """One line per context encoder, at the `base` width the presets actually use."""
+    for name in CONTEXT_ENCODERS:
+        model = ActionExpert(
+            hdim=768,
+            num_heads=12,
+            num_context_layers=8,
+            num_diffusion_layers=4,
+            diffusion_timesteps=100,
+            # every VA encoder refuses a camera-relative action space, see __init__
+            action_space="ee_cam" if name == "vl" else "ee_base",
+            context_encoder=name,
+        )
 
-    modules = [
-        model
-    ]
-
-    num_param = 0
-    for m in modules:
-        for p in m.parameters():
-            if not p.requires_grad:
-                continue
-            
-            num_param += p.numel()
-
-    print("[INFO] Total {:.3f}M trainable parameters"
-          .format(num_param / 1e6))
+        num_param = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        num_ctx = sum(p.numel() for p in model.context_encoder.parameters()
+                      if p.requires_grad)
+        print("[INFO] context_encoder={:>12}: {:.3f}M trainable ({:.3f}M in the context "
+              "encoder, {:.3f}M in the head)"
+              .format(name, num_param / 1e6, num_ctx / 1e6, (num_param - num_ctx) / 1e6))
 
 
 if __name__ == "__main__":

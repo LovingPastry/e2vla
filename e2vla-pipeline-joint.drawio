@@ -1,0 +1,143 @@
+<mxGraphModel adaptiveColors="auto" dx="1520" dy="1760" grid="0" page="1" pageWidth="1520" pageHeight="1760">
+  <root>
+    <mxCell id="0"/>
+    <mxCell id="1" parent="0"/>
+
+    <mxCell id="title" value="&lt;b&gt;E2VLA · joint 动作空间（action_space = &quot;joint7&quot;）&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;只画真正进入模型、参与训练或推理的数据。RealBinDataset + vla_base：nq=7，state_dim = action_dim = 8，ncam=2，nee=1，To=1，nhist=4，Ta=16&lt;/font&gt;" style="text;html=1;align=center;verticalAlign=middle;fontSize=17;fillColor=none;strokeColor=none;" vertex="1" parent="1">
+      <mxGeometry x="70" y="15" width="1010" height="55" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="in1" value="&lt;b&gt;多路 RGB&lt;/b&gt;&lt;br&gt;&lt;br&gt;ncam=2，(H,W,3) uint8&lt;br&gt;camera_names[0] 第三人称&lt;br&gt;camera_names[1] 腕部" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="80" y="90" width="330" height="110" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="in2" value="&lt;b&gt;自然语言&lt;/b&gt;&lt;br&gt;&lt;br&gt;PROMPT_TEXT / set_prompt&lt;br&gt;单任务下整段固定" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="440" y="90" width="270" height="110" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="in3" value="&lt;b&gt;本体状态&lt;/b&gt;&lt;br&gt;&lt;br&gt;joint[:7] 绝对关节角（&lt;b&gt;弧度&lt;/b&gt;）&lt;br&gt;夹爪宽度 → 归一到 [0,1]&lt;br&gt;&lt;font style=&quot;font-size:10px;&quot;&gt;get_openness：norm_openness 或 GRIPPER_MIN/MAX 线性映射&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="740" y="90" width="340" height="110" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s2" value="&lt;b&gt;① 采样与预处理&lt;/b&gt;　&lt;font style=&quot;font-size: 10px;&quot;&gt;data_utils/dataset_real.py : RealBinDataset.sample_traj&lt;/font&gt;&lt;br&gt;&lt;br&gt;• &lt;b&gt;按索引采样，不做时间插值&lt;/b&gt;（等间隔录制）：obs_ind / hist_ind / fut_ind，gaps = 10 / 2 / 2&lt;br&gt;• preprocess_images：uint8/255 → scale_to_fit + center_crop → 256×256，K 同步变换&lt;br&gt;• gen_norm_xy_map(H,W,K) → obs_norm_xys，逐像素 ((u,v)−c)/f&lt;br&gt;• compose_joint_gripper：关节角 ‖ 夹爪 → &lt;b&gt;(T, nee, nq+1 = 8)&lt;/b&gt;&lt;br&gt;• pad2ncam / pad2nee → valid_ee_mask" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="80" y="250" width="1000" height="150" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s3" value="&lt;b&gt;② 冻结 VLM（无梯度）&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;models/vlm.py&lt;/font&gt;&lt;br&gt;&lt;br&gt;• DINOv2 ViT-B/14-reg → (2, 256, 768)&lt;br&gt;• SigLIP-vision patch16-256 → (2, 256, 768)&lt;br&gt;• SigLIP-text，定长 64 token → (64, 768)&lt;br&gt;• AvgPool(16)：norm_xy_ds → (2, 256, 2)&lt;br&gt;• 只取最新帧 [:, −1]" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="80" y="455" width="520" height="155" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s5" value="&lt;b&gt;③ AbsJoint.states2action&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;models/action_space.py : AbsJoint&lt;/font&gt;&lt;br&gt;&lt;br&gt;1. 关节角 &lt;b&gt;原样透传&lt;/b&gt;（绝对量，弧度）&lt;br&gt;2. 夹爪 [0,1] → [−1,1]&lt;br&gt;3. ActionNormalizer q01/q99 → ≈[−1,1]&lt;br&gt;&nbsp;&nbsp;&nbsp;&lt;font style=&quot;font-size:10px;&quot;&gt;layout 戳 = abs_joint7_openness&lt;/font&gt;&lt;br&gt;&lt;br&gt;&lt;b&gt;没有任何坐标变换&lt;/b&gt;：签名里的 cur_wcT /&lt;br&gt;cur_weT 一行都没用到" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="680" y="455" width="400" height="190" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s4" value="&lt;b&gt;④ ContextEncoder&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;models/action_expert.py : ContextEncoder&lt;/font&gt;&lt;br&gt;&lt;br&gt;• 外参重定基到「相机0 @ 最新时刻」&lt;br&gt;• proj_v 双塔投影相加　&lt;i&gt;（＋可选 conv 分支，见下）&lt;/i&gt;&lt;br&gt;• ＋ proj_pe(norm_xy_ds)：加性 2D 位置编码&lt;br&gt;• pre_attn DiT×4：跨相机 512 token 联合自注意（PRoPE）&lt;br&gt;&nbsp;&nbsp;&nbsp;＋ 对语言的交叉注意&lt;br&gt;• ＋ main_cam_embed 标记相机0&lt;br&gt;• QFormer 64 query 压缩 → post_attn×4" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="80" y="665" width="520" height="200" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="conv" value="&lt;i&gt;可选：conv_tower = &quot;resnet18&quot;&lt;/i&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;&quot;&gt;ResNet18 截到 layer2 读原始像素，&lt;br&gt;与 ViT 和拼接后过 proj_fuse=[I|0]。&lt;br&gt;preset: finetune_real_joint_conv_flow&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=6;fillColor=#ffe6cc;strokeColor=#d79b00;dashed=1;fontSize=11;" vertex="1" parent="1">
+      <mxGeometry x="80" y="890" width="330" height="75" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s6" value="&lt;b&gt;⑤ DiffusionHead&lt;/b&gt;　&lt;font style=&quot;font-size: 10px;&quot;&gt;models/action_expert.py : DiffusionHead.forward&lt;/font&gt;&lt;br&gt;&lt;br&gt;• hist_enc(前 &lt;b&gt;7&lt;/b&gt; 维 = 关节角，&lt;b&gt;丢掉夹爪&lt;/b&gt;) ＋ traj_enc(8 维) → 4 ＋ 16 = &lt;b&gt;20 token&lt;/b&gt;&lt;br&gt;• ＋ traj_time_embed：chunk 内位置（加性正弦）&lt;br&gt;• &lt;b&gt;✗ abs_pos_enc 不构建&lt;/b&gt;　has_pose_geometry = False —— 从关节角复原末端位置需正运动学&lt;br&gt;• denoising_time_embed(t) → film → adaLN　&lt;i&gt;（去噪时间，与上面的 chunk 位置是两回事）&lt;/i&gt;&lt;br&gt;• traj_context_attn DiT×4 → 交叉注意 cond → act_head&lt;br&gt;• 只读出后 16 个 token → &lt;b&gt;(Ta=16, 8)&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="450" y="920" width="630" height="185" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="train" value="&lt;b&gt;⑥a 训练　&lt;/b&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;train.py · ActionExpert.forward(inference=False)&lt;/font&gt;&lt;br&gt;&lt;br&gt;真值 future_actions 走&lt;b&gt;同一个&lt;/b&gt; states2action → future_action_cam (16, 8)&lt;br&gt;&lt;br&gt;加噪后做&lt;b&gt;单步&lt;/b&gt;回归（不跑采样循环）：&lt;br&gt;&nbsp;&nbsp;• ddim：add_noise，目标 = ε&lt;br&gt;&nbsp;&nbsp;• flow：x_t = (1−t)·noise ＋ t·a，目标 = a − noise&lt;br&gt;&lt;br&gt;&lt;b&gt;loss = 30 · joint_L1 ＋ 10 · openness_L1&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;&quot;&gt;AbsJoint.loss —— 没有 pos / rot 项&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#f8f0d8;strokeColor=#b8a04a;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="590" y="1165" width="490" height="215" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="infer" value="&lt;b&gt;⑥b 推理采样&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;ActionExpert.sample_actions&lt;/font&gt;&lt;br&gt;&lt;br&gt;x ~ N(0, I)，形状 (16, 8)&lt;br&gt;&lt;b&gt;DDIM 20 步&lt;/b&gt;（预测 ε）&lt;br&gt;&lt;b&gt;或 Flow Euler 10 步&lt;/b&gt;（预测速度场）&lt;br&gt;&lt;font style=&quot;font-size:10px;&quot;&gt;cond / history 只算一次，逐步复用&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="80" y="1165" width="440" height="160" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="dec" value="&lt;b&gt;⑦ AbsJoint.action2states&lt;/b&gt;&lt;br&gt;&lt;br&gt;反归一化 → 夹爪 [−1,1] → [0,1]&lt;br&gt;无效 ee 槽位填 &lt;b&gt;零&lt;/b&gt;（基类实现，不是单位阵）&lt;br&gt;&lt;b&gt;→ (Ta=16, nee, 8)：绝对关节角 ＋ 夹爪&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="80" y="1385" width="440" height="125" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="ctrl" value="&lt;b&gt;⑧ 关节控制器&lt;/b&gt;&lt;br&gt;&lt;br&gt;绝对关节角目标直接下发&lt;br&gt;&lt;b&gt;无 IK，手眼标定误差不在动作链路上&lt;/b&gt;&lt;br&gt;chunk 覆盖 16 × 2 / 30 Hz ≈ 1.07 s" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="80" y="1570" width="440" height="120" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="noteA" value="&lt;b&gt;视觉几何量的现状&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;&quot;&gt;RealBinDataset&lt;/font&gt;&lt;br&gt;&lt;br&gt;• K = default_intrinsics（D435 名义值，&lt;b&gt;编的&lt;/b&gt;）&lt;br&gt;&nbsp;&nbsp;当 proj_pe 的位置编码用没问题，度量用途不成立&lt;br&gt;• extrinsics = identity（无手眼标定）&lt;br&gt;&nbsp;&nbsp;→ PRoPE &lt;b&gt;退化为 no-op&lt;/b&gt;，动作退化为 base-relative&lt;br&gt;&nbsp;&nbsp;→ 两路相机几何上不可区分，&lt;b&gt;shuffle_cameras 必须 False&lt;/b&gt;&lt;br&gt;• 填 identity 而非零：零矩阵会在第一次 inverse 出 NaN" style="rounded=0;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=6;fillColor=#fff2cc;strokeColor=#d6b656;dashed=1;fontSize=11;" vertex="1" parent="1">
+      <mxGeometry x="1160" y="455" width="330" height="190" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="noteB" value="&lt;b&gt;相比 ee_cam，这些&lt;u&gt;不存在&lt;/u&gt;&lt;/b&gt;&lt;br&gt;&lt;br&gt;✗ ee_poses / cur_weT —— 仍在契约里，但&lt;b&gt;死输入&lt;/b&gt;，&lt;br&gt;&nbsp;&nbsp;&nbsp;对输出零影响（故未画在本图上）&lt;br&gt;✗ space_ee2cam / space_cam2ee 不调用&lt;br&gt;✗ rotation_6d ↔ 旋转矩阵 不参与&lt;br&gt;✗ abs_pos_enc 不构建（state_dict 里也没有）&lt;br&gt;✗ loss 无 pos / rot 项&lt;br&gt;&lt;br&gt;&lt;b&gt;本体信息的唯一入口&lt;/b&gt;：hist_enc 吃到的 4 帧、跨 8 个&lt;br&gt;采样步的绝对关节角序列（含隐式关节速度）" style="rounded=0;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=6;fillColor=#f5f5f5;strokeColor=#999999;dashed=1;fontSize=11;" vertex="1" parent="1">
+      <mxGeometry x="1160" y="900" width="330" height="205" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="noteC" value="&lt;b&gt;⚠ 部署缺口&lt;/b&gt;&lt;br&gt;&lt;br&gt;infer_utils/planner.py 无条件按 &lt;b&gt;17 维 SE(3)&lt;/b&gt; 解码&lt;br&gt;（get_action 的 reshape(…,4,4)、_make_empty_action、&lt;br&gt;ensemble_traj）。joint ckpt 在 remote_service 里能&lt;br&gt;&lt;b&gt;建起来&lt;/b&gt;，跑到那一行才崩。&lt;br&gt;&lt;br&gt;⑦→⑧ 这一段真机部署要自己写；&lt;br&gt;开环评测走 test.py 是通的（用 AbsJoint.state_error：&lt;br&gt;joint_err_rad / _max / _last、grip_l1、grip_acc）。" style="rounded=0;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=6;fillColor=#f8cecc;strokeColor=#b85450;dashed=1;fontSize=11;" vertex="1" parent="1">
+      <mxGeometry x="590" y="1420" width="490" height="185" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e12a" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.15;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;" edge="1" parent="1" source="in1" target="s2">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="e12b" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;" edge="1" parent="1" source="in2" target="s2">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="e12c" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.85;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;" edge="1" parent="1" source="in3" target="s2">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e23" value="rgbs / obs_norm_xys / obs_extrinsics / prompt_text" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="s2" target="s3">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e25" value="history_actions (4, nee, 8)&lt;br&gt;future_actions (16, nee, 8)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.88;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="s2" target="s5">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e34" value="vision_embeds ×2 / lang_embeds / norm_xy_ds / extrinsics" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="s3" target="s4">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="econv" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.35;entryY=1;entryDx=0;entryDy=0;dashed=1;endArrow=block;strokeColor=#d79b00;" edge="1" parent="1" source="conv" target="s4">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e46" value="cond (128, 768)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=1;exitY=0.7;exitDx=0;exitDy=0;entryX=0;entryY=0.35;entryDx=0;entryDy=0;strokeWidth=2;fontSize=11;" edge="1" parent="1" source="s4" target="s6">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e56" value="history (4, 8)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.4;exitY=1;exitDx=0;exitDy=0;entryX=0.4;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;fontSize=11;" edge="1" parent="1" source="s5" target="s6">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e5train" value="future_action_cam&lt;br&gt;（回归目标）" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=1;exitY=0.7;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;strokeWidth=2;fontSize=10;dashed=1;strokeColor=#b8a04a;" edge="1" parent="1" source="s5" target="train">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points">
+          <mxPoint x="1120" y="588"/>
+          <mxPoint x="1120" y="1272"/>
+        </Array>
+      </mxGeometry>
+    </mxCell>
+
+    <mxCell id="e6train" value="pred (16, 8)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.75;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;fontSize=11;" edge="1" parent="1" source="s6" target="train">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e6infer" value="每步一次网络评估" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.1;exitY=1;exitDx=0;exitDy=0;entryX=0.75;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;fontSize=11;" edge="1" parent="1" source="s6" target="infer">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e78" value="pred_actions (16, 8)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;fontSize=11;" edge="1" parent="1" source="infer" target="dec">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e89" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;" edge="1" parent="1" source="dec" target="ctrl">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="eloop" value="下一控制周期：新的关节角 + 图像回灌" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;dashed=1;strokeWidth=2;strokeColor=#6c8ebf;fontSize=11;" edge="1" parent="1" source="ctrl" target="s2">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points">
+          <mxPoint x="35" y="1630"/>
+          <mxPoint x="35" y="325"/>
+        </Array>
+      </mxGeometry>
+    </mxCell>
+
+  </root>
+</mxGraphModel>

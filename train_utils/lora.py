@@ -110,6 +110,15 @@ def setup_lora(module: nn.Module, rank: int, keep_trainable=LORA_KEEP_TRAINABLE)
         raise ValueError("lora rank must be positive, got {}".format(rank))
 
     module, num_replaced = replace_with_lora_linear(module, rank)
+    if num_replaced == 0:
+        # Reachable with `context_encoder="mlp"`, which has no attention at all. Without
+        # this the freeze below would still run, leaving only LayerNorms and biases
+        # trainable -- a run that reports "LoRA rank=16" and trains ~0.1% of the encoder.
+        raise RuntimeError(
+            "lora_rank={} but this subtree has no attention projections to wrap, so "
+            "LoRA would train nothing and the freeze below would leave the encoder at "
+            "its initialisation. Set lora_rank=0 for this context encoder."
+            .format(rank))
 
     # replace_with_lora_linear only freezes the Linears it wrapped; freeze the rest here
     # (FFNs, projections, the QFormer's non-attention weights, ...).

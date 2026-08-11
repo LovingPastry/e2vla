@@ -36,6 +36,11 @@ class ActionSpace(object):
     # 是否支持 DiffusionHead 的绝对位置编码（pos_rel2abs）。关节空间要复原末端位置需要
     # 正运动学，得有 URDF/DH 参数，这里没有，所以关掉。
     has_pose_geometry: bool = False
+    # 是否需要相机外参。只有 `CamRelEEPose` 需要——它把动作表达在 0 号相机的朝向里。
+    # 视觉-动作（VA）模型完全不读标定，所以 `ActionExpert.__init__` 会拒绝
+    # "无相机参数的 context_encoder + uses_camera_pose 的动作空间" 这一组合：默默塞单位阵
+    # 会在不改动任何张量的前提下改变 checkpoint 里动作的含义。
+    uses_camera_pose: bool = False
 
     def states2action(self, cur_wcT: Tensor, cur_weT: Tensor, states: Tensor,
                       action_norm: Optional[ActionNormalizer] = None) -> Tensor:
@@ -92,6 +97,7 @@ class CamRelEEPose(ActionSpace):
     state_dim = 4 * 4 + 1
     action_dim = 3 + 6 + 1
     has_pose_geometry = True
+    uses_camera_pose = True
 
     def states2action(self, cur_wcT, cur_weT, states, action_norm=None):
         from .action_expert import states2action
@@ -146,6 +152,46 @@ class CamRelEEPose(ActionSpace):
             "grip_l1": grip_err.mean().item(),
             "grip_acc": grip_acc.mean().item(),
         }
+
+
+class BaseRelEEPose(CamRelEEPose):
+    """与 `CamRelEEPose` 同一套编码，只是参考系换成机器人自己的基座（世界）坐标系。
+
+    `build_action_space("ee_base")`，视觉-动作（VA）模型的默认动作空间。
+
+    数学上就是把 `cur_wcT` 换成单位阵：`space_ee2cam` 里的 `ceR` 于是退化成 `^{w}R_{e}`，
+    动作 = 当前末端位姿的增量，按**世界坐标轴**表达（而不是相机坐标轴）。平移不变性、6D
+    旋转、夹爪重标定这些都原样保留，唯一没了的是"动作跟着相机转"这条性质——而那条性质正是
+    要靠外参才能算出来的。
+
+    这不只是"外参缺失时的降级"，在固定第三人称相机的单任务设定下它往往更合适：世界坐标轴
+    在整段轨迹里恒定，而相机坐标轴会随任何一次相机移动整体旋转。代价是模型必须自己从图像里
+    推断"世界的前方在哪"，这也是 `main_cam_embed` 仍然保留的原因。
+
+    `layout` 单独取名而不是复用 `cam_rel_t3r6_openness`：两者的张量名和形状完全一致，
+    channel 数也一样，把相机相对的 checkpoint 加载进来只会得到一个坐标轴系统性转错的策略，
+    没有任何下游能发现。统计文件同理，`compute_action_stats` 必须按本空间重算。
+    """
+
+    name = "ee_base"
+    layout = "base_rel_t3r6_openness"
+    uses_camera_pose = False
+
+    @staticmethod
+    def _identity_like(cur_weT: Tensor):
+        """(B, 4, 4) 单位阵，dtype/device 跟随输入。"""
+        return torch.eye(4).to(cur_weT).expand_as(cur_weT)
+
+    def states2action(self, cur_wcT, cur_weT, states, action_norm=None):
+        # 无视传进来的 cur_wcT：调用方（ActionExpert / compute_action_stats）已经通过
+        # `reference_cam_pose` 给的是单位阵，这里再挡一层，免得某个新调用方顺手传了真外参
+        # 就得到一个混合坐标系的动作。
+        return super().states2action(self._identity_like(cur_weT), cur_weT, states,
+                                     action_norm)
+
+    def action2states(self, cur_wcT, cur_weT, action, action_norm=None):
+        return super().action2states(self._identity_like(cur_weT), cur_weT, action,
+                                     action_norm)
 
 
 class AbsJoint(ActionSpace):
@@ -229,7 +275,7 @@ class AbsJoint(ActionSpace):
 
 
 def build_action_space(spec: Optional[str | ActionSpace]) -> ActionSpace:
-    """"ee_cam" | "joint" | "joint7" | "joint6" ... -> ActionSpace。None 取 EE（历史默认）。"""
+    """"ee_cam" | "ee_base" | "joint" | "jointN" -> ActionSpace。None 取 EE（历史默认）。"""
     if isinstance(spec, ActionSpace):
         return spec
     if spec is None or spec == "":
@@ -237,6 +283,8 @@ def build_action_space(spec: Optional[str | ActionSpace]) -> ActionSpace:
     spec = spec.strip()
     if spec in ("ee_cam", "ee", "cam_rel_t3r6_openness"):
         return CamRelEEPose()
+    if spec in ("ee_base", "base_rel_t3r6_openness"):
+        return BaseRelEEPose()
     if spec == "joint":
         return AbsJoint()
     if spec.startswith("joint"):
@@ -244,4 +292,37 @@ def build_action_space(spec: Optional[str | ActionSpace]) -> ActionSpace:
         if suffix.isdigit():
             return AbsJoint(num_joints=int(suffix))
     raise ValueError(
-        "未知的 action_space '{}'。可选：'ee_cam'、'joint'（=joint7）、'jointN'".format(spec))
+        "未知的 action_space '{}'。可选：'ee_cam'、'ee_base'、'joint'（=joint7）、'jointN'"
+        .format(spec))
+
+
+def reference_cam_pose(
+    action_space: ActionSpace,
+    extrinsics: Optional[Tensor],
+    batch_size: int,
+    like: Tensor,
+):
+    """动作编码所用的参考系 `^{world}T_{ref}`，形状 (B, 4, 4)。
+
+    `ActionExpert.forward` 与 `data_prepare/compute_action_stats.py` 共用这一个函数：
+    统计量是在模型动作空间上算的，两边的参考系一旦不一致，归一化就会静默地按错误的坐标系
+    去缩放动作，而 loss 曲线看不出任何异常。
+
+    Args:
+        action_space: 当前动作空间，只读它的 `uses_camera_pose`
+        extrinsics: (B, To, Ncam, 4, 4) 或 None，`^{world}_{camera} T`
+        batch_size: B，仅在退化到单位阵时使用
+        like: 借它的 dtype/device（一般传 ee_poses）
+
+    Returns:
+        (B, 4, 4)：相机相对空间取 0 号相机在最新帧的位姿；否则取单位阵，等价于把动作
+        表达在机器人基座（世界）坐标系里——见 `BaseRelEEPose`。
+    """
+    if action_space.uses_camera_pose:
+        if extrinsics is None:
+            raise ValueError(
+                "action_space '{}' 需要相机外参，但 extrinsics 是 None。要么换成 "
+                "'ee_base'/'jointN'，要么用 context_encoder='vl' 把外参喂进来。"
+                .format(action_space.name))
+        return extrinsics[:, -1][:, 0]  # 最新帧的 0 号相机, (B, 4, 4)
+    return torch.eye(4).to(like).expand(batch_size, 4, 4)

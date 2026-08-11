@@ -10,6 +10,7 @@ from train_utils.lora import VLM_LORA_TARGETS, DEFAULT_VLM_LORA_TARGETS
 # -- a second list would drift, and the failure of a drifted list is a config that
 # validates and then blows up (or worse, silently falls back) inside the model.
 from models.action_expert import OBJECTIVES, FLOW_TIME_SAMPLING
+from models.context_encoder import CONTEXT_ENCODERS, DEFAULT_CONTEXT_ENCODER
 from models.conv_tower import CONV_TOWERS
 
 
@@ -87,6 +88,28 @@ class TrainConfig(object):
     # deliberately absent from `model_kwargs()`. Ignored when conv_tower == "none".
     conv_tower_lr_scale: float = 1.0
 
+    # Which context encoder sits between the frozen backbones and the diffusion head
+    # (models/context_encoder.py). This is the vision-language / vision-action switch.
+    #   "vl"          -- the original: language cross-attention + PRoPE camera-pose
+    #                    encoding. 60.95M. The only value the released checkpoints use.
+    #   "sa"          -- no language, no camera parameters, same topology and (within
+    #                    5.8%) the same size: every cross-attention into the text tokens
+    #                    becomes a second self-attention over the vision tokens. 57.40M.
+    #   "transformer" -- no language, no camera parameters, one self-attention stack over
+    #                    all patches followed by average pooling to 64 tokens. 12.42M.
+    #   "mlp"         -- the same without any attention: a per-token MLP and the pooling.
+    #                    4.14M.
+    #
+    # The three vision-action variants read NO camera intrinsics and NO extrinsics, which
+    # constrains `action_space`: there is no camera frame left to express actions in, so
+    # they require "ee_base" (the same SE(3)-delta encoding rebased onto the robot's own
+    # frame) or a joint space. `ActionExpert.__init__` refuses "ee_cam".
+    #
+    # Not a knob to flip mid-run. "sa" against "vl" is the language ablation at matched
+    # capacity; "transformer"/"mlp" against "sa" is the capacity ablation at matched
+    # modality. Every checkpoint is stamped with the value used (`check_context_encoder`).
+    context_encoder: str = DEFAULT_CONTEXT_ENCODER
+
     # Path to a q01/q99 action-statistics JSON, produced by
     #   python -m data_prepare.compute_action_stats --config THIS_CONFIG -o PATH
     # None disables action normalization, which is the historical behaviour: the model
@@ -103,6 +126,9 @@ class TrainConfig(object):
     # Which action space the head predicts in; see models/action_space.py.
     #   "ee_cam"  -- camera-relative SE(3) delta + openness (10 dim). The default and the
     #                only space the released pretrain checkpoints were trained in.
+    #   "ee_base" -- the same 10-dim encoding expressed in the robot's own (world/base)
+    #                frame instead of camera 0's. Needs no extrinsics, which is why it is
+    #                what the vision-action `context_encoder` variants use.
     #   "jointN"  -- absolute joint angles + openness (N+1 dim), "joint" == "joint7".
     # This is not a knob to flip on an existing run: it changes action_dim, so hist_enc /
     # traj_enc / act_head all change shape and no checkpoint crosses the boundary. It also
@@ -279,6 +305,11 @@ class TrainConfig(object):
                 "nothing. Set targets or set the rank back to 0."
                 .format(self.vlm_lora_rank))
 
+        if self.context_encoder not in CONTEXT_ENCODERS:
+            raise ValueError(
+                "unknown context_encoder '{}'; valid choices are {}"
+                .format(self.context_encoder, list(CONTEXT_ENCODERS)))
+
         if self.conv_tower not in CONV_TOWERS:
             raise ValueError(
                 "unknown conv_tower '{}'; valid choices are {}"
@@ -313,6 +344,10 @@ class TrainConfig(object):
             # fail on load -- loudly, but only after the backbones and the simulator are
             # already up. Older config jsons have no such key and fall back to "none".
             conv_tower=self.conv_tower,
+            # Same argument, one level up: this decides which ContextEncoder class is
+            # constructed, so evaluation cannot infer it from the checkpoint's tensors
+            # without guessing. Older config jsons fall back to "vl".
+            context_encoder=self.context_encoder,
         )
 
     def to_json(self) -> str:
@@ -514,6 +549,39 @@ CONFIGS["finetune_real_joint"] = TrainConfig(
 )
 
 
+def _va_variant(base: TrainConfig, context_encoder: str, **overrides) -> TrainConfig:
+    """A vision-action copy of `base`: no language, no camera intrinsics/extrinsics.
+
+    Three fields change together and none of them is optional:
+
+    * `context_encoder` picks the encoder, and with it drops the SigLIP text tower and
+      both uses of calibration (see models/context_encoder.py).
+    * `action_space` must leave "ee_cam" behind -- camera-relative actions need the
+      extrinsics this model no longer receives, and `ActionExpert.__init__` says so.
+      "ee_base" is the same t3r6 + openness encoding in the robot's own frame.
+    * `action_norm_stats` is cleared: the statistics are computed over the *model's*
+      action space, and rebasing the frame changes every translation channel. Recompute
+      with `python -m data_prepare.compute_action_stats --config <this preset>`.
+
+    `lora_rank` and `pretrained_ckpt` are cleared for the same reason: no released
+    checkpoint has these tensors, and LoRA on a randomly initialised trunk adapts nothing.
+    """
+    return replace(
+        base,
+        context_encoder=context_encoder,
+        action_space="ee_base",
+        action_norm_stats=None,
+        lora_rank=0,
+        pretrained_ckpt=None,
+        # rewrapped for the same reason `_flow_variant` does it -- see below
+        dataset_classes=list(base.dataset_classes),
+        dataset_weights=(None if base.dataset_weights is None
+                         else list(base.dataset_weights)),
+        vlm_lora_targets=list(base.vlm_lora_targets),
+        **overrides
+    )
+
+
 def _flow_variant(base: TrainConfig, **overrides) -> TrainConfig:
     """A copy of `base` trained with the flow objective instead of DDIM.
 
@@ -566,6 +634,38 @@ CONFIGS["finetune_real_flow"] = _flow_variant(CONFIGS["finetune_real"])
 #
 # `flow_time_sampling` stays "uniform" (rectified flow's own choice). Reach for
 # "logitnormal" or "beta" only if few-step sampling looks under-converged; see README §3.8.
+# ---------------------------------------------------------------------------
+# Vision-action (VA) presets: no language, no camera parameters.
+#
+# Six presets, one per (dataset, encoder). They are generated rather than written out
+# because the ONLY thing that differs between the three in each row is the encoder --
+# which is the point: the comparison is only meaningful if the data, the schedule, the
+# action space and the objective are held fixed.
+#
+#     va_libero_10_sa            57.40M encoder   language ablation at matched capacity
+#     va_libero_10_transformer   12.42M encoder   \  capacity ablation at matched
+#     va_libero_10_mlp            4.14M encoder   /  modality
+#     va_real_{sa,transformer,mlp}                the same three on a real rig
+#
+# All six train FROM SCRATCH: no released checkpoint contains these tensors, and none
+# could -- the state_dict layouts differ. That is why the real-robot row overrides
+# `finetune_real`'s warm-start schedule (5e-5 / 1e3 warmup / 20e3 iters) with the
+# from-scratch one `finetune_real_joint` already uses.
+#
+# The LIBERO row inherits `finetune_libero_10` unchanged: that preset is already sized
+# for a 1e-4 from-scratch run.
+for _enc in ("sa", "transformer", "mlp"):
+    CONFIGS["va_libero_10_" + _enc] = _va_variant(CONFIGS["finetune_libero_10"], _enc)
+    CONFIGS["va_real_" + _enc] = _va_variant(
+        CONFIGS["finetune_real"], _enc,
+        max_lr=1e-4,
+        num_warmup=int(2e3),
+        ema_start=int(2e3),
+        max_iterations=int(60e3),
+    )
+del _enc
+
+
 CONFIGS["finetune_real_conv_flow"] = _flow_variant(
     CONFIGS["finetune_real_conv"],
     conv_tower_lr_scale=1.0,

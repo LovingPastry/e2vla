@@ -9,7 +9,9 @@ end-effector pose, expressed in the orientation of camera 0 at the latest observ
 timestep, as 3 translation + a 6D rotation, plus a rescaled gripper openness. That
 encoding depends on the DataConfig (which cameras, `sample_state_gaps`, the future
 horizon, whether cameras are shuffled), so the statistics are a property of the
-*config*, not of the dataset on disk. This script therefore builds the very same
+*config*, not of the dataset on disk. Under `action_space="ee_base"` -- what the
+vision-action presets use -- the same delta is expressed in the robot's own frame
+instead, which changes every translation channel: statistics do not cross the two. This script therefore builds the very same
 datasets `train.py` would, draws samples through the very same `DataSampler`, and runs
 the very same `states2action` -- with normalization off, since that is what it is
 measuring.
@@ -39,8 +41,8 @@ import numpy as np
 import torch
 
 from configs import CONFIGS, TrainConfig
-from models.action_norm import ActionNormalizer
-from models.action_space import build_action_space
+from models.action_norm import ActionNormalizer, EE_POSE_LAYOUTS
+from models.action_space import build_action_space, reference_cam_pose
 from data_utils.dataset_base import get_dataloader, generate_sample_weights
 
 
@@ -52,7 +54,8 @@ EE_CHANNEL_NAMES = ["tx", "ty", "tz",
 
 
 def channel_names(action_space):
-    if action_space.layout == "cam_rel_t3r6_openness":
+    # Both EE layouts share the channel meanings; only the frame they live in differs.
+    if action_space.layout in EE_POSE_LAYOUTS:
         return EE_CHANNEL_NAMES
     return ["q{}".format(i) for i in range(action_space.action_dim - 1)] + ["openness"]
 
@@ -135,8 +138,14 @@ def collect_actions(cfg: TrainConfig, args) -> np.ndarray:
         ee_poses = batch["ee_poses"].to(device)             # (B, Nee, 4, 4)
         valid_ee_mask = batch["valid_ee_mask"].to(device)   # (B, Nee)
 
-        # exactly the reference frame ActionExpert.forward uses: camera 0, latest frame
-        current_cam_pose = extrinsics[:, -1][:, 0]  # (B, 4, 4)
+        # exactly the reference frame ActionExpert.forward uses -- camera 0 at the latest
+        # frame under "ee_cam", the identity (i.e. the robot's own frame) under "ee_base".
+        # Shared helper rather than a second copy of the rule: the statistics are defined
+        # over the model's action space, so a divergence here rescales every translation
+        # channel and nothing downstream would report it.
+        current_cam_pose = reference_cam_pose(
+            action_space, extrinsics, batch_size=extrinsics.shape[0],
+            like=ee_poses)  # (B, 4, 4)
 
         valid_ee_per_batch = valid_ee_mask.sum(dim=-1)
         batch_index = torch.cat([torch.empty(n, dtype=torch.long).fill_(b)

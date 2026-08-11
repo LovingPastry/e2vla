@@ -5,6 +5,7 @@ from .vlm import VLM
 from .action_expert import ActionExpert, DEFAULT_OBJECTIVE
 from .action_norm import ActionNormalizer, build_action_normalizer
 from .action_space import ActionSpace, build_action_space
+from .context_encoder import CONTEXT_ENCODER_CLASSES, DEFAULT_CONTEXT_ENCODER
 from .conv_tower import CONV_LR_KEYS
 
 
@@ -33,11 +34,30 @@ class VLA(nn.Module):
         # "none" / None keeps the original two-tower vision path. Anything else adds a
         # trainable CNN branch inside the ContextEncoder -- see models/conv_tower.py.
         conv_tower: Optional[str] = None,
+        # Which context encoder sits between the frozen backbones and the action head.
+        # "vl" is the original vision-language one; the other three are vision-action
+        # (no language, no camera parameters) -- see models/context_encoder.py.
+        context_encoder: str = DEFAULT_CONTEXT_ENCODER,
     ):
         super().__init__()
         self.action_space = build_action_space(action_space)
         self.objective = objective
-        self.vlm = VLM()
+
+        # Read off the encoder CLASS, before anything is constructed: the VLM has to know
+        # whether to build a text tower, and `self.vlm` must stay the first registered
+        # submodule. That order is load-bearing -- `ExponentialMovingAverage` and
+        # `optimizer.load_state_dict` match parameters positionally, so building the actor
+        # first would silently misalign every existing EMA shadow and every `-c` resume of
+        # a run with VLM LoRA. Same reasoning as `ContextEncoderBase.__init__`.
+        if context_encoder not in CONTEXT_ENCODER_CLASSES:
+            raise ValueError("unknown context_encoder '{}'; valid choices are {}"
+                             .format(context_encoder, list(CONTEXT_ENCODER_CLASSES)))
+        encoder_cls = CONTEXT_ENCODER_CLASSES[context_encoder]
+        self.context_encoder_name = context_encoder
+        self.uses_language = encoder_cls.uses_language
+        self.uses_camera_params = encoder_cls.uses_camera_params
+
+        self.vlm = VLM(use_language=self.uses_language)
         self.actor = ActionExpert(
             hdim=hdim,
             num_heads=num_heads,
@@ -52,6 +72,7 @@ class VLA(nn.Module):
             flow_time_sampling=flow_time_sampling,
             flow_time_alpha=flow_time_alpha,
             conv_tower=conv_tower,
+            context_encoder=context_encoder,
         )
 
         self.reset_parameters()
@@ -115,13 +136,13 @@ class VLA(nn.Module):
         return decay, no_decay, conv_decay, conv_no_decay
 
     def forward(
-        self, 
+        self,
         rgbs: Tensor,
-        obs_norm_xys: Tensor,
-        obs_extrinsics: Tensor, 
-        prompt_text: Optional[Tensor], 
+        obs_norm_xys: Optional[Tensor],
+        obs_extrinsics: Optional[Tensor],
+        prompt_text: Optional[Tensor],
 
-        ee_poses: Tensor, 
+        ee_poses: Tensor,
         history_actions: Tensor, 
         future_actions: Tensor, 
         valid_ee_mask: Tensor, 
@@ -134,8 +155,10 @@ class VLA(nn.Module):
             obs_norm_xys: (B, To, ncam, 2, H, W)，归一化相机平面上的坐标
                 * 即逐像素的 ((u,v) - (cx,cy)) / (fx,fy)，等价于把像素反投影到 z=1 平面
                 * 与外参一起用于构造 Plücker 射线位置编码
-            obs_extrinsics: (B, To, ncam, 4, 4)，相机外参 ^{world}_{camera} T
+                * 视觉-动作模型（context_encoder != "vl"）下会被下面直接置 None
+            obs_extrinsics: (B, To, ncam, 4, 4)，相机外参 ^{world}_{camera} T，同上
             prompt_text: (B, Lang, E) 或 None，语言指令
+                * context_encoder != "vl" 时同样被置 None，SigLIP 文本塔根本没有构建
 
             ee_poses: (B, Nee, 4, 4)，当前末端位姿 ^{world}_{ee} T
             history_actions: (B, nhist, Nee, 4*4+1)，世界坐标系下的历史末端状态
@@ -159,6 +182,16 @@ class VLA(nn.Module):
             loss (Tensor): 标量张量
             metrics (Dict[str, Tensor]): 用于记录的指标
         """
+        # Dropped here, at the one place every caller goes through, rather than asking
+        # train.py / planner.py / compute_action_stats to each remember not to pass them.
+        # The dataset still produces intrinsics and a prompt -- they are simply not part
+        # of this model's input, and making that structural is what "完全不使用" means.
+        if not self.uses_camera_params:
+            obs_norm_xys = None
+            obs_extrinsics = None
+        if not self.uses_language:
+            prompt_text = None
+
         vl_obs, vl_feature = self.vlm(
             rgbs=rgbs,
             obs_norm_xys=obs_norm_xys,
@@ -199,6 +232,7 @@ def _build_vla(
     flow_time_sampling: str = "uniform",
     flow_time_alpha: float = 1.5,
     conv_tower: Optional[str] = None,
+    context_encoder: str = DEFAULT_CONTEXT_ENCODER,
 ):
     hdim, num_heads = VLA_SIZES[size]
     return VLA(
@@ -214,6 +248,7 @@ def _build_vla(
         flow_time_sampling=flow_time_sampling,
         flow_time_alpha=flow_time_alpha,
         conv_tower=conv_tower,
+        context_encoder=context_encoder,
     )
 
 
@@ -232,11 +267,16 @@ def vla_base(**kwargs):
 
 
 
-def count_parameters():
+def count_parameters(context_encoder: str = DEFAULT_CONTEXT_ENCODER,
+                     action_space: Optional[str] = None, verbose: bool = True):
     # model = vla_tiny()
     # model = vla_small()
-    model = vla_base()
-    print(model)
+    if action_space is None:
+        # every VA encoder refuses a camera-relative action space, see ActionExpert
+        action_space = "ee_cam" if context_encoder == "vl" else "ee_base"
+    model = vla_base(context_encoder=context_encoder, action_space=action_space)
+    if verbose:
+        print(model)
 
     modules = [
         model
@@ -250,9 +290,14 @@ def count_parameters():
             if p.requires_grad:
                 num_trainable += p.numel()
 
-    print("[INFO] Total {:.3f}M parameters, {:.3f}M frozen, {:.3f}M trainable"
-          .format(num_total / 1e6, (num_total - num_trainable) / 1e6, num_trainable / 1e6))
+    print("[INFO] context_encoder={} action_space={}: total {:.3f}M parameters, "
+          "{:.3f}M frozen, {:.3f}M trainable"
+          .format(context_encoder, action_space, num_total / 1e6,
+                  (num_total - num_trainable) / 1e6, num_trainable / 1e6))
+    return num_trainable
 
 
 if __name__ == "__main__":
-    count_parameters()
+    import sys
+    # python -m models.vla [vl|sa|transformer|mlp]
+    count_parameters(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_CONTEXT_ENCODER)

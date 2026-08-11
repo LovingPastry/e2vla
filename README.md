@@ -829,3 +829,85 @@ while not done:
 episode 之间的 `controller.reset()` 不是可选的:ensembler 是按时间戳索引的,而新 episode 的时间戳会重新从 0 开始,不 reset 的话上一条 episode 的残留 chunk 会被混进新 episode 的最初几个动作里。
 
 `obs_frame` 使用与 HDF5 转换相同的 schema —— 精确的 dict 布局见 `TrajPlanner.add_obs_frame` 的 docstring,完整示例见 `examples/libero/eval.py` 里的 `obs_libero2ours`。
+
+
+# 视觉-动作(VA)模型:去掉语言,去掉相机内外参
+
+前面所有内容描述的都是 `context_encoder="vl"`,即"视觉 + 语言 + 标定"的原始架构。这一节是另一条支线:把模型砍成纯粹的**像素 → 动作**策略,不读指令、不读相机内参、不读外参。单任务场景下这三样东西都不产生泛化,却各自带来一份成本(文本塔 110M 显存、标定误差进入动作链路、多相机 FOV 依赖),所以值得单独有一套可对照的实现。
+
+代码入口是 `models/context_encoder.py`,四个编码器共用一个契约(`forward(vl_obs, vl_feature, fp16) -> (cond, cond_mask)`,`cond` 形状 `(B, Lc, hdim)`),`DiffusionHead` 完全不知道自己接的是哪一个:
+
+| `context_encoder` | 语言 | 相机参数 | 编码器参数量 | 整模型可训练量 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| `vl` | 有 | 有(PRoPE) | 60.95M | 102.34M | 原始架构,发布的预训练权重都是它 |
+| `sa` | **无** | **无** | 57.40M | 98.80M | 拓扑不变,语言交叉注意力 → 第二次自注意力 |
+| `transformer` | **无** | **无** | 12.42M | 53.82M | 单个自注意力栈 + 平均池化到 64 token |
+| `mlp` | **无** | **无** | 4.14M | 45.54M | 逐 token MLP + 池化,完全没有注意力 |
+
+## 两个变体各自回答什么问题
+
+**`sa`(容量对齐的语言消融)。** 每一处原来读文本 token 的地方都改读视觉 token 自己:`pre_attn` 里 `DiTBlock` 的 cross-attn 传 `c=None`,于是它对 x 自身再做一次注意力(`CrossAttentionLayer` 的 Q 与 KV 投影是分开的两个矩阵,参数量一个不少);QFormer 换成 `QFormerVision`,原来在 `[query ; text]` 上做的自注意力退化成只在 query 上做。真正消失的只有 `proj_l`(1.18M)和 QFormer 的 `ffn_text`(2.36M),合计 3.5M / 5.8%。深度、宽度、层数都没动,所以它和 `vl` 的成功率差距可以归因到"没有指令"这一件事上,而不是"网络变小了"。
+
+**`transformer` / `mlp`(模态对齐的容量消融)。** 两者都保留投影 stem 和 64 token 的输出,砍掉的是中间那套三段式融合。`transformer` 让所有相机的 patch 在全分辨率下互相看一次(`num_context_layers // 4` 层),然后平均池化;`mlp` 连注意力都不要,只有逐 token 的 MLP,patch 之间唯一的混合就是池化里的那个均值。注意池化放在注意力**之后**:放在前面能省 8 倍算力,但也就等于在网络开始推理之前先把空间分辨率钉死了。
+
+如果 `mlp` 在某个任务上追平了 `vl`,那说明这个任务的上下文根本不需要空间推理,那 61M 的融合栈没买到任何东西 —— 这正是这一档存在的意义。
+
+## 相机参数是怎么被彻底移除的
+
+原编码器消费标定的地方有两处,`proj_pe(norm_xy_ds)` 用内参 K,PRoPE 用外参。三个 VA 变体:
+
+* **内参** 换成按 patch 网格生成的固定 `[-1, 1]` 栅格(`ContextEncoderBase.token_xy`)。对理想针孔而言两者只差一个逐相机的仿射,而 `proj_pe` 是个学出来的 MLP,第一层线性就能吸收掉。真正丢掉的是"不同 FOV 的相机应该有不同位置编码"这条信息。
+* **外参** 直接不用。`pe_type` 换成 `"rope"` 且不传 `x_pe`,等价于不加任何乘性位置编码(两者都无参数,所以 state_dict 不变)。
+
+连带的影响不在编码器里,而在**动作空间**上:没有外参就没有相机坐标系可以表达动作,所以 VA 变体必须配 `action_space="ee_base"`(新增)或关节空间。`ee_base` 就是把 `space_ee2cam` 的 `cur_wcT` 换成单位阵:同样的 3 平移 + 6D 旋转 + 夹爪,同样的平移不变性,只是表达在机器人自己的基座(世界)坐标轴里而不是相机坐标轴里。固定第三人称相机的单任务设定下这往往还更合适 —— 世界坐标轴在整段轨迹里恒定,相机坐标轴会跟着相机一起转。
+
+`ActionExpert.__init__` 会拒绝"无相机参数的 context_encoder + `ee_cam`"这个组合。别绕过它:默默塞一个单位阵会在不改动任何张量名字和形状的前提下改变 checkpoint 里动作的含义,这正是 §3.7 那两道戳存在的理由。`ee_base` 的 `layout` 因此也单独取名 `base_rel_t3r6_openness`,统计文件必须按新空间重算。
+
+## 怎么跑
+
+六个预设,`va_{libero_10,real}_{sa,transformer,mlp}`,同一行里除编码器外一切相同(数据、schedule、动作空间、objective),这样对照才有意义。都是**从零训**:没有任何已发布的 checkpoint 含有这些张量,`--pretrained_ckpt` 也不该指向 `vl` 的权重(`check_context_encoder` 会拦)。
+
+```bash
+# LIBERO-10,三个变体各跑一个
+CUDA_VISIBLE_DEVICES=0 python train.py --config va_libero_10_sa          -s VA_SA
+CUDA_VISIBLE_DEVICES=1 python train.py --config va_libero_10_transformer -s VA_TF
+CUDA_VISIBLE_DEVICES=2 python train.py --config va_libero_10_mlp         -s VA_MLP
+
+# 想和原始 VLA 对照,就在同一份数据上再跑一个 vl(它用 ee_cam)
+CUDA_VISIBLE_DEVICES=3 python train.py --config finetune_libero_10 -s VL_BASE
+
+# 真机数据同理
+CUDA_VISIBLE_DEVICES=0 python train.py --config va_real_sa -s VA_REAL_SA
+
+# 在任意预设上直接覆盖也行(tyro 接管 --config 之后的所有参数),但两个字段必须一起改
+CUDA_VISIBLE_DEVICES=0 python train.py --config finetune_libero_10 \
+  --context_encoder mlp --action_space ee_base -s VA_ADHOC
+```
+
+动作归一化(§3.6)要在新空间上重算,`ee_cam` 的统计文件在这里是错的:
+
+```bash
+python -m data_prepare.compute_action_stats --config va_libero_10_sa \
+  -o ./action_stats/libero_10_ee_base.json
+python train.py --config va_libero_10_sa \
+  --action_norm_stats ./action_stats/libero_10_ee_base.json -s VA_SA_NORM
+```
+
+评测和 `vl` 完全一样,三进程不变:
+
+```bash
+pyro4-ns
+CUDA_VISIBLE_DEVICES=0 python -m infer_utils.remote_service \
+  --ckpt ./checkpoints/E2VLA/VA_SA/ckpt_xxxxxxx.pt --uri VA_SA
+python -m examples.libero.eval --task_suite libero_10 --uri VA_SA --save --video
+```
+
+`set_prompt()` 仍然可以调(评测脚本不用改),只是策略不看它 —— planner 会打一行 `[INFO] ... reads no language; the prompt is ignored.` 提醒你。同样,内参在推理时压根不会被计算(`_make_data_for_infer` 跳过 `gen_norm_xy_map`),外参只留给轨迹可视化用。
+
+## 几个不显然的点
+
+* **`lora_rank` 对 `mlp` 无意义**,因为它没有任何注意力投影可以注入。`setup_lora` 会直接报错而不是"注入 0 个然后把整个编码器冻住"—— 后者会打印 `LoRA rank=16` 并训练 0.1% 的参数。六个 VA 预设都把 `lora_rank` 设成 0(从零训也没有可分解的预训练基座)。
+* **`conv_tower` 四个变体都支持**,stem 是共用的,`proj_v.2` / `proj_fuse` / `conv_tower` 三个 key 名字也没变。
+* **`vl` 这条路径没有任何行为变化**:类从 `action_expert.py` 挪到了 `context_encoder.py`,但 228 个张量的名字逐一相同,同权重同输入的前向输出逐位相同,已发布的 checkpoint 照常加载。
+* **checkpoint 多了第五道戳** `context_encoder`。不带这个字段的 checkpoint 一律按 `"vl"` 读。它比另外四道戳弱一些(四个编码器的 state_dict 布局本来就不同,严格加载会自己报错),存在的意义是 `pretrained_strict=False` 会把整份逐张量报告一次性放行 —— 那时一个 `vl` 的 checkpoint 加载进 `sa` 只会贡献投影 stem,看起来像热启动,实际 94% 是冷的。
+* **`sample/*`(§3.9)是唯一可以跨变体比较的训练期指标**,它是米和度。loss 不行:`ee_base` 和 `ee_cam` 的平移通道量纲不同。

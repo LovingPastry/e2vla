@@ -7,9 +7,15 @@ E2VLA: a diffusion-transformer VLA. Frozen SigLIP + DINOv2 + SigLIP-text → `Co
 denoises a chunk of end-effector actions. Pretrain on DROID/ManiSkill/MetaWorld, fine-tune +
 evaluate on LIBERO, or fine-tune on your own robot.
 
-`README.md` is the long-form manual (Chinese, ~600 lines) and is *current* — sections §3.5–§3.7
-document LoRA, action normalization and the joint/EE action-space split in detail. Code comments
-are a mix of English and Chinese; match the file you are editing.
+`TrainConfig.context_encoder` also selects three **vision-action** variants of that middle stage
+(`"sa"` / `"transformer"` / `"mlp"`): no language, no camera intrinsics or extrinsics, and
+`action_space="ee_base"` instead of `"ee_cam"`. `"vl"` — the default and everything the released
+checkpoints use — is unchanged. See `models/context_encoder.py` and README's last section.
+
+`README.md` is the long-form manual (Chinese, ~700 lines) and is *current* — sections §3.5–§3.7
+document LoRA, action normalization and the joint/EE action-space split in detail, and the final
+section covers the vision-action variants. Code comments are a mix of English and Chinese; match
+the file you are editing.
 
 ---
 
@@ -89,8 +95,9 @@ out of the checkpoint. Results → `./eval_results/`, videos → `./eval_videos/
 ### Self-tests (no test framework; each is a `__main__` block)
 
 ```bash
-python -m models.vla                  # parameter counts for vla_base
-python -m models.action_expert        # parameter count for the action expert alone
+python -m models.vla [vl|sa|transformer|mlp]   # parameter counts for vla_base
+python -m models.context_encoder      # per-variant context-encoder parameter counts
+python -m models.action_expert        # action-expert counts, one line per context encoder
 python -m models.action_norm          # normalize/unnormalize round-trip
 python -m data_utils.dataset_real     # __getitem__ output-contract + unit checks (see below)
 python -m models.encoders.siglip
@@ -111,14 +118,30 @@ Degrees vs radians never errors during training, it just makes the normalization
 **`models/vlm.py`** — SigLIP (`google/siglip-base-patch16-256`, vision + text) and DINOv2
 (`dinov2_vitb14_reg` via `torch.hub`, so `HF_ENDPOINT` does *not* apply to it — see the class
 docstring for the offline path). Both are frozen and `VLM.train()` pins them to eval. Only the
-latest frame is used (`[:, -1]`) even though tensors carry a history axis.
+latest frame is used (`[:, -1]`) even though tensors carry a history axis. `VLM(use_language=False)`
+*deletes* SigLIP's text tower rather than leaving it unused, and every one of `obs_norm_xys` /
+`obs_extrinsics` / `prompt_text` may be None.
 
-**`models/action_expert.py`** — two modules and the action-encoding functions:
-- `ContextEncoder` (~60% of params): projects both vision towers into `hdim` and sums → additive
-  2D PE (`proj_pe`, zero-init) → `pre_attn` self-attn over *all cameras' patches jointly*,
-  cross-attn to language, with **PRoPE** (multiplicative camera-pose PE) → QFormer compresses to
-  64 queries → `post_attn`. Camera poses are rebased onto camera 0 at the latest timestep so the
-  world origin never leaks in; `main_cam_embed` tags camera 0's tokens.
+**`models/context_encoder.py`** — four interchangeable encoders behind one contract
+(`forward(vl_obs, vl_feature, fp16) -> (cond, cond_mask)`), selected by
+`TrainConfig.context_encoder`. `VLContextEncoder` ("vl", 60.95M) is the original vision-language
+path, moved here unchanged — same 228 tensor names, bit-identical forward. The other three are
+vision-action: no language, **no intrinsics and no extrinsics**. `SelfAttnContextEncoder` ("sa",
+57.40M) keeps the topology and turns every cross-attention into the text tokens into a second
+self-attention over the vision tokens (`DiTBlock` with `c=None`, `QFormerVision`);
+`TransformerContextEncoder` ("transformer", 12.42M) is one self-attention stack then average
+pooling to 64 tokens; `MLPContextEncoder` ("mlp", 4.14M) drops attention entirely. The shared
+projection stem lives on `ContextEncoderBase` as a *base class*, not a submodule, so the
+state_dict keys stay flat. See README's last section.
+
+**`models/action_expert.py`** — the head, the action-encoding functions, and the wiring:
+- `ContextEncoder` used to live here; `ActionExpert` now builds one via `build_context_encoder`.
+  Whatever the variant, it projects both vision towers into `hdim` and sums → additive
+  2D PE (`proj_pe`, zero-init) → fusion → 64 context tokens.  Under "vl" the fusion is
+  `pre_attn` self-attn over *all cameras' patches jointly*, cross-attn to language, with **PRoPE**
+  (multiplicative camera-pose PE) → QFormer → `post_attn`; camera poses are rebased onto camera 0
+  at the latest timestep so the world origin never leaks in. `main_cam_embed` tags camera 0's
+  tokens in every variant.
   Optionally a *third*, **trainable** vision stream (`TrainConfig.conv_tower`, off by default):
   `models/conv_tower.py` runs ResNet18 truncated after `layer2` over the raw RGB and
   `proj_fuse` concatenates it with the ViT sum. See "Things that fail silently" below —
@@ -173,16 +196,28 @@ work around them.
   calibration, fill `obs_extrinsics` with identity for the *whole* episode (degenerates to base
   frame, self-consistent) and set `shuffle_cameras=False`, never a mix of real and fake. `pe_type`
   is parameter-free, so switching it does not change the `state_dict` — a checkpoint still
-  "loads", the PE just means something else and training stops converging.
-- **Four stamps guard checkpoint compatibility** (`train_utils/ckpt.py`), all for the same reason:
+  "loads", the PE just means something else and training stops converging. The principled version
+  of the same degeneracy is `action_space="ee_base"` + a vision-action `context_encoder`, which
+  reads no calibration at all and *stamps* that fact into the checkpoint.
+- **A camera-free encoder forbids `ee_cam`, loudly.** `ActionExpert.__init__` raises rather than
+  substituting identity extrinsics: the substitution changes what every stored action means while
+  changing no tensor name or shape. `reference_cam_pose` (`models/action_space.py`) is the single
+  place that rule lives, shared by the model and `compute_action_stats` so the statistics cannot
+  be measured in a different frame from the one trained in.
+- **Five stamps guard checkpoint compatibility** (`train_utils/ckpt.py`), all for the same reason:
   the offending checkpoint has identical tensor names and shapes.
   - `objective` (`"ddim"` / `"flow"`, set by `TrainConfig.objective`) — the same network under two
     generative objectives, so they share every tensor name and shape. Raises unconditionally; the
     deliberate cross-objective path is `pretrained_ignore_objective`, which transfers the trunk (96.5%
     of the expert) and re-zeroes `act_head`'s output Linear. Released pretrain checkpoints predate the
     stamp, so a *missing* key means DDIM.
-  - `action_layout` (`cam_rel_t3r6_openness` / `abs_joint7_openness`) — two action spaces can have
-    the same channel count (a 9-axis arm's joint space is also 10-dim).
+  - `action_layout` (`cam_rel_t3r6_openness` / `base_rel_t3r6_openness` / `abs_joint7_openness`) —
+    two action spaces can have the same channel count (a 9-axis arm's joint space is also 10-dim),
+    and the two EE layouts differ only in which frame the 10 channels live in.
+  - `context_encoder` (`"vl"` / `"sa"` / `"transformer"` / `"mlp"`) — the weakest of the five, since
+    the four encoders have different module trees and a strict load already fails. It exists
+    because `pretrained_strict=False` waves the whole per-tensor report through at once, and a "vl"
+    checkpoint then contributes only its projection stem to an "sa" run. A missing key means "vl".
   - `action_norm` — a checkpoint trained on normalized actions loads into an un-normalized model
     with zero missing keys and executes actions off by an affine.
   - `vlm_lora_rank` / `vlm_lora_targets` — the backbones are never serialized (rebuilt from

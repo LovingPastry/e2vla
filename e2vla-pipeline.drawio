@@ -1,0 +1,100 @@
+<mxGraphModel adaptiveColors="auto" dx="1400" dy="1500" grid="0" page="1" pageWidth="1400" pageHeight="1500">
+  <root>
+    <mxCell id="0"/>
+    <mxCell id="1" parent="0"/>
+
+    <mxCell id="title" value="&lt;b&gt;E2VLA 推理全流程：多路 RGB + 语言 + 本体状态 → 控制器指令&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;基准配置 vla_base (hdim 768 / 12 头)，ncam=2，nee=1，To=1，nhist=1，Ta=32，图像 256×256&lt;/font&gt;" style="text;html=1;align=center;verticalAlign=middle;fontSize=17;fillColor=none;strokeColor=none;" vertex="1" parent="1">
+      <mxGeometry x="140" y="10" width="900" height="50" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s1" value="&lt;b&gt;① 传感器输入契约&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;infer_utils/planner.py : add_obs_frame / set_prompt&lt;/font&gt;&lt;br&gt;&lt;br&gt;• 多路 RGB (H,W,3) ＋ 内参 K ＋ 外参 wcT (world←cam)&lt;br&gt;&nbsp;&nbsp;&nbsp;camera_names[0] = 第三人称，&lt;b&gt;定义整个动作坐标系&lt;/b&gt;&lt;br&gt;• 本体状态：ee_pose (4,4) world←ee，gripper ∈ [0,1]&lt;br&gt;• 语言指令：prompt_text（每 episode 设一次）&lt;br&gt;• timestamp → 维护观测环形缓冲" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="140" y="80" width="470" height="150" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s2" value="&lt;b&gt;② 观测预处理&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;data_utils/dataset_base.py : DataSampler.sample_framedict (latest=True)&lt;/font&gt;&lt;br&gt;&lt;br&gt;• 图像：按 sample_camera_gaps 取窗（最近邻，不插值）&lt;br&gt;&nbsp;&nbsp;&nbsp;scale_to_fit + center_crop → 256×256，&lt;b&gt;K 同步变换&lt;/b&gt;，uint8/255&lt;br&gt;• 状态：align_data 插值（位姿 interp_SE3_sep，夹爪 interp_linear）&lt;br&gt;• gen_norm_xy_map：逐像素 ((u,v)−c)/f，反投影到 z=1 平面&lt;br&gt;• pad2ncam / pad2nee → valid_ee_mask" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="140" y="270" width="470" height="155" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s3" value="&lt;b&gt;③ 冻结 VLM（无梯度，train() 恒为 eval）&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;models/vlm.py + models/encoders/{dino,siglip}.py&lt;/font&gt;&lt;br&gt;&lt;br&gt;• DINOv2 ViT-B/14-reg：resize 224 → 16×16 patch → (ncam,256,768)&lt;br&gt;• SigLIP-vision patch16-256：resize 256 → 16×16 → (ncam,256,768)&lt;br&gt;• SigLIP-text：定长 64 token → (64,768)&lt;br&gt;• AvgPool(16)：norm_xy_ds → (ncam,256,2)，与 patch 行主序对齐&lt;br&gt;• 只取最新帧 [:, −1]：历史图像不进模型" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="60" y="470" width="490" height="155" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s4" value="&lt;b&gt;④ ContextEncoder（≈60% 可训练参数）&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;models/action_expert.py : ContextEncoder&lt;/font&gt;&lt;br&gt;&lt;br&gt;• 外参重定基到「相机0 @ 最新时刻」，消掉世界原点&lt;br&gt;• proj_v 双塔投影相加（可选 ResNet18 conv 分支，proj_fuse = [I | 0]）&lt;br&gt;• ＋ proj_pe(norm_xy_ds)：加性 2D 位置编码（零初始化）&lt;br&gt;• pre_attn DiT×4：跨相机 512 token &lt;b&gt;联合自注意&lt;/b&gt;（PRoPE 乘性位姿 PE）&lt;br&gt;&nbsp;&nbsp;&nbsp;＋ 对语言的交叉注意&lt;br&gt;• ＋ main_cam_embed 标记相机0 的 token&lt;br&gt;• QFormer：512 → &lt;b&gt;64 query&lt;/b&gt; 压缩 → post_attn×4" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="60" y="665" width="490" height="195" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s5" value="&lt;b&gt;⑤ 本体状态 → 模型动作空间&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;action_expert.py : states2action / space_ee2cam&lt;/font&gt;&lt;br&gt;&lt;br&gt;1. space_ee2cam&lt;br&gt;&nbsp;&nbsp;&nbsp;ΔT = inv(T_world←e1) · T_world←e2&lt;br&gt;&nbsp;&nbsp;&nbsp;再用 R_cam←ee 共轭旋到相机轴系&lt;br&gt;&nbsp;&nbsp;&nbsp;→ t3 ＋ r6（6D 旋转）&lt;br&gt;2. 夹爪 [0,1] → [−1,1]&lt;br&gt;3. ActionNormalizer：q01/q99 仿射 → ≈[−1,1]&lt;br&gt;&lt;br&gt;&lt;b&gt;action_dim = 10&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="640" y="470" width="360" height="215" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s6" value="&lt;b&gt;⑥ DiffusionHead ── 去噪 / 积分循环（每步一次网络评估）&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;action_expert.py : DiffusionHead.forward + sample_actions&lt;/font&gt;&lt;br&gt;&lt;br&gt;起点 x ~ N(0, I)，形状 (Ta=32, 10)&lt;br&gt;• denoising_time_embed(t) → film 驱动 adaLN　&lt;i&gt;（去噪时间）&lt;/i&gt;&lt;br&gt;• hist_enc(前 9 维，&lt;b&gt;刻意丢掉夹爪&lt;/b&gt;) ＋ traj_enc → 拼成 1+32 = 33 token&lt;br&gt;• ＋ traj_time_embed（chunk 内位置）　&lt;i&gt;（另一个「时间」）&lt;/i&gt;&lt;br&gt;• ＋ abs_pos_enc(pos_rel2abs)：相机系绝对末端位置&lt;br&gt;• traj_context_attn DiT×4（adaLN）→ 交叉注意 cond → act_head&lt;br&gt;&lt;br&gt;&lt;b&gt;DDIM：20 步，预测 ε　　|　　Flow：Euler 10 步，预测速度场&lt;/b&gt;&lt;br&gt;只读出后 32 个 token → (Ta, 10)" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="230" y="920" width="620" height="215" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="loop" value="&lt;b&gt;循环 N 步&lt;/b&gt;&lt;br&gt;cond / history&lt;br&gt;只算一次" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;dashed=1;fontSize=11;" vertex="1" parent="1">
+      <mxGeometry x="900" y="975" width="110" height="70" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s7" value="&lt;b&gt;⑦ 解码回世界系&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;action_expert.py : action2states / space_cam2ee&lt;/font&gt;&lt;br&gt;&lt;br&gt;反归一化 → rotation_6d_to_matrix（Gram-Schmidt）→ space_cam2ee → 夹爪 [−1,1]→[0,1]&lt;br&gt;无效 ee 槽位填单位阵（填零会让下游 inverse 出 NaN）&lt;br&gt;&lt;b&gt;→ (Ta, nee, 17) = 展平 4×4 世界系位姿 ＋ 夹爪开合度&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="230" y="1180" width="620" height="120" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s8" value="&lt;b&gt;⑧ 输出与执行&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;planner.py : get_action / ensemble_traj　+　examples/libero/eval.py&lt;/font&gt;&lt;br&gt;&lt;br&gt;• scatter 回机器人自身 ee 编号；future_time = (1…Ta) · sample_dt · sample_state_gaps&lt;br&gt;• TrajEnsembler：与仍重叠的历史 chunk 插值后按 0.1 → 1.0 权重加权平均&lt;br&gt;• 转控制器指令：OSC 增量 (Δpos, Δ轴角 / action_scale, 夹爪 ∓1) 或关节目标&lt;br&gt;• &lt;b&gt;只执行前 substep 步（默认 3）→ 立即重规划&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=12;spacingTop=8;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="230" y="1345" width="620" height="130" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="note1" value="&lt;b&gt;⚠ 全程唯一的「帧」&lt;/b&gt;&lt;br&gt;&lt;br&gt;camera_names[0] 在最新时刻的位姿：&lt;br&gt;• space_ee2cam 用它编码动作&lt;br&gt;• main_cam_embed 标记它的 token&lt;br&gt;• 外参以它为原点重定基&lt;br&gt;&lt;br&gt;三处必须指同一路相机 —— 相机顺序反了，loss 照样收敛，机器人沿错误轴运动。" style="rounded=0;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=6;fillColor=#f8cecc;strokeColor=#b85450;dashed=1;fontSize=11;" vertex="1" parent="1">
+      <mxGeometry x="1040" y="665" width="300" height="180" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="note2" value="&lt;b&gt;训练分支（train.py）&lt;/b&gt;&lt;br&gt;&lt;br&gt;真值 future_actions 走&lt;b&gt;同一个&lt;/b&gt; states2action，&lt;br&gt;加噪后做&lt;b&gt;单步&lt;/b&gt;回归（不跑采样循环）：&lt;br&gt;• ddim：目标 = ε&lt;br&gt;• flow：x_t=(1−t)·noise+t·a，目标 = a − noise&lt;br&gt;&lt;br&gt;loss = 30·pos + 10·rot + 10·夹爪（L1）&lt;br&gt;&lt;i&gt;两种 objective 的 loss 数值不可比&lt;/i&gt;" style="rounded=0;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=6;fillColor=#f5f5f5;strokeColor=#999999;dashed=1;fontSize=11;" vertex="1" parent="1">
+      <mxGeometry x="1040" y="920" width="300" height="185" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e12" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;" edge="1" parent="1" source="s1" target="s2">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e23" value="rgbs / norm_xys / extrinsics / prompt" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="s2" target="s3">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e25" value="ee_poses / history_actions" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.85;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;fontSize=10;dashed=1;" edge="1" parent="1" source="s2" target="s5">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e34" value="vision_embeds ×2 / lang_embeds / norm_xy_ds / extrinsics" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="s3" target="s4">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e46" value="cond (128, 768)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.25;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;fontSize=11;" edge="1" parent="1" source="s4" target="s6">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e56" value="history (nhist, 10)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.8;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;fontSize=11;" edge="1" parent="1" source="s5" target="s6">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e6loop" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;dashed=1;endArrow=none;strokeColor=#d6b656;" edge="1" parent="1" source="s6" target="loop">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e67" value="pred_actions (Ta, 10)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;fontSize=11;" edge="1" parent="1" source="s6" target="s7">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e78" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeWidth=2;" edge="1" parent="1" source="s7" target="s8">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e81" value="下一控制周期：执行后的新观测回灌 add_obs_frame" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;dashed=1;strokeWidth=2;strokeColor=#6c8ebf;fontSize=11;verticalAlign=middle;" edge="1" parent="1" source="s8" target="s1">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points">
+          <mxPoint x="30" y="1410"/>
+          <mxPoint x="30" y="155"/>
+        </Array>
+      </mxGeometry>
+    </mxCell>
+
+  </root>
+</mxGraphModel>

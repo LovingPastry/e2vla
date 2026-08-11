@@ -89,6 +89,47 @@ def check_action_layout(ckpt: dict, layout: str, what: str = "checkpoint"):
     return stored
 
 
+def check_context_encoder(ckpt: dict, context_encoder: str, what: str = "checkpoint"):
+    """Verify a checkpoint's context encoder is the one this run builds.
+
+    Unlike `check_objective`, most mismatches here WOULD be caught by the state_dict
+    layout check -- the four encoders have genuinely different module trees. This exists
+    for the two cases where that is not enough:
+
+    * `pretrained_strict=False` (and `--pretrained_ignore_action_layout`, which requires
+      it) waves the whole per-tensor report through at once. A "vl" checkpoint loaded
+      into an "sa" model then quietly contributes only its projection stem, and the run
+      looks like a warm start while being ~94% a cold one.
+    * the *semantics* of a tensor set can differ without its names doing so. "sa" and a
+      hypothetical future language-free variant of "vl" would share every key.
+
+    It also documents in one line what the checkpoint is, which matters more here than
+    for the other stamps: whether a policy reads its instruction is not something you can
+    recover from the weights.
+
+    Args:
+        ckpt: the loaded checkpoint dict
+        context_encoder: `TrainConfig.context_encoder` for the current run
+        what: label used in messages
+
+    Returns:
+        str, the checkpoint's context encoder
+    """
+    from models.context_encoder import DEFAULT_CONTEXT_ENCODER
+    stored = ckpt.get("context_encoder", DEFAULT_CONTEXT_ENCODER)
+    if stored != context_encoder:
+        raise ValueError(
+            "context encoder mismatch: the {} was trained with '{}', but this run is "
+            "configured for '{}'. These are different networks -- and different input "
+            "modalities: '{}' {} language and {} camera parameters.\n\n"
+            "Set `context_encoder` in the config to match the checkpoint. There is no "
+            "conversion; only the projection stem is shared."
+            .format(what, stored, context_encoder, stored,
+                    "reads" if stored == "vl" else "does not read",
+                    "uses" if stored == "vl" else "does not use"))
+    return stored
+
+
 def check_action_norm(ckpt: dict, action_norm, what: str = "checkpoint",
                       strict: bool = True):
     """Verify a checkpoint's action normalization matches the one being used.

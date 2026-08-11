@@ -34,11 +34,11 @@ class DiTBlock(nn.Module):
         )
     
     def forward(
-        self, 
+        self,
         x: Tensor,
         x_pe: Optional[Tensor],
         x_mask: Optional[Tensor],
-        c: Tensor,
+        c: Optional[Tensor],
         c_mask: Optional[Tensor],
         film: Optional[Tensor],
         x_pe_inv: Optional[Tensor] = None,
@@ -51,10 +51,16 @@ class DiTBlock(nn.Module):
             film=film,
             query_pe_inv=x_pe_inv
         )
-        # cross attn
+        # cross attn -- or, when there is no conditioning sequence, a SECOND self-attention
+        # over x. `c=None` is what the vision-action context encoder passes: dropping the
+        # language stream leaves nothing to cross-attend to, and re-attending to x keeps
+        # every parameter of this block (`CrossAttentionLayer` projects Q and KV
+        # separately, so the tensor names and shapes are unchanged) instead of deleting
+        # half the depth. The value is the *current* x, not the block's input, which is
+        # what makes this a real second attention rather than a stale re-read.
         x, c_mask = self.cross_attn(
             query=x,
-            value=c,
+            value=x if c is None else c,
             value_mask=c_mask
         )
         # ffn
@@ -85,19 +91,22 @@ class DiT(nn.Module):
         x: Tensor,
         x_pe: Optional[Tensor],
         x_mask: Optional[Tensor],
-        conds: List[Tensor],
+        conds: Optional[List[Optional[Tensor]]],
         cond_masks: Optional[List[Optional[Tensor]]],
         films: Optional[List[Optional[Tensor]]],
         x_pe_inv: Optional[Tensor] = None,
     ):
         """
+        - conds: one conditioning sequence per "cond type", cycled over the layers. A
+          `None` entry (or `conds=None`) turns that layer's cross-attention into a second
+          self-attention over x -- see `DiTBlock.forward`.
         - x_pe_inv: inverse of `x_pe`, only used if pe_type == "prope". Computing it
           once outside is much cheaper than inverting the same matrices in every layer.
         """
         NoneType = type(None)
 
         # wrap to iterable
-        if isinstance(conds, Tensor):
+        if isinstance(conds, (NoneType, Tensor)):
             conds = [conds]
         if isinstance(cond_masks, (NoneType, Tensor)):
             cond_masks = [cond_masks]

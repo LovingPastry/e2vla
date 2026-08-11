@@ -52,6 +52,16 @@ STATS_VERSION = 1
 # caller that does not care keep working unchanged.
 ACTION_LAYOUT = "cam_rel_t3r6_openness"
 
+# The same t3r6 + openness encoding rebased onto the robot's own frame, used when no
+# camera extrinsics are available -- see `action_space.BaseRelEEPose`. A separate layout
+# string because the two are indistinguishable by shape and would otherwise cross.
+BASE_ACTION_LAYOUT = "base_rel_t3r6_openness"
+
+# Every layout whose 10 channels are "3 translation + 6D rotation + openness". What they
+# have in common is the channel *meaning*, which is all `DEFAULT_CLIP_DIMS` below and the
+# report in `compute_action_stats` depend on -- not the frame those channels live in.
+EE_POSE_LAYOUTS = (ACTION_LAYOUT, BASE_ACTION_LAYOUT)
+
 # Channels whose q99-q01 is below this are treated as constant and left untouched
 # (scale 1, offset 0) rather than blown up by a division by ~0. A dimension can be
 # genuinely constant -- e.g. a gripper that never closes within the recorded window.
@@ -130,7 +140,7 @@ class ActionNormalizer(nn.Module):
             # Keyed on the layout, not on D: the 6D-rotation carve-out below is a property
             # of the EE-pose encoding, and a joint space with 9 joints would also be
             # 10-dim while needing every channel clipped.
-            clip_dims = (DEFAULT_CLIP_DIMS if (layout == ACTION_LAYOUT and D == 10)
+            clip_dims = (DEFAULT_CLIP_DIMS if (layout in EE_POSE_LAYOUTS and D == 10)
                          else tuple(range(D)))
         clip_dims = tuple(int(i) for i in clip_dims)
         if any(i < 0 or i >= D for i in clip_dims):
