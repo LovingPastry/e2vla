@@ -865,7 +865,15 @@ episode 之间的 `controller.reset()` 不是可选的:ensembler 是按时间戳
 
 ## 怎么跑
 
-六个预设,`va_{libero_10,real}_{sa,transformer,mlp}`,同一行里除编码器外一切相同(数据、schedule、动作空间、objective),这样对照才有意义。都是**从零训**:没有任何已发布的 checkpoint 含有这些张量,`--pretrained_ckpt` 也不该指向 `vl` 的权重(`check_context_encoder` 会拦)。
+预设一共 18 个,三个数据集 × 三个编码器 × 两个 objective:
+
+```
+va_libero_10_{sa,transformer,mlp}[_flow]      LIBERO-10,动作空间 ee_base
+va_real_{sa,transformer,mlp}[_flow]           HDF5 真机(RealRobot),动作空间 ee_base
+va_real_joint_{sa,transformer,mlp}[_flow]     memmap 真机(RealBinDataset),动作空间 joint7
+```
+
+同一行里除编码器外一切相同(数据、schedule、动作空间、objective),这样对照才有意义;`_flow` 后缀的兄弟除 objective 外与它完全相同。都是**从零训**:没有任何已发布的 checkpoint 含有这些张量,`--pretrained_ckpt` 也不该指向 `vl` 的权重(`check_context_encoder` 会拦),所以 `--pretrained_ignore_objective` 在这里也没有用武之地。
 
 ```bash
 # LIBERO-10,三个变体各跑一个
@@ -918,8 +926,8 @@ python -m examples.libero.eval --task_suite libero_10 --uri VA_SA --save --video
 
 | 数据类 | 存储 | 默认动作空间 | VA 预设 | 能否部署 |
 | --- | --- | --- | --- | --- |
-| `RealBinDataset`(`data_utils/dataset_real.py`) | memmap `.bin`,每条轨迹一个目录 | `joint7` | `va_real_joint_{sa,transformer,mlp}` | 训练可以,**部署不行**(见下) |
-| `RealRobot`(`data_utils/datasets.py`) | `./data_converted/real_robot/**/*.h5` | ee(17 维) | `va_real_{sa,transformer,mlp}` | 可以 |
+| `RealBinDataset`(`data_utils/dataset_real.py`) | memmap `.bin`,每条轨迹一个目录 | `joint7` | `va_real_joint_{sa,transformer,mlp}[_flow]` | 训练可以,**部署不行**(见下) |
+| `RealRobot`(`data_utils/datasets.py`) | `./data_converted/real_robot/**/*.h5` | ee(17 维) | `va_real_{sa,transformer,mlp}[_flow]` | 可以 |
 
 **关节空间本来就不需要相机参数**,`AbsJoint.uses_camera_pose` 一直是 `False`,所以 memmap 那条路换 VA 编码器不用改动作空间,直接:
 
