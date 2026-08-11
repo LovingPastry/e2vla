@@ -46,6 +46,7 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from tqdm import tqdm
 
 from configs import TrainConfig
+from models.action_norm import EE_POSE_LAYOUTS
 from data_utils import datasets as datasets_mod
 from data_utils.dataset_base import H5DatasetMapBase
 from infer_utils.planner import load_model, parse_config
@@ -303,7 +304,9 @@ def main():
 
     loader, ds_list, num_samples = build_dataloader(cfg, args)
 
-    can_visualize = args.vis > 0 and action_space.layout == "cam_rel_t3r6_openness"
+    # 两个 EE layout 都行:预测出来的 state 都是 17 维世界系位姿,投影靠的是 K 和外参,
+    # 与动作是表达在相机系还是基座系无关(ee_base 见 models/action_space.py)。
+    can_visualize = args.vis > 0 and action_space.layout in EE_POSE_LAYOUTS
     if args.vis > 0 and not can_visualize:
         print("[WARN] --vis 只支持 EE 动作空间（关节角要正运动学才能投影回图像），已跳过")
     vis_dir = os.path.join(RESULT_DIR, "openloop_vis")

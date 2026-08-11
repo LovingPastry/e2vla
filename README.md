@@ -911,3 +911,51 @@ python -m examples.libero.eval --task_suite libero_10 --uri VA_SA --save --video
 * **`vl` 这条路径没有任何行为变化**:类从 `action_expert.py` 挪到了 `context_encoder.py`,但 228 个张量的名字逐一相同,同权重同输入的前向输出逐位相同,已发布的 checkpoint 照常加载。
 * **checkpoint 多了第五道戳** `context_encoder`。不带这个字段的 checkpoint 一律按 `"vl"` 读。它比另外四道戳弱一些(四个编码器的 state_dict 布局本来就不同,严格加载会自己报错),存在的意义是 `pretrained_strict=False` 会把整份逐张量报告一次性放行 —— 那时一个 `vl` 的 checkpoint 加载进 `sa` 只会贡献投影 stem,看起来像热启动,实际 94% 是冷的。
 * **`sample/*`(§3.9)是唯一可以跨变体比较的训练期指标**,它是米和度。loss 不行:`ee_base` 和 `ee_cam` 的平移通道量纲不同。
+
+## 真机数据怎么跑 VA
+
+真机这边有两条数据路径,VA 模式下各自的配法不同:
+
+| 数据类 | 存储 | 默认动作空间 | VA 预设 | 能否部署 |
+| --- | --- | --- | --- | --- |
+| `RealBinDataset`(`data_utils/dataset_real.py`) | memmap `.bin`,每条轨迹一个目录 | `joint7` | `va_real_joint_{sa,transformer,mlp}` | 训练可以,**部署不行**(见下) |
+| `RealRobot`(`data_utils/datasets.py`) | `./data_converted/real_robot/**/*.h5` | ee(17 维) | `va_real_{sa,transformer,mlp}` | 可以 |
+
+**关节空间本来就不需要相机参数**,`AbsJoint.uses_camera_pose` 一直是 `False`,所以 memmap 那条路换 VA 编码器不用改动作空间,直接:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python train.py --config va_real_joint_sa          -s VA_REAL_SA
+CUDA_VISIBLE_DEVICES=1 python train.py --config va_real_joint_transformer -s VA_REAL_TF
+CUDA_VISIBLE_DEVICES=2 python train.py --config va_real_joint_mlp         -s VA_REAL_MLP
+```
+
+数据路径写在 `RealBinDataset.inst(data_root=...)` 的默认值里,换数据集就传 `data_root` 或改那一行。开跑前先过一遍契约检查(它会顺带查夹爪是否在 [0,1]、关节角是弧度不是角度):
+
+```bash
+python -m data_utils.dataset_real
+```
+
+**要部署到真机就别用关节空间。** `TrajPlanner` 无条件把动作解码成 17 维 SE(3),关节 checkpoint 在 `remote_service` 里能建起来,然后在 `reshape(..., 4, 4)` 崩掉 —— 这是既有限制,不是这次改动引入的。走 EE 的话把 `RealBinDataset.ACTION_SPACE` 改成 `"ee_base"`(现在支持了,`check_contract` 和 `stat_actions` 都认这个 layout),然后:
+
+```bash
+python train.py --config va_real_joint_sa --action_space ee_base -s VA_REAL_EE_SA
+```
+
+`ee_base` 而不是 `ee_cam`:这份数据没有手眼标定,`sample_traj` 里的外参全是 identity。原来那套是"填 identity 让 PRoPE 退化成 no-op、动作退化成基座相对",自洽但没有任何东西记录下"这是编的";`ee_base` 把同一件事写进 checkpoint 的 `action_layout` 戳里,而且 VA 编码器压根不读那些假外参。内参同理(`default_intrinsics` 是 D435 的名义值)。
+
+动作归一化按新配置重算 —— 统计量是 config 的属性,换了动作空间或换了编码器都要重来:
+
+```bash
+python -m data_prepare.compute_action_stats --config va_real_joint_sa \
+  -o ./action_stats/real_va_joint7.json
+python train.py --config va_real_joint_sa \
+  --action_norm_stats ./action_stats/real_va_joint7.json -s VA_REAL_SA_NORM
+```
+
+几个真机特有的注意点:
+
+* **`PROMPT_TEXT` 不用管了**,VA 模型不读它,TensorBoard 里也不会再记(记了会被误读成"指令起作用了")。
+* **相机顺序仍然重要**,虽然不再有外参:`main_cam_embed` 标记的是 0 号相机,第三人称在前、腕部在后。`CAMERA_AXIS` 和 `config.camera_names` 要对上。
+* **`shuffle_cameras` 保持 `False`**。理由从"两路相机在几何上不可区分"变成了"根本没有几何",结论不变。
+* **`obs_norm_xys` 仍然在 dataloader 里生成**(每样本约 1MB),只是模型不读。想省掉这份带宽可以在 `sample_traj` 里按需跳过,不影响正确性。
+* **从零训**,`va_*` 预设都不带 `--pretrained_ckpt`:发布的预训练权重是 `vl` 编码器 + `ee_cam`,张量结构对不上,`check_context_encoder` 会拦。想要预训练收益就得先用 VA 配置跑一遍 `pretrain`。

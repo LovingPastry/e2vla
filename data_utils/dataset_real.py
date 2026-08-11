@@ -22,6 +22,7 @@ from data_utils.dataset_base import (
     DataConfig, DataSampler, H5DatasetMapBase, gen_norm_xy_map,
 )
 from data_utils.h5io import default_intrinsics, identity_extrinsics
+from models.action_norm import EE_POSE_LAYOUTS
 from models.action_space import build_action_space
 
 
@@ -101,8 +102,14 @@ class RealBinDataset(H5DatasetMapBase):
     GRIPPER_MAX: float = 1.5
     PROMPT_TEXT: str = "pick up the red cup and place it in the coffee machine"
     # 动作空间，必须与 TrainConfig.action_space 一致，见 models/action_space.py
-    #   "joint7" -> history/future_actions 是 (T, nee, 8)，绝对关节角 + 夹爪
-    #   "ee_cam" -> (T, nee, 17)，展平 4x4 位姿 + 夹爪
+    #   "joint7"  -> history/future_actions 是 (T, nee, 8)，绝对关节角 + 夹爪
+    #   "ee_cam"  -> (T, nee, 17)，展平 4x4 位姿 + 夹爪，动作表达在 0 号相机坐标轴里
+    #   "ee_base" -> 同样 (T, nee, 17)，但动作表达在机器人基座坐标轴里，不需要外参。
+    #                本数据集没有手眼标定（见下面 obs_extrinsics 那段 NOTE），所以它比
+    #                "ee_cam" 更诚实：后者会拿一堆 identity 外参当真外参用。视觉-动作
+    #                模型（TrainConfig.context_encoder != "vl"）只接受这个或关节空间。
+    # 三者在这里的产出宽度不同，训练侧的 cfg.action_space 必须跟着改，否则 train.py 的
+    # get_data_loader_for_cfg 会当场拦下来。
     ACTION_SPACE: str = "joint7"
     # joint 数组里前多少列是手臂关节（其余是夹爪等）
     NUM_JOINTS: int = 7
@@ -229,6 +236,12 @@ class RealBinDataset(H5DatasetMapBase):
         # 到 cam0 再喂 PRoPE，space_ee2cam 还要对它求逆——零矩阵会在第一次 inverse 出 NaN。
         # 全 identity 时 PRoPE 退化为 no-op，动作从 camera-relative 退化为 base-relative，
         # 仍然自洽。也正因为如此，两路相机在几何上完全不可区分，shuffle_cameras 必须关掉。
+        #
+        # 视觉-动作模型（TrainConfig.context_encoder != "vl"）下这一整块是死数据：`VLA.forward`
+        # 会把 obs_extrinsics 和 obs_norm_xys 一起置 None，模型根本读不到。仍然产出它们只是
+        # 为了满足 batch 的键契约（train.py 无条件按键取）。也就是说：与其靠"填 identity 让它
+        # 退化"，不如直接把 ACTION_SPACE 设成 "ee_base"/"joint7" + 用 VA 编码器，让"没有标定"
+        # 这件事被写进 checkpoint 的 stamp 里，而不是藏在一堆假外参里。
         To, ncam = rgbs.shape[:2]
         obs_extrinsics = np.tile(identity_extrinsics(ncam)[None], (To, 1, 1, 1)).astype(np.float32)
 
@@ -327,7 +340,7 @@ def check_contract(dataset: RealBinDataset, num_samples: int = 8):
         assert openness.min() >= 0.0 and openness.max() <= 1.0, \
             "夹爪开合度必须在 [0,1]，实得 [{:.3f}, {:.3f}]；检查 GRIPPER_MIN/MAX".format(
                 openness.min(), openness.max())
-        if dataset.action_space.layout == "cam_rel_t3r6_openness":
+        if dataset.action_space.layout in EE_POSE_LAYOUTS:
             poses = out["future_actions"][..., :16].reshape(Ta, nee, 4, 4)
             assert np.allclose(poses[..., 3, :], [0, 0, 0, 1], atol=1e-4), \
                 "位姿末行不是 [0,0,0,1]，ee_poses 可能不是行主序 4x4 齐次矩阵"
@@ -349,7 +362,7 @@ def stat_actions(dataset: RealBinDataset, count: int = 1000):
     deltas = []
     for i in range(min(count, len(dataset))):
         act = dataset[i]["future_actions"][:, 0]  # (Ta, state_dim)
-        if dataset.action_space.layout == "cam_rel_t3r6_openness":
+        if dataset.action_space.layout in EE_POSE_LAYOUTS:
             pose = act[:, :16].reshape(-1, 4, 4)
             deltas.append(np.abs(pose[-1, :3, 3] - pose[0, :3, 3]))
         else:

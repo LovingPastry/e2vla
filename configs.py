@@ -549,7 +549,8 @@ CONFIGS["finetune_real_joint"] = TrainConfig(
 )
 
 
-def _va_variant(base: TrainConfig, context_encoder: str, **overrides) -> TrainConfig:
+def _va_variant(base: TrainConfig, context_encoder: str,
+                action_space: str = "ee_base", **overrides) -> TrainConfig:
     """A vision-action copy of `base`: no language, no camera intrinsics/extrinsics.
 
     Three fields change together and none of them is optional:
@@ -558,10 +559,15 @@ def _va_variant(base: TrainConfig, context_encoder: str, **overrides) -> TrainCo
       both uses of calibration (see models/context_encoder.py).
     * `action_space` must leave "ee_cam" behind -- camera-relative actions need the
       extrinsics this model no longer receives, and `ActionExpert.__init__` says so.
-      "ee_base" is the same t3r6 + openness encoding in the robot's own frame.
+      "ee_base" (the default here) is the same t3r6 + openness encoding in the robot's
+      own frame. A joint space is already camera-free, so a joint preset passes its own
+      `action_space` through unchanged.
     * `action_norm_stats` is cleared: the statistics are computed over the *model's*
       action space, and rebasing the frame changes every translation channel. Recompute
       with `python -m data_prepare.compute_action_stats --config <this preset>`.
+      (A joint preset's statistics would survive the encoder change -- joint angles do
+      not depend on the frame -- but they are cleared anyway, because the base preset
+      does not set any.)
 
     `lora_rank` and `pretrained_ckpt` are cleared for the same reason: no released
     checkpoint has these tensors, and LoRA on a randomly initialised trunk adapts nothing.
@@ -569,7 +575,7 @@ def _va_variant(base: TrainConfig, context_encoder: str, **overrides) -> TrainCo
     return replace(
         base,
         context_encoder=context_encoder,
-        action_space="ee_base",
+        action_space=action_space,
         action_norm_stats=None,
         lora_rank=0,
         pretrained_ckpt=None,
@@ -654,6 +660,15 @@ CONFIGS["finetune_real_flow"] = _flow_variant(CONFIGS["finetune_real"])
 #
 # The LIBERO row inherits `finetune_libero_10` unchanged: that preset is already sized
 # for a 1e-4 from-scratch run.
+#     va_real_joint_{sa,transformer,mlp}          the same three on RealBinDataset
+#
+# The joint row is the one that fits the memmap real-robot pipeline as it stands
+# (`RealBinDataset.ACTION_SPACE = "joint7"`), and it needs no action-space change at all:
+# absolute joint angles never referred to a camera frame, so `AbsJoint.uses_camera_pose`
+# is already False. It inherits `finetune_real_joint`, which is already a from-scratch
+# schedule. NOTE joint checkpoints are training-only -- `TrajPlanner` decodes 17-dim
+# SE(3) unconditionally, so use the `ee_base` row if you need to deploy through
+# `remote_service` (set `RealBinDataset.ACTION_SPACE = "ee_base"` to match).
 for _enc in ("sa", "transformer", "mlp"):
     CONFIGS["va_libero_10_" + _enc] = _va_variant(CONFIGS["finetune_libero_10"], _enc)
     CONFIGS["va_real_" + _enc] = _va_variant(
@@ -662,6 +677,10 @@ for _enc in ("sa", "transformer", "mlp"):
         num_warmup=int(2e3),
         ema_start=int(2e3),
         max_iterations=int(60e3),
+    )
+    CONFIGS["va_real_joint_" + _enc] = _va_variant(
+        CONFIGS["finetune_real_joint"], _enc,
+        action_space=CONFIGS["finetune_real_joint"].action_space,
     )
 del _enc
 
