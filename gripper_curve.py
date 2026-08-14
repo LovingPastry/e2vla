@@ -18,6 +18,14 @@
 
 开环：观测全部来自数据集真值，预测不回灌。在训练集上跑时它先答的是拟合，不是泛化。
 
+**画的是哪一层的数**：数据集 state 空间的开合度，契约 `[0 (闭合), 1 (张开)]`——既没做
+`(x-0.5)*2` 的重标定，也没过 q01/q99 归一化。GT 直接取 `future_actions[..., -1]`，pred 是
+模型输出经 `action2states` 解码回来的（那里做的正是 `/2 + 0.5`，开了 action_norm 则先
+unnormalize）。所以这条曲线与 `planner` 输出、与 `eval.py` 里 `>0.5` 二值化看到的是同一个
+量。想看模型内部那一层（t3r6 / 关节 + `[-1,1]` 的夹爪 / 归一化后的值）用
+`dump_chunk.py --raw`；两者差一个 `x = 值/2 + 0.5`，例如 action 空间的 -1.0 ~ -0.4 对应
+这里的 0.0 ~ 0.3。
+
 模型加载走 `infer_utils.planner.load_model`（三个戳的校验、LoRA 注入顺序、EMA copy_to），
 数据装配走 `dump_chunk.build_datasets`（相机顺序、padding 与 test.py / dump_chunk.py 一致）。
 """
@@ -187,6 +195,20 @@ def print_summary(gt: np.ndarray, pred: np.ndarray, delta: np.ndarray):
     print()
     print("  MAE {:.4f}   最大偏差 {:.4f}   二值一致率 {:.1%}".format(
         float(np.abs(delta).mean()), float(np.abs(delta).max()), agree))
+    # 数据集契约是 [0 (闭合), 1 (张开)]（dataset_base.py 的 sample_hdf5 文档）。越界不会
+    # 在训练里报错，只会让 `states2action` 的 (x-0.5)*2 把动作推到 [-1,1] 之外，然后
+    # 归一化统计、loss 权重、二值化阈值全部按错误的量程工作。
+    if gt.min() < -1e-6 or gt.max() > 1 + 1e-6:
+        print("  [WARN] GT 夹爪超出 [0,1]（实测 {:.3f} ~ {:.3f}）。这一维不是开合度，或者"
+              "归一化常数不对：".format(gt.min(), gt.max()))
+        print("         跑 `python -m data_utils.dataset_real` 让 check_contract 定位；"
+              "memmap 数据看 RealBinDataset.get_openness 的 GRIPPER_MIN/MAX 与 "
+              "norm_openness 分支（后者原样透传，不做 clip）。")
+    elif gt.max() < 0.6:
+        print("  [WARN] GT 夹爪最大只有 {:.3f}，从未达到"
+              "\"张开\"（1.0）。下游 `>{:.1f}` 二值化后会恒为闭合——"
+              "这份数据里夹爪本来就不会动，先查 GRIPPER_MIN/MAX。".format(
+                  gt.max(), BINARY_THRESHOLD))
     if pred_range < 0.1 and gt_range > 0.3:
         print("  [WARN] 真值在动（极差 {:.3f}）而预测几乎是常量（极差 {:.3f}）——"
               "夹爪塌成了边缘均值".format(gt_range, pred_range))
@@ -205,16 +227,24 @@ def plot(frames: np.ndarray, gt: np.ndarray, pred: np.ndarray, delta: np.ndarray
 
     ax_val.plot(frames, gt, color="#1f77b4", lw=1.8, label="GT")
     ax_val.plot(frames, pred, color="#ff7f0e", lw=1.5, label="pred")
-    # 一条线，两个含义，而且是构造出来的巧合不是碰巧：左轴固定 [-0.05, 1.05]、右轴关于 0
-    # 对称，两者的中线都落在图高的正中间。所以只画一条，标签把两个含义都写上——画两条
-    # 会永远重叠成一条颜色可疑的线。
-    ax_val.axhline(BINARY_THRESHOLD, color="gray", ls=":", lw=1.2,
-                   label="openness {:.1f}  =  delta 0".format(BINARY_THRESHOLD))
     ax_val.set_xlabel("frame index")
     ax_val.set_ylabel("gripper openness  [0 = close, 1 = open]")
-    # 固定成开合度的定义域：自动缩放会把一条几乎水平的预测线放大成剧烈震荡
-    ax_val.set_ylim(-0.05, 1.05)
     ax_val.grid(alpha=0.25)
+
+    # 默认锁成开合度的定义域：自动缩放会把一条几乎水平的预测线放大成剧烈震荡。但**只在
+    # 数据确实落在里面时**才锁——否则就是拿一个漂亮的坐标轴把越界的点裁出画面，看图的人
+    # 完全不会发现。超出就扩轴 + 在图上写明。
+    lo, hi = -0.05, 1.05
+    data_lo = float(min(gt.min(), pred.min()))
+    data_hi = float(max(gt.max(), pred.max()))
+    clipped = data_lo < lo or data_hi > hi
+    if clipped:
+        lo, hi = min(lo, data_lo - 0.05), max(hi, data_hi + 0.05)
+        ax_val.text(0.01, 0.02,
+                    "note: data outside [0, 1] -> axis widened to "
+                    "[{:.2f}, {:.2f}]".format(lo, hi),
+                    transform=ax_val.transAxes, fontsize=8, color="#d62728")
+    ax_val.set_ylim(lo, hi)
 
     ax_err = ax_val.twinx()
     span = float(np.abs(delta).max())
@@ -222,6 +252,17 @@ def plot(frames: np.ndarray, gt: np.ndarray, pred: np.ndarray, delta: np.ndarray
     ax_err.plot(frames, delta, color="#d62728", lw=1.2, alpha=0.7,
                 label="delta (pred - GT)")
     ax_err.set_ylabel("delta (pred - GT)", color="#d62728")
+
+    # 左轴锁在 [-0.05, 1.05] 且右轴关于 0 对称时，两者的中线都落在图高正中间——这时画
+    # 两条参考线只会重叠成一条颜色可疑的线，合成一条并把两个含义都写进图例。扩轴之后这个
+    # 巧合就没了，必须分开画。
+    if abs((lo + hi) / 2 - BINARY_THRESHOLD) < 1e-9:
+        ax_val.axhline(BINARY_THRESHOLD, color="gray", ls=":", lw=1.2,
+                       label="openness {:.1f}  =  delta 0".format(BINARY_THRESHOLD))
+    else:
+        ax_val.axhline(BINARY_THRESHOLD, color="gray", ls=":", lw=1.2,
+                       label="openness {:.1f} (binarize)".format(BINARY_THRESHOLD))
+        ax_err.axhline(0.0, color="#d62728", ls="--", lw=0.8, alpha=0.45)
     ax_err.tick_params(axis="y", labelcolor="#d62728")
     ax_err.set_ylim(-span, span)  # 对称，0 才落在正中间
 

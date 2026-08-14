@@ -357,6 +357,95 @@ def check_contract(dataset: RealBinDataset, num_samples: int = 8):
     print("[OK] 契约校验通过，{} 个样本".format(min(num_samples, len(dataset))))
 
 
+def stat_gripper(dataset: RealBinDataset, count: int = 50):
+    """扫一遍**原始**夹爪列，报出真实量程，并给出 GRIPPER_MIN/MAX 该填什么。
+
+    为什么值得单独有这个函数：夹爪量程填错了，全链路没有一处会报错。
+    `check_contract` 只查 `[0,1]`，而一条被压进 `[0, 0.25]` 的开合度完全满足它；训练照常
+    收敛（模型会把那条压扁的曲线学得很好，`sample/grip_l1` 甚至很漂亮）；只有到了下游
+    `(g > 0.5)` 二值化那一步，指令才变成恒定值——表现就是"夹爪一步都不动"，而那时已经
+    离数据很远了。`gripper_curve.py` 画出来的 GT 上限远小于 1 就是这个症状。
+
+    Args:
+        count: 扫多少条 episode。量程是全数据集的属性，别只看一条。
+    """
+    n = min(count, len(dataset))
+    assert n > 0, "数据集是空的"
+
+    raw = []
+    joint_cols = None
+    col_lo = col_hi = None
+    uses_norm_openness = False
+
+    for i in range(n):
+        traj = dataset.load_traj(i)
+        if "norm_openness" in traj:
+            uses_norm_openness = True
+            raw.append(np.asarray(traj["norm_openness"], dtype=np.float32).ravel())
+            continue
+        joints = np.asarray(traj["joint"], dtype=np.float32)
+        if joint_cols is None:
+            joint_cols = joints.shape[-1]
+            col_lo = np.full(joint_cols, np.inf, dtype=np.float64)
+            col_hi = np.full(joint_cols, -np.inf, dtype=np.float64)
+        col_lo = np.minimum(col_lo, joints.min(axis=0))
+        col_hi = np.maximum(col_hi, joints.max(axis=0))
+        raw.append(joints[:, -1])
+
+    raw = np.concatenate(raw)
+    lo, hi = float(raw.min()), float(raw.max())
+    # joint 的列数正好等于 NUM_JOINTS 时，`joint[:, :NUM_JOINTS]` 与 `joint[:, -1]` 是同
+    # 一列——这时改量程没有意义，别给建议值误导人
+    wrong_column = joint_cols is not None and joint_cols == dataset.NUM_JOINTS
+
+    print("=" * 70)
+    print("[夹爪量程] 扫了 {} / {} 条 episode，{} 帧".format(n, len(dataset), len(raw)))
+    print("  来源: {}".format(
+        "traj['norm_openness']（get_openness 原样透传，不做 clip 也不缩放）"
+        if uses_norm_openness else "traj['joint'][:, -1]"))
+
+    if joint_cols is not None:
+        print("  joint 共 {} 列，NUM_JOINTS = {}".format(joint_cols, dataset.NUM_JOINTS))
+        for c in range(joint_cols):
+            mark = "  <- 被当成夹爪宽度" if c == joint_cols - 1 else ""
+            print("    col {}: [{:+.4f}, {:+.4f}]{}".format(c, col_lo[c], col_hi[c], mark))
+        if wrong_column:
+            # 切片再比长度的断言（sample_traj 里那句）永远不会触发这个情况
+            print("  [ERR ] joint 只有 {} 列，而 NUM_JOINTS 也是 {}：`joint[:, :NUM_JOINTS]`"
+                  " 和 `joint[:, -1]` 取的是同一列，".format(joint_cols, dataset.NUM_JOINTS))
+            print("         被当成夹爪的其实是最后一个**关节角**。量程改多少都救不回来，"
+                  "先确认夹爪存在哪里。")
+
+    print("  原始取值范围: [{:.4f}, {:.4f}]".format(lo, hi))
+
+    if uses_norm_openness:
+        print("  当前 get_openness 输出: [{:.4f}, {:.4f}]（原样透传）".format(lo, hi))
+        if lo < -1e-6 or hi > 1 + 1e-6:
+            print("  [ERR ] 超出 [0,1]，违反数据集契约。norm_openness 存的不是开合度，"
+                  "或者是 [-1,1] 的指令——后者需要 (x+1)/2。")
+    else:
+        rng = dataset.GRIPPER_MAX - dataset.GRIPPER_MIN
+        cur = np.clip((np.array([lo, hi]) - dataset.GRIPPER_MIN) / rng, 0.0, 1.0)
+        print("  当前 GRIPPER_MIN/MAX = {} / {}  ->  openness [{:.4f}, {:.4f}]".format(
+            dataset.GRIPPER_MIN, dataset.GRIPPER_MAX, cur[0], cur[1]))
+        if cur[1] - cur[0] < 0.8:
+            print("  [ERR ] 量程只覆盖了 {:.0f}%。下游 `(g > 0.5)` 二值化会拿到恒定指令，"
+                  "夹爪不会动。".format((cur[1] - cur[0]) * 100))
+        if lo < dataset.GRIPPER_MIN - 1e-6:
+            print("  [ERR ] 有 {:.4f} < GRIPPER_MIN，闭合端被 clip 压平，信息已经丢了"
+                  .format(lo))
+        if not wrong_column:
+            print()
+            print("  建议改成（数据的真实上下界）:")
+            print("      GRIPPER_MIN: float = {:.4f}".format(lo))
+            print("      GRIPPER_MAX: float = {:.4f}".format(hi))
+
+    print("  改完必须重训：openness 的监督目标变了。若用了 --action_norm_stats，"
+          "统计量也要重算。")
+    print("=" * 70)
+    return lo, hi
+
+
 def stat_actions(dataset: RealBinDataset, count: int = 1000):
     """打印动作块首尾的变化幅度，用来核对量纲（EE：米 vs 毫米；关节：弧度 vs 角度）。
     真正喂给 --action_norm_stats 的统计量请用 data_prepare/compute_action_stats.py，
@@ -376,6 +465,13 @@ def stat_actions(dataset: RealBinDataset, count: int = 1000):
 
 
 if __name__ == "__main__":
-    ds = RealBinDataset.inst()
+    import sys
+
+    # 数据根目录可以从命令行给，省得为了换一份数据改 inst() 的默认值
+    ds = (RealBinDataset.inst(sys.argv[1]) if len(sys.argv) > 1
+          else RealBinDataset.inst())
+    # 量程放在契约校验**之前**：check_contract 的 [0,1] 断言对一个被压扁的开合度是通过的，
+    # 先把真实量程打出来，才不会拿着一个"通过了"的结论继续往下走。
+    stat_gripper(ds)
     check_contract(ds)
     stat_actions(ds)
