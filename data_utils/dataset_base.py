@@ -645,6 +645,13 @@ class H5DatasetMapBase(Dataset):
         # opt-out of image decoding; see `H5DatasetMapBase.sample_from_hdf5`. Set by
         # data_prepare/compute_action_stats.py, never during training.
         self.skip_rgb = False
+        # Pin which frame a sample is anchored on instead of drawing it at random.
+        # None (the default) is the training behaviour, unchanged. Set by `dump_chunk.py`
+        # to look at one specific chunk -- an attribute rather than a `__getitem__`
+        # argument because every subclass overrides `__getitem__` to post-process the
+        # sample (Libero rewrites the prompt, Droid shifts ee_poses along the gripper
+        # axis), and those overrides are part of what the model was trained on.
+        self.debug_sample_index = None
 
         if isinstance(self.config.camera_names, str):
             # wrap to tuple
@@ -734,7 +741,8 @@ class H5DatasetMapBase(Dataset):
         h5_file = self.h5_filelist[i]
 
         with h5py.File(h5_file, "r") as h5:
-            out = self.sample_from_hdf5(h5, latest=False, debug_sample_index=None)
+            out = self.sample_from_hdf5(h5, latest=False,
+                                        debug_sample_index=self.debug_sample_index)
         return out
     
     def visualize(self):

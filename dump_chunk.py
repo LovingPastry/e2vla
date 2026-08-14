@@ -3,6 +3,9 @@
     # 最简：ckpt 目录的 config json 提供数据集、动作空间、归一化、LoRA
     CUDA_VISIBLE_DEVICES=0 python dump_chunk.py --ckpt ./checkpoints/E2VLA/VA_SA/ckpt_latest.pt
 
+    # 第 0 条 episode 的第一个 chunk（--step 把锚点钉死，不再随机抽时刻）
+    CUDA_VISIBLE_DEVICES=0 python dump_chunk.py --ckpt ... --index 0 --step 0
+
     # 换样本 / 连看几个 / 换数据集
     CUDA_VISIBLE_DEVICES=0 python dump_chunk.py --ckpt ... --index 37 -n 3
     CUDA_VISIBLE_DEVICES=0 python dump_chunk.py --ckpt ... --dataset Libero10 --data_root /path
@@ -85,6 +88,16 @@ def build_view(cfg, args):
     view = FixedSampleView(dataset, repeats=args.repeats, seed=args.seed)
     print("[INFO] {} 条 episode x {} 次采样 = {} 个可选样本".format(
         len(dataset), args.repeats, len(view)))
+
+    if args.step is not None:
+        # 数据集自己的 `__getitem__` 只指定 episode，episode 内取哪一帧是随机抽的；
+        # `debug_sample_index` 把那个锚点钉死。走属性而不是参数，是为了保留各子类
+        # `__getitem__` 里的后处理（Libero 改 prompt、Droid 沿夹爪轴平移 ee_pose）——
+        # 绕开它们喂给模型的就不是训练时的那份数据了。见 H5DatasetMapBase.__init__。
+        for d in ds_list:
+            d.debug_sample_index = args.step
+        print("[INFO] 锚点钉在每条 episode 的第 {} 帧（--step）；"
+              "history 往前取会被夹到 0，future 从这一帧之后开始".format(args.step))
     return view, ds_list
 
 
@@ -289,8 +302,14 @@ def parse_args():
                         help="数据集类名，默认用 ckpt config 里记的（python datavis.py -l 列全部）")
     parser.add_argument("--data_root", type=str, default=None,
                         help="仅对 inst() 接受 data_root 的数据集有效（如 RealBinDataset）")
-    parser.add_argument("--index", type=int, default=0, help="从第几个样本开始看")
-    parser.add_argument("-n", "--num_chunks", type=int, default=1, help="连着看几个样本")
+    parser.add_argument("--index", type=int, default=0,
+                        help="从第几个样本开始看；样本 k 对应 episode (k %% episode 数)，"
+                             "所以 --repeats 1 时它就是 episode 序号")
+    parser.add_argument("-n", "--num_chunks", type=int, default=1,
+                        help="连着看几个样本（配 --step 就是连着几条 episode 的同一帧）")
+    parser.add_argument("--step", type=int, default=None,
+                        help="把 chunk 的锚点钉在 episode 的第几帧（0 = 最开始的第一个 "
+                             "chunk）。默认 None = 按 --seed 随机抽一帧，与 test.py 一致")
     parser.add_argument("--samples", type=int, default=1,
                         help="同一个观测重复采样几次（>1 用来看采样器的随机性）")
     parser.add_argument("--stride", type=int, default=1, help="chunk 内每隔几步打一行")
@@ -314,6 +333,9 @@ def parse_args():
 def main():
     args = parse_args()
     assert args.samples >= 1 and args.num_chunks >= 1 and args.stride >= 1
+    # 负的 step 在两条数据路径上含义不同（h5 走 Python 的负索引，memmap 那边被 clip
+    # 到末帧），不如直接不收
+    assert args.step is None or args.step >= 0, "--step 不能是负数"
 
     cfg, _ = parse_config(os.path.dirname(os.path.abspath(args.ckpt)))
     # 权重加载的全部规矩都在 load_model 里，包括三个戳的校验

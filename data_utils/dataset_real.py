@@ -296,7 +296,9 @@ class RealBinDataset(H5DatasetMapBase):
         return names
 
     def __getitem__(self, i):
-        return self.sample_traj(self.load_traj(i), latest=False)
+        # debug_sample_index 见 `H5DatasetMapBase.__init__`；None（默认）就是训练行为
+        return self.sample_traj(self.load_traj(i), latest=False,
+                                debug_sample_index=self.debug_sample_index)
 
     def visualize(self):
         raise NotImplementedError(
