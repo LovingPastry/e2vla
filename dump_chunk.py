@@ -52,12 +52,14 @@ from infer_utils.planner import load_model, parse_config
 # 数据
 # ---------------------------------------------------------------------------
 
-def build_view(cfg, args):
-    """按 ckpt 的训练配置搭出一个可按序号索引的数据视图。
+def build_datasets(cfg, args):
+    """按 ckpt 的训练配置实例化数据集，并对齐部署条件与训练时的 padding。
 
-    与 `test.py:build_dataloader` 同源，两处差异都是"只看一个样本"带来的：不建 DataLoader
-    （直接 `view[k]`，省掉为一个样本起 worker），也不截断成 Subset（`--index` 要能指到任何
-    位置）。padding 与 shuffle_cameras 的处理必须保持一致，否则输入宽度和相机顺序都变了。
+    单独拆出来是因为 `gripper_curve.py` 也要它：那边按帧索引 episode，不需要
+    `FixedSampleView`，但相机顺序和 padding 必须和这里、和 `test.py` 完全一致，
+    否则三个脚本的数字没法互相印证。
+
+    需要 args 提供：dataset / data_root / pad_ncam / pad_nee。
     """
     classes = resolve_dataset_classes(cfg, args.dataset)
     print("[INFO] 数据集: {}".format(", ".join(D.__name__ for D in classes)))
@@ -83,7 +85,17 @@ def build_view(cfg, args):
         d.pad2nee = pad_nee
     print("[INFO] pad2ncam={}, pad2nee={}（取自训练配置 {}）".format(
         pad_ncam, pad_nee, [D.__name__ for D in train_classes]))
+    return ds_list
 
+
+def build_view(cfg, args):
+    """在 `build_datasets` 之上加一层可按序号索引的视图。
+
+    与 `test.py:build_dataloader` 同源，两处差异都是"只看一个样本"带来的：不建 DataLoader
+    （直接 `view[k]`，省掉为一个样本起 worker），也不截断成 Subset（`--index` 要能指到任何
+    位置）。
+    """
+    ds_list = build_datasets(cfg, args)
     dataset = ds_list[0] if len(ds_list) == 1 else ConcatDataset(ds_list)
     view = FixedSampleView(dataset, repeats=args.repeats, seed=args.seed)
     print("[INFO] {} 条 episode x {} 次采样 = {} 个可选样本".format(
