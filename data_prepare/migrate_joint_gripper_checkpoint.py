@@ -1,16 +1,21 @@
-"""Migrate a joint checkpoint from normalized openness to raw gripper values.
+"""Migrate a joint checkpoint from the legacy misnamed channel to raw gripper values.
 
 Only affine metadata changes; model weights are copied byte-for-byte.  The required
 old endpoints describe the transform used while training the old checkpoint:
 
-    openness = (raw_gripper - old_raw_min) / (old_raw_max - old_raw_min)
-    legacy_action = 2 * openness - 1
+    legacy_unit = (raw_gripper - old_raw_min) / (old_raw_max - old_raw_min)
+    legacy_action = 2 * legacy_unit - 1
+
+Despite the old ``*_openness`` layout name, the real joint data use 0=open and larger
+values=close. The formula never inverts that direction; only the historical name was
+wrong.
 
 After migration, q01/q99 absorb that transform and ``action2states`` returns
 ``raw_gripper`` directly.
 """
 
 import argparse
+import json
 import os
 import re
 
@@ -93,6 +98,9 @@ def parse_args():
     parser.add_argument("--output", required=True, help="new checkpoint; must not exist")
     parser.add_argument("--old-raw-min", required=True, type=float)
     parser.add_argument("--old-raw-max", required=True, type=float)
+    parser.add_argument("--config", help="config JSON next to the old checkpoint")
+    parser.add_argument("--output-config",
+                        help="write a migrated config; requires --config")
     return parser.parse_args()
 
 
@@ -104,6 +112,22 @@ def main():
         raise ValueError("refusing to overwrite the source checkpoint")
     if os.path.exists(output_path):
         raise FileExistsError("output already exists: {}".format(output_path))
+    if bool(args.config) != bool(args.output_config):
+        raise ValueError("--config and --output-config must be provided together")
+    config_input = config_output = stats_path = config = None
+    if args.config:
+        config_input = os.path.abspath(args.config)
+        config_output = os.path.abspath(args.output_config)
+        if config_input == config_output:
+            raise ValueError("refusing to overwrite the source config")
+        if os.path.exists(config_output):
+            raise FileExistsError("output config already exists: {}".format(config_output))
+        config_dir = os.path.dirname(config_output)
+        stats_path = os.path.join(config_dir, "raw_gripper_action_norm.json")
+        if os.path.exists(stats_path):
+            raise FileExistsError("output action stats already exist: {}".format(stats_path))
+        with open(config_input, "r", encoding="utf-8") as fp:
+            config = json.load(fp)
 
     ckpt = torch.load(input_path, map_location="cpu", weights_only=False)
     migrated = migrate_checkpoint(ckpt, args.old_raw_min, args.old_raw_max)
@@ -111,12 +135,27 @@ def main():
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
     torch.save(migrated, output_path)
+
+    if args.config:
+        config["legacy_gripper_scale"] = 1.0
+
+        os.makedirs(config_dir, exist_ok=True)
+        with open(stats_path, "w", encoding="utf-8") as fp:
+            json.dump(migrated["action_norm"], fp, ensure_ascii=False, indent=2)
+        config["action_norm_stats"] = stats_path
+        with open(config_output, "w", encoding="utf-8") as fp:
+            json.dump(config, fp, ensure_ascii=False, indent=4)
+
     print("[OK] {} -> {}".format(input_path, output_path))
     print("[OK] action layout: {}".format(migrated["action_layout"]))
     print("[OK] raw gripper q01/q99: {:.8f} / {:.8f}".format(
         migrated["action_norm"]["q01"][-1],
         migrated["action_norm"]["q99"][-1]))
-    print("[NOTE] Keep legacy_gripper_scale=1.0 in the checkpoint directory config.")
+    if args.config:
+        print("[OK] migrated config: {}".format(config_output))
+        print("[OK] migrated action stats: {}".format(stats_path))
+    else:
+        print("[NOTE] Keep legacy_gripper_scale=1.0 in the checkpoint directory config.")
 
 
 if __name__ == "__main__":

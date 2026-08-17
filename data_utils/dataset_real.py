@@ -97,7 +97,7 @@ class RealBinDataset(H5DatasetMapBase):
     # process 阶段做掉；搞反了模型照样收敛，但和预训练权重的色彩统计对不上
     IS_BGR: bool = False
     # joint 最后一列的夹爪真值原样进入数据契约。这里不再构造 openness，
-    # 也不使用物理程端点做第二次缩放；训练所需的缩放统一由 q01/q99 完成。
+    # 也不使用物理量程端点做第二次缩放；训练所需的缩放统一由 q01/q99 完成。
     PROMPT_TEXT: str = "pick up the red cup and place it in the coffee machine"
     # 动作空间，必须与 TrainConfig.action_space 一致，见 models/action_space.py
     #   "joint7"  -> history/future_actions 是 (T, nee, 8)，绝对关节角 + 夹爪
@@ -421,8 +421,7 @@ if __name__ == "__main__":
     # 数据根目录可以从命令行给，省得为了换一份数据改 inst() 的默认值
     ds = (RealBinDataset.inst(sys.argv[1]) if len(sys.argv) > 1
           else RealBinDataset.inst())
-    # 量程放在契约校验**之前**：check_contract 的 [0,1] 断言对一个被压扁的开合度是通过的，
-    # 先把真实量程打出来，才不会拿着一个"通过了"的结论继续往下走。
+    # 先打印夹爪原始范围，再检查数据契约。
     stat_gripper(ds)
     check_contract(ds)
     stat_actions(ds)

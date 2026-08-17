@@ -126,7 +126,8 @@ def load_model(path, device, use_ema: bool = False):
                 "multiplier would corrupt it. Update the config JSON next to the "
                 "checkpoint.")
         print("[WARN] Legacy gripper output correction is enabled: scale={:.8f}. "
-              "This multiplier is applied only to inference openness after action "
+              "This multiplier is applied only to the legacy inference gripper channel "
+              "after action "
               "unnormalization; do not enable it for newly trained checkpoints."
               .format(cfg.legacy_gripper_scale))
 
@@ -284,7 +285,8 @@ class TrajPlanner(object):
             
             - CAM_NAME_1: similar as CAM_NAME_0
             - ee_pose: np.ndarray of shape (4, 4), ^{world}_{ee} T
-            - gripper: float, value from [0 (close), 1 (open)]
+            - gripper: float, in the configured action space's state units. EE models use
+              openness [0=close, 1=open]; raw-gripper joint models use the dataset value.
             - timestamp: float
         """
         max_frames = max(
@@ -457,7 +459,8 @@ class TrajPlanner(object):
         Returns
         -------
             future_ee_poses (np.ndarray): shape (Ta, 4, 4), ^{world} _{ee} T
-            future_grippers (np.ndarray): shape (Ta,), range [0 (close), 1 (open)]
+            future_grippers (np.ndarray): shape (Ta,), in the configured action space's
+                state units; raw-gripper joint models return the dataset value directly
             future_time (np.ndarray): shape (Ta,)
             traj_img (np.ndarray | None): shape (H, Ncam*W, C) if not compressed else (nbytes,)
         """

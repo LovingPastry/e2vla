@@ -190,7 +190,7 @@ def decode_columns(action_space: ActionSpace, states: np.ndarray,
 
 
 def gripper_column(states: np.ndarray) -> np.ndarray:
-    """夹爪那一列，[0 (闭合), 1 (张开)]。两个动作空间都把它放在 state 的最后一维。"""
+    """夹爪那一列。EE 空间是 openness；raw joint 空间是数据原值。"""
     return states[..., -1]
 
 

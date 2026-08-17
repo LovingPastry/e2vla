@@ -563,7 +563,7 @@ class ActionExpert(nn.Module):
         return actions
 
     def _apply_legacy_gripper_scale(self, states: Tensor) -> Tensor:
-        """Correct legacy inference openness after all action-space inverses.
+        """Correct the legacy, historically misnamed gripper channel at inference.
 
         The identity case returns the original tensor without even a multiply/clamp, so
         checkpoints whose config omits the compatibility field keep the historical path
