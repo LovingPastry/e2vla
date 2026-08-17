@@ -42,6 +42,17 @@ CUDA_VISIBLE_DEVICES=0 python test.py \
   --ckpt checkpoints/E2VA/VA_TF_FLOW_RAW/ckpt_best.pt \
   --data_root /data/lanzc/task0_0716_process \
   --num_samples 256 --bs 8 --workers 4 --seed 0 --save
+
+同一训练目录下迁移多个 checkpoint 时，为每个 --output 使用不同文件名，但可以重复传入
+同一个 --output-config。脚本会复用内容一致的 config.json 和 action stats；若内容不同则拒绝，
+防止把不同实验的权重与配置混在一起。例如继续迁移 latest：
+
+python -m data_prepare.migrate_joint_gripper_checkpoint \
+  --input checkpoints/E2VA/VA_TF_FLOW/ckpt_latest.pt \
+  --output checkpoints/E2VA/VA_TF_FLOW_RAW/ckpt_latest.pt \
+  --old-raw-min 0.0 --old-raw-max 1.5 \
+  --config checkpoints/E2VA/VA_TF_FLOW/202608121001.json \
+  --output-config checkpoints/E2VA/VA_TF_FLOW_RAW/config.json
 """
 
 import argparse
@@ -55,6 +66,33 @@ from models.action_norm import STATS_VERSION
 
 
 OLD_LAYOUT_RE = re.compile(r"^abs_joint(\d+)_openness$")
+
+
+def write_or_reuse_json(path: str, payload: dict, label: str) -> str:
+    """Create shared metadata once, or verify an existing copy is identical.
+
+    Several checkpoints from one run have the same model config and action statistics.
+    Requiring a fresh JSON filename for every weight file is both noisy and dangerous:
+    inference selects configuration by directory, not by checkpoint basename.
+    """
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                existing = json.load(fp)
+        except (OSError, ValueError) as exc:
+            raise FileExistsError(
+                "{} exists but is not a readable JSON file: {}".format(label, path)
+            ) from exc
+        if existing != payload:
+            raise FileExistsError(
+                "{} already exists with different content: {}. Use a separate output "
+                "directory/config for checkpoints from a different experiment."
+                .format(label, path))
+        return "reused"
+
+    with open(path, "w", encoding="utf-8") as fp:
+        json.dump(payload, fp, ensure_ascii=False, indent=4)
+    return "wrote"
 
 
 def migrate_checkpoint(ckpt: dict, old_raw_min: float, old_raw_max: float) -> dict:
@@ -150,31 +188,31 @@ def main():
         config_output = os.path.abspath(args.output_config)
         if config_input == config_output:
             raise ValueError("refusing to overwrite the source config")
-        if os.path.exists(config_output):
-            raise FileExistsError("output config already exists: {}".format(config_output))
         config_dir = os.path.dirname(config_output)
         stats_path = os.path.join(config_dir, "raw_gripper_action_norm.json")
-        if os.path.exists(stats_path):
-            raise FileExistsError("output action stats already exist: {}".format(stats_path))
         with open(config_input, "r", encoding="utf-8") as fp:
             config = json.load(fp)
 
     ckpt = torch.load(input_path, map_location="cpu", weights_only=False)
     migrated = migrate_checkpoint(ckpt, args.old_raw_min, args.old_raw_max)
-    output_dir = os.path.dirname(output_path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    torch.save(migrated, output_path)
 
+    # Validate/reuse shared metadata before creating the checkpoint. If a caller points a
+    # checkpoint from another experiment at this directory, fail without leaving behind
+    # a weight file that inference could later pair with the wrong config.
     if args.config:
         config["legacy_gripper_scale"] = 1.0
 
         os.makedirs(config_dir, exist_ok=True)
-        with open(stats_path, "w", encoding="utf-8") as fp:
-            json.dump(migrated["action_norm"], fp, ensure_ascii=False, indent=2)
         config["action_norm_stats"] = stats_path
-        with open(config_output, "w", encoding="utf-8") as fp:
-            json.dump(config, fp, ensure_ascii=False, indent=4)
+        stats_status = write_or_reuse_json(
+            stats_path, migrated["action_norm"], "output action stats")
+        config_status = write_or_reuse_json(
+            config_output, config, "output config")
+
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    torch.save(migrated, output_path)
 
     print("[OK] {} -> {}".format(input_path, output_path))
     print("[OK] action layout: {}".format(migrated["action_layout"]))
@@ -182,8 +220,9 @@ def main():
         migrated["action_norm"]["q01"][-1],
         migrated["action_norm"]["q99"][-1]))
     if args.config:
-        print("[OK] migrated config: {}".format(config_output))
-        print("[OK] migrated action stats: {}".format(stats_path))
+        print("[OK] migrated config ({}): {}".format(config_status, config_output))
+        print("[OK] migrated action stats ({}): {}".format(
+            stats_status, stats_path))
     else:
         print("[NOTE] Keep legacy_gripper_scale=1.0 in the checkpoint directory config.")
 
