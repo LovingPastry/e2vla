@@ -12,6 +12,15 @@ wrong.
 
 After migration, q01/q99 absorb that transform and ``action2states`` returns
 ``raw_gripper`` directly.
+
+Usage：
+python -m data_prepare.migrate_joint_gripper_checkpoint \
+  --input checkpoints/E2VA/VA_TF_FLOW/ckpt_best.pt \
+  --output checkpoints/E2VA/VA_TF_FLOW_RAW/ckpt_best.pt \
+  --old-raw-min 0.0 \
+  --old-raw-max 1.5 \
+  --config checkpoints/E2VA/VA_TF_FLOW/202608121001.json \
+  --output-config checkpoints/E2VA/VA_TF_FLOW_RAW/config.json
 """
 
 import argparse

@@ -277,8 +277,17 @@ def build_pipeline_report(arrays: dict, ckpt: dict, old_min: float, old_max: flo
         | (restored_unit * legacy_scale > 1.0)))
 
     old_stats = ckpt.get("action_norm")
-    migrated_stats = None
-    if old_stats is not None:
+    if old_stats is None:
+        # The old model denoised joint angles directly and the gripper's hard-coded
+        # 2*unit-1 value directly. The migration normalizer must therefore be identity
+        # on joint channels and [old_min, old_max] on the raw gripper channel.
+        migrated_stats = {
+            "raw_gripper_q01": old_min,
+            "raw_gripper_q99": old_max,
+            "note": ("compatibility stats for this trained checkpoint; do not replace "
+                     "with empirical data q01/q99 without retraining"),
+        }
+    else:
         migrated_stats = {
             "raw_gripper_q01": ((float(old_stats["q01"][-1]) + 1.0) * 0.5
                                   * (old_max - old_min) + old_min),
@@ -326,7 +335,17 @@ def build_pipeline_report(arrays: dict, ckpt: dict, old_min: float, old_max: flo
             "joint_last_direct_q01": describe(arrays["joint"])["q01"],
             "joint_last_direct_q99": describe(arrays["joint"])["q99"],
             "migrated_checkpoint_q01_q99": migrated_stats,
-            "legacy_gripper_scale_must_be": 1.0,
+            "correct_legacy_decode_to_raw": {
+                "scale": old_max - old_min,
+                "offset": old_min,
+                "formula": "raw=decoded_unit*scale+offset",
+            },
+            "legacy_gripper_scale_after_checkpoint_migration": 1.0,
+            "old_code_hotfix_without_checkpoint_migration": {
+                "legacy_gripper_scale": old_max - old_min,
+                "valid_only_because_old_gripper_min_is_zero": old_min == 0.0,
+                "robot_side_extra_0_to_1_mapping": "remove",
+            },
             "extra_openness_or_robot_range_mapping": "none",
         },
     }
