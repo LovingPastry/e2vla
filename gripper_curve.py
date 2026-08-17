@@ -7,6 +7,13 @@
     CUDA_VISIBLE_DEVICES=0 python gripper_curve.py --ckpt ... --episode 3
     CUDA_VISIBLE_DEVICES=0 python gripper_curve.py --ckpt ... --start 80 --end 200 --stride 2
 
+    # 迁移后的真机关节 checkpoint；CSV 的 gt 是磁盘原始 action，pred 是模型最终返回值
+    CUDA_VISIBLE_DEVICES=0 python gripper_curve.py \
+      --ckpt checkpoints/E2VA/VA_TF_FLOW_RAW/ckpt_best.pt \
+      --data_root /data/lanzc/task0_0716_process \
+      --episode 0 --exec_step 0 --stride 1 --bs 8 --no_table \
+      --out eval_results/gripper_raw_ep0.png
+
 与 `dump_chunk.py` 的分工：那边是一个观测、整条 chunk 的所有通道，看"这一次预测了什么"；
 这边是一条 episode、每帧只取 chunk 的**第一个动作**、只看夹爪那一维，看"夹爪指令在整段
 轨迹上的走向"。后者才能回答"夹爪到底动没动"——单看一个 chunk，真值本来就可能整段都不翻转
@@ -197,6 +204,10 @@ def print_summary(gt: np.ndarray, pred: np.ndarray, delta: np.ndarray,
         float(np.abs(delta).mean()), float(np.abs(delta).max())))
     if binary_threshold is None:
         print("  [INFO] raw gripper: 0=张开，数值增大=闭合；不使用 0.5 二值阈值。")
+        below = int(np.count_nonzero(pred < gt.min()))
+        above = int(np.count_nonzero(pred > gt.max()))
+        print("  [INFO] 本段 GT 范围 [{:.4f}, {:.4f}]；预测低于/高于该范围：{}/{} 帧"
+              .format(gt.min(), gt.max(), below, above))
     else:
         agree = float(np.mean((gt > binary_threshold) == (pred > binary_threshold)))
         print("  二值一致率 {:.1%}".format(agree))

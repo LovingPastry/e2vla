@@ -21,6 +21,27 @@ python -m data_prepare.migrate_joint_gripper_checkpoint \
   --old-raw-max 1.5 \
   --config checkpoints/E2VA/VA_TF_FLOW/202608121001.json \
   --output-config checkpoints/E2VA/VA_TF_FLOW_RAW/config.json
+
+迁移完成后，在服务器仓库根目录依次验证（GT 是磁盘原始 action，Pred 是模型最终返回值）：
+
+# 1. 固定一个观测，逐步打印一个 action chunk；--raw 同时打印模型内部归一化值
+CUDA_VISIBLE_DEVICES=0 python dump_chunk.py \
+  --ckpt checkpoints/E2VA/VA_TF_FLOW_RAW/ckpt_best.pt \
+  --data_root /data/lanzc/task0_0716_process \
+  --index 0 --step 0 --samples 3 --raw
+
+# 2. 扫完整 episode；生成的 CSV 中 gt=原始 actions[:, -1]，pred=最终模型输出
+CUDA_VISIBLE_DEVICES=0 python gripper_curve.py \
+  --ckpt checkpoints/E2VA/VA_TF_FLOW_RAW/ckpt_best.pt \
+  --data_root /data/lanzc/task0_0716_process \
+  --episode 0 --exec_step 0 --stride 1 --bs 8 --no_table \
+  --out eval_results/gripper_raw_ep0.png
+
+# 3. 批量开环统计；grip_l1 的单位与磁盘原始夹爪 action 相同
+CUDA_VISIBLE_DEVICES=0 python test.py \
+  --ckpt checkpoints/E2VA/VA_TF_FLOW_RAW/ckpt_best.pt \
+  --data_root /data/lanzc/task0_0716_process \
+  --num_samples 256 --bs 8 --workers 4 --seed 0 --save
 """
 
 import argparse

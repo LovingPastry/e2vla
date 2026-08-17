@@ -16,6 +16,12 @@
     # 顺带打印模型内部的动作向量（t3r6 / 归一化后的值），而不是解码回来的 state
     CUDA_VISIBLE_DEVICES=0 python dump_chunk.py --ckpt ... --raw
 
+    # 迁移后的真机关节 checkpoint：表格 gt 是原始 action，pd 是最终反归一化输出
+    CUDA_VISIBLE_DEVICES=0 python dump_chunk.py \
+      --ckpt checkpoints/E2VA/VA_TF_FLOW_RAW/ckpt_best.pt \
+      --data_root /data/lanzc/task0_0716_process \
+      --index 0 --step 0 --samples 3 --raw
+
 与 `test.py` 的分工：那边是遍历数据集出统计量（mean/p50/p90 + hold 基线），回答"这个 ckpt
 大概能不能用"；这边只看一个样本的原始数字，回答"它到底预测了什么"。所以这里刻意不做任何
 聚合——夹爪卡住、动作块整体不动、chunk 后半段发散这类问题，看统计量只能看出"有问题"，
@@ -32,7 +38,7 @@ objective / action_layout / action_norm 三个戳的校验都在那里），数�
 
 import os
 import argparse
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import envars  # noqa: F401  必须在 torchvision（被 data_utils 带进来）之前 import
 import numpy as np
@@ -227,13 +233,12 @@ def print_table(cols: List[str], gt: np.ndarray, preds: List[np.ndarray], stride
 
 
 def print_gripper_summary(gt: np.ndarray, preds: List[np.ndarray], cur_grip: float,
-                          threshold: float = 0.5):
-    """夹爪单独再看一眼：它是唯一离散跳变的通道，塌到均值时表格里不明显，这里明显。
-
-    `变化次数` 数的是二值化后的翻转次数，也就是下游真正会执行的那个量——
-    `examples/libero/eval.py` 就是 `(g > 0.5)` 之后再映射成 -1/+1 的指令。
-    """
+                          threshold: Optional[float]):
+    """单独汇总夹爪；raw command 不套用 openness 的 0.5 二值阈值。"""
     def describe(g: np.ndarray) -> str:
+        if threshold is None:
+            return "min {:.3f}  max {:.3f}  极差 {:.3f}".format(
+                g.min(), g.max(), g.max() - g.min())
         binary = g > threshold
         flips = int(np.count_nonzero(binary[1:] != binary[:-1]))
         return ("min {:.3f}  max {:.3f}  极差 {:.3f}  过阈值翻转 {} 次  "
@@ -257,6 +262,8 @@ def print_gripper_summary(gt: np.ndarray, preds: List[np.ndarray], cur_grip: flo
     if pred_range < 0.1 and gt_range > 0.3:
         print("  [WARN] 真值夹爪在动（极差 {:.3f}）而预测基本是常量（极差 {:.3f}）——"
               "这就是'夹爪不动'".format(gt_range, pred_range))
+    if threshold is None:
+        print("  [INFO] raw gripper: 0=张开，数值增大=闭合；不使用 0.5 二值阈值。")
 
 
 def print_raw(action_space: ActionSpace, action_norm, cam_pose: Tensor, ee_pose: Tensor,
@@ -297,7 +304,8 @@ def print_sample(action_space: ActionSpace, sample: Dict, gt: np.ndarray,
         sample.get("prompt_text", "")))
     print("-" * 78)
     print_table(cols, gt_table, pred_tables, stride)
-    print_gripper_summary(gt, preds, float(gripper_column(cur_state)))
+    threshold = (None if action_space.layout.endswith("_raw_gripper") else 0.5)
+    print_gripper_summary(gt, preds, float(gripper_column(cur_state)), threshold)
 
 
 # ---------------------------------------------------------------------------

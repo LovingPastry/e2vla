@@ -2,6 +2,7 @@ import os
 import cv2
 import copy
 import glob
+import json
 import torch
 import threading
 import numpy as np
@@ -28,8 +29,34 @@ def parse_config(ckpt_dir: str):
     config_files.sort()
 
     assert len(config_files), "No config files found in {}".format(ckpt_dir)
-    config_file = config_files[-1]
+
+    # Checkpoint directories can also contain action-normalization metadata.  Picking the
+    # lexicographically last *.json used to make a migrated checkpoint accidentally feed
+    # raw_gripper_action_norm.json into TrainConfig.load().  Select by document shape so
+    # filenames remain free to describe their purpose.
+    config_candidates = []
+    skipped = []
+    required_keys = {"model", "action_space", "dataset_classes"}
+    for path in config_files:
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                payload = json.load(fp)
+        except (OSError, ValueError):
+            skipped.append(path)
+            continue
+        if isinstance(payload, dict) and required_keys.issubset(payload):
+            config_candidates.append(path)
+        else:
+            skipped.append(path)
+
+    assert config_candidates, (
+        "No TrainConfig JSON found in {}. Scanned: {}"
+        .format(ckpt_dir, ", ".join(config_files)))
+    config_file = config_candidates[-1]
     print("[INFO] Use config file {}".format(config_file))
+    if skipped:
+        print("[INFO] Ignore non-config JSON: {}".format(
+            ", ".join(os.path.basename(path) for path in skipped)))
 
     cfg = TrainConfig.load(config_file)
     data_config = cfg.dataset_classes[0].config
