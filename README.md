@@ -23,16 +23,32 @@ NUM_JOINTS = 7
 
 数据中的 `joint` 必须有 8 列：前 7 列是弧度制关节角，最后一列是夹爪原值。
 
-在 [configs.py](configs.py) 的 `CONFIGS` 区域新增配置：
+例如，要使用同格式的新数据，从零训练一个满足以下条件的模型：
+
+- VA 模型，不使用语言和相机参数；
+- `sa` 作为 ContextEncoder；
+- Flow Matching 作为动作专家训练目标；
+- 输出 7 个绝对关节角和 1 个夹爪原值；
+
+在 [configs.py](configs.py) 的 `CONFIGS` 区域新增：
 
 ```python
-CONFIGS["va_real_joint_new"] = make_real_joint_config(
-    context_encoder="sa",
+CONFIGS["va_real_joint_new_sa_flow"] = make_real_joint_config(
+    context_encoder="sa",        # VA：无语言的 SA ContextEncoder
+    objective="flow",            # 动作专家使用 Flow Matching
+    action_space="joint7",       # 7 个绝对关节角 + gripper_raw
     action_norm_stats="./action_stats/real_joint7_new.json",
-    pretrained_ckpt=None,
-    legacy_gripper_scale=1.0,
+    pretrained_ckpt=None,         # 从零训练，不加载旧 checkpoint
+    lora_rank=0,                  # 全量训练 ContextEncoder
+    vlm_lora_rank=0,
+    conv_tower="none",
+    legacy_gripper_scale=1.0,     # 关闭旧夹爪兼容缩放
 )
 ```
+
+`make_real_joint_config()` 已经选择 `RealBinDataset`，并继承真机关节模型的 batch size、学习率、EMA 和保存周期等默认值。
+
+新数据的根目录由 `RealBinDataset.inst()` 决定。如果新数据不在默认路径，修改 [data_utils/dataset_real.py](data_utils/dataset_real.py) 中 `inst()` 的 `data_root` 默认值。
 
 对算法的修改可以参考 [算法配置讲解](docs/ALGORITHMS.md)。
 
@@ -48,7 +64,7 @@ python -m data_utils.dataset_real /data/lanzc/task0_0716_process
 
 ```bash
 python -m data_prepare.compute_action_stats \
-  --config va_real_joint_new \
+  --config va_real_joint_new_sa_flow \
   -o ./action_stats/real_joint7_new.json
 ```
 
@@ -67,26 +83,26 @@ action_dim = 8
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train.py \
-  --config va_real_joint_new \
-  -s VA_REAL_JOINT_NEW
+  --config va_real_joint_new_sa_flow \
+  -s VA_REAL_JOINT_NEW_SA_FLOW
 ```
 
 临时覆盖 batch size、学习率和训练步数：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train.py \
-  --config va_real_joint_new \
+  --config va_real_joint_new_sa_flow \
   --bs 8 \
   --max_lr 5e-5 \
   --max_iterations 30000 \
-  -s VA_REAL_JOINT_NEW
+  -s VA_REAL_JOINT_NEW_SA_FLOW
 ```
 
 输出位置：
 
 ```text
-logs/E2VLA/VA_REAL_JOINT_NEW/
-checkpoints/E2VLA/VA_REAL_JOINT_NEW/
+logs/E2VLA/VA_REAL_JOINT_NEW_SA_FLOW/
+checkpoints/E2VLA/VA_REAL_JOINT_NEW_SA_FLOW/
 ```
 
 查看曲线：
@@ -99,7 +115,7 @@ tensorboard --logdir ./logs/E2VLA
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python test.py \
-  --ckpt ./checkpoints/E2VLA/VA_REAL_JOINT_NEW/ckpt_latest.pt \
+  --ckpt ./checkpoints/E2VLA/VA_REAL_JOINT_NEW_SA_FLOW/ckpt_latest.pt \
   --data_root /data/lanzc/task0_0716_process \
   --num_samples 256 \
   --bs 8 \
