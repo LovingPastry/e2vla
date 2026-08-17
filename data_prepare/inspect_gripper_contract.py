@@ -27,7 +27,21 @@ def describe(values: np.ndarray):
         "median": float(quantiles[2]),
         "q99": float(quantiles[3]),
         "max": float(quantiles[4]),
+        "count_le_1e-8": int(np.count_nonzero(finite <= 1e-8)),
+        "count_le_1e-4": int(np.count_nonzero(finite <= 1e-4)),
+        "count_le_1e-3": int(np.count_nonzero(finite <= 1e-3)),
+        "count_le_1e-2": int(np.count_nonzero(finite <= 1e-2)),
     }
+
+
+def longest_true_run(mask: np.ndarray):
+    indices = np.flatnonzero(mask)
+    if not len(indices):
+        return 0
+    breaks = np.flatnonzero(np.diff(indices) > 1)
+    starts = np.r_[0, breaks + 1]
+    ends = np.r_[breaks, len(indices) - 1]
+    return int(np.max(indices[ends] - indices[starts] + 1))
 
 
 def load_array(traj_dir: str, name: str, metadata: dict):
@@ -50,6 +64,9 @@ def inspect_data(data_root: str, episode_limit: int):
     norm_parts = []
     paired_raw = []
     paired_norm = []
+    action_last_parts = []
+    paired_joint_action = []
+    near_zero_episodes = []
     schemas = {}
     episodes_with_norm = 0
 
@@ -71,6 +88,28 @@ def inspect_data(data_root: str, episode_limit: int):
             raise ValueError("{}: joint shape is {}".format(traj_dir, joint.shape))
         raw = np.asarray(joint[:, -1], dtype=np.float64)
         raw_parts.append(raw)
+        near_zero = raw <= 1e-4
+        if np.any(near_zero):
+            minimum_index = int(np.argmin(raw))
+            lo = max(0, minimum_index - 5)
+            hi = min(len(raw), minimum_index + 6)
+            near_zero_episodes.append({
+                "episode": os.path.relpath(traj_dir, os.path.abspath(data_root)),
+                "length": int(len(raw)),
+                "minimum": float(raw[minimum_index]),
+                "minimum_index": minimum_index,
+                "count_le_1e-4": int(np.count_nonzero(near_zero)),
+                "longest_run_le_1e-4": longest_true_run(near_zero),
+                "values_around_minimum": raw[lo:hi].tolist(),
+                "window_start_index": lo,
+            })
+
+        if "actions" in metadata:
+            actions = load_array(traj_dir, "actions", metadata)
+            if actions.ndim == 2 and len(actions) == len(raw):
+                action_last = np.asarray(actions[:, -1], dtype=np.float64)
+                action_last_parts.append(action_last)
+                paired_joint_action.append((raw, action_last))
 
         if "norm_openness" in metadata:
             episodes_with_norm += 1
@@ -89,7 +128,21 @@ def inspect_data(data_root: str, episode_limit: int):
         "episodes_with_norm_openness": episodes_with_norm,
         "joint_last_raw": describe(raw),
         "schema_variants": schemas,
+        "episodes_with_joint_le_1e-4": len(near_zero_episodes),
+        "near_zero_episode_details": near_zero_episodes,
     }
+
+    if action_last_parts:
+        action_last = np.concatenate(action_last_parts)
+        result["actions_last_raw"] = describe(action_last)
+        joint_values = np.concatenate([pair[0] for pair in paired_joint_action])
+        action_values = np.concatenate([pair[1] for pair in paired_joint_action])
+        delta = action_values - joint_values
+        result["actions_last_minus_joint_last"] = {
+            "mae": float(np.mean(np.abs(delta))),
+            "max_abs": float(np.max(np.abs(delta))),
+            "correlation": float(np.corrcoef(joint_values, action_values)[0, 1]),
+        }
 
     if norm_parts:
         norm = np.concatenate(norm_parts)
@@ -158,8 +211,8 @@ def inspect_checkpoint(path: str):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", required=True)
-    parser.add_argument("--ckpt", required=True, nargs="+",
-                        help="one or more old checkpoints")
+    parser.add_argument("--ckpt", required=True, action="append",
+                        help="old checkpoint; repeat --ckpt to inspect more than one")
     parser.add_argument("--episodes", type=int, default=0,
                         help="number of episodes to scan; 0 means all")
     return parser.parse_args()
