@@ -205,10 +205,10 @@ def print_summary(gt: np.ndarray, pred: np.ndarray, delta: np.ndarray):
               "memmap 数据看 RealBinDataset.get_openness 的 GRIPPER_MIN/MAX 与 "
               "norm_openness 分支（后者原样透传，不做 clip）。")
     elif gt.max() < 0.6:
-        print("  [WARN] GT 夹爪最大只有 {:.3f}，从未达到"
-              "\"张开\"（1.0）。下游 `>{:.1f}` 二值化后会恒为闭合——"
-              "这份数据里夹爪本来就不会动，先查 GRIPPER_MIN/MAX。".format(
-                  gt.max(), BINARY_THRESHOLD))
+        print("  [INFO] GT 夹爪最大为 {:.3f}，示教未覆盖物理全开。这本身不是"
+              "数据错误；物理量程端点正确时不要重定标。".format(gt.max()))
+        print("         如果部署端使用 `>{:.1f}` 二值化，它才会被错误地变成"
+              "恒定全闭指令；真机应直接执行连续位置。".format(BINARY_THRESHOLD))
     if pred_range < 0.1 and gt_range > 0.3:
         print("  [WARN] 真值在动（极差 {:.3f}）而预测几乎是常量（极差 {:.3f}）——"
               "夹爪塌成了边缘均值".format(gt_range, pred_range))

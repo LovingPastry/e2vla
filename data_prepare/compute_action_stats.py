@@ -6,7 +6,8 @@
 WHAT IT MEASURES, and why it cannot be done by reading the HDF5 files directly: the
 model does not act in the dataset's coordinates. It predicts a delta from the current
 end-effector pose, expressed in the orientation of camera 0 at the latest observed
-timestep, as 3 translation + a 6D rotation, plus a rescaled gripper openness. That
+timestep, as 3 translation + a 6D rotation, plus a gripper channel. Joint action spaces
+keep the dataset's raw gripper value; their q01/q99 are the only gripper scaling. That
 encoding depends on the DataConfig (which cameras, `sample_state_gaps`, the future
 horizon, whether cameras are shuffled), so the statistics are a property of the
 *config*, not of the dataset on disk. Under `action_space="ee_base"` -- what the
@@ -47,7 +48,7 @@ from data_utils.dataset_base import get_dataloader, generate_sample_weights
 
 
 # names for the report only. The EE-pose space has 10 fixed channels; a joint space is
-# nq joints + openness, so its names are generated.
+# nq joints + a raw gripper value, so its names are generated.
 EE_CHANNEL_NAMES = ["tx", "ty", "tz",
                     "r00", "r10", "r20", "r01", "r11", "r21",
                     "openness"]
@@ -57,7 +58,7 @@ def channel_names(action_space):
     # Both EE layouts share the channel meanings; only the frame they live in differs.
     if action_space.layout in EE_POSE_LAYOUTS:
         return EE_CHANNEL_NAMES
-    return ["q{}".format(i) for i in range(action_space.action_dim - 1)] + ["openness"]
+    return ["q{}".format(i) for i in range(action_space.action_dim - 1)] + ["gripper_raw"]
 
 
 def parse_args(argv=None):
@@ -179,7 +180,8 @@ def collect_actions(cfg: TrainConfig, args) -> np.ndarray:
     return actions
 
 
-def report(actions: np.ndarray, q01: np.ndarray, q99: np.ndarray, names: List[str]):
+def report(actions: np.ndarray, q01: np.ndarray, q99: np.ndarray, names: List[str],
+           action_space):
     print("\n{:>9} {:>12} {:>12} {:>12} {:>12} {:>12}"
           .format("channel", "min", "q01", "q99", "max", "span"))
     for i, name in enumerate(names[:actions.shape[1]]):
@@ -195,39 +197,32 @@ def report(actions: np.ndarray, q01: np.ndarray, q99: np.ndarray, names: List[st
     print("  " + "  ".join("{}={:.3f}".format(n, f)
                            for n, f in zip(names, outside)))
 
-    check_openness(q01[-1], q99[-1])
+    if action_space.layout in EE_POSE_LAYOUTS:
+        check_openness(actions[:, -1].min(), q01[-1], q99[-1],
+                       actions[:, -1].max())
 
 
-def check_openness(q01: float, q99: float):
-    """Openness is the one channel whose range is known a priori -- flag it if it is off.
+def check_openness(minimum: float, q01: float, q99: float, maximum: float):
+    """Report openness coverage without confusing demonstration range with calibration.
 
     Every other channel's scale is an empirical property of the robot and the task, so
     there is nothing to compare its quantiles against. Openness is different: it comes
     from the dataset contract `[0 (close), 1 (open)]` through `states2action`'s
-    `(x - 0.5) * 2`, so a healthy channel spans very nearly [-1, +1] -- q01 near -1 when
-    the gripper fully closes, q99 near +1 when it fully opens.
-
-    A negative q99 therefore means the gripper never opened past halfway *as the dataset
-    defines openness*, which in practice means the dataset's own conversion is wrong --
-    `RealBinDataset.GRIPPER_MIN/MAX` is the usual culprit (run
-    `python -m data_utils.dataset_real` to see the raw range). Nothing downstream reports
-    this: training converges on the squashed target, the model fits it well, and only the
-    `(g > 0.5)` binarisation at deploy turns it into a constant gripper command.
+    `(x - 0.5) * 2`, so valid values are in [-1, +1]. A particular demonstration need
+    not reach either endpoint: a fragile object may deliberately be held with a partial
+    closure. q01/q99 describe training coverage, not the gripper's mechanical endpoints.
     """
     span = q99 - q01
-    if q99 < 0.5:
-        print("\n[WARN] openness q99 = {:+.3f} (< 0.5): the gripper never opens past "
-              "halfway in the dataset's own units.".format(q99))
-        print("       Healthy is q01 ~ -1, q99 ~ +1 (openness comes from [0,1] through "
-              "(x-0.5)*2). Check the dataset's")
-        print("       raw-to-openness conversion -- for memmap data that is "
-              "RealBinDataset.GRIPPER_MIN/MAX; run `python -m data_utils.dataset_real`.")
-        print("       Normalizing with these stats hides it during training and the "
-              "gripper still comes out wrong at deploy.")
+    if minimum < -1.0 - 1e-6 or maximum > 1.0 + 1e-6:
+        print("\n[WARN] openness is outside [-1,+1]: [{:+.3f}, {:+.3f}]. Check the "
+              "dataset's physical full-close/full-open calibration."
+              .format(minimum, maximum))
     elif span < 1.5:
-        print("\n[WARN] openness spans only {:.3f} of the expected 2.0 ([-1, +1]). The "
-              "gripper uses {:.0f}% of its".format(span, span / 2 * 100))
-        print("       nominal range; verify the dataset's raw-to-openness conversion.")
+        print("\n[INFO] openness q01/q99 span is {:.3f} ({:.0f}% of the physical "
+              "range). Partial coverage is valid; do not remap the demonstration's "
+              "min/max to [-1,+1].".format(span, span / 2 * 100))
+        print("       Deploy this channel as a continuous position command. Thresholding "
+              "it would discard the demonstrated grip strength.")
 
 
 def main(argv=None):
@@ -246,7 +241,7 @@ def main(argv=None):
     actions = collect_actions(cfg, args)
     q01 = np.percentile(actions, 1, axis=0)
     q99 = np.percentile(actions, 99, axis=0)
-    report(actions, q01, q99, channel_names(action_space))
+    report(actions, q01, q99, channel_names(action_space), action_space)
 
     normalizer = ActionNormalizer(
         q01=q01.tolist(),

@@ -195,7 +195,7 @@ class BaseRelEEPose(CamRelEEPose):
 
 
 class AbsJoint(ActionSpace):
-    """绝对关节角 + 夹爪开合度。
+    """绝对关节角 + 数据集原始夹爪值。
 
     为什么是绝对角而不是增量：这与 EE 路径的设计取向相反，是有意的。EE 那边预测增量是因为
     绝对世界位姿依赖标定，跨 episode 不可比；关节角本身就在机器人自己的坐标里，绝对值天然
@@ -203,8 +203,8 @@ class AbsJoint(ActionSpace):
     也都是绝对目标。要改成增量的话，覆盖 states2action/action2states 两个方法即可，但记得
     同时改 `layout`，否则旧统计文件会静默套用。
 
-    量纲：这里不做任何归一化，输出的就是弧度 + [-1,1] 的夹爪。缩放交给 ActionNormalizer 的
-    q01/q99，和 EE 路径共用同一套机制——用 compute_action_stats 在本空间上重算即可。用关节
+    量纲：这里不做任何归一化，输出的就是弧度 + 数据集夹爪原值。所有缩放都交给
+    ActionNormalizer 的 q01/q99，用 compute_action_stats 在本空间上计算。用关节
     限位 q_min/q_max 归一化也可以，但单任务下 demo 只覆盖限位的一小段，q01/q99 的范围更紧、
     分辨率更高。
 
@@ -222,16 +222,13 @@ class AbsJoint(ActionSpace):
         self.state_dim = num_joints + 1
         self.action_dim = num_joints + 1
         self.name = "joint{}".format(num_joints)
-        self.layout = "abs_joint{}_openness".format(num_joints)
+        self.layout = "abs_joint{}_raw_gripper".format(num_joints)
 
     def states2action(self, cur_wcT, cur_weT, states, action_norm=None):
-        """(B, T, nq+1) -> (B, T, nq+1)。夹爪从数据集的 [0,1] 重标定到 [-1,1]，与 EE
-        路径的第 2 步一致；关节角原样透传。"""
+        """(B, T, nq+1) -> (B, T, nq+1)。所有通道只做 q01/q99 归一化。"""
         assert states.shape[-1] == self.state_dim, \
             "期望 state_dim={}，实得 {}".format(self.state_dim, states.shape[-1])
-        joints = states[..., :self.num_joints]
-        openness = (states[..., -1:] - 0.5) * 2
-        action = torch.cat([joints, openness], dim=-1)
+        action = states
         if action_norm is not None:
             action = action_norm.normalize(action)
         return action
@@ -239,20 +236,18 @@ class AbsJoint(ActionSpace):
     def action2states(self, cur_wcT, cur_weT, action, action_norm=None):
         if action_norm is not None:
             action = action_norm.unnormalize(action)
-        joints = action[..., :self.num_joints]
-        openness = action[..., -1:] / 2 + 0.5
-        return torch.cat([joints, openness], dim=-1)
+        return action
 
     def loss(self, pred, target):
         nq = self.num_joints
         joint_loss = F.l1_loss(pred[..., :nq], target[..., :nq], reduction="mean")
-        openness_loss = F.l1_loss(pred[..., nq:nq+1], target[..., nq:nq+1],
-                                  reduction="mean")
+        gripper_loss = F.l1_loss(pred[..., nq:nq+1], target[..., nq:nq+1],
+                                 reduction="mean")
         # 权重沿用 EE 路径的量级，性质见基类 `ActionSpace.loss` 的说明。
-        total_loss = 30 * joint_loss + 10 * openness_loss
+        total_loss = 30 * joint_loss + 10 * gripper_loss
         return total_loss, {
             "joint_loss": joint_loss.item(),
-            "openness_loss": openness_loss.item(),
+            "gripper_loss": gripper_loss.item(),
             "total_loss": total_loss.item(),
         }
 
@@ -261,7 +256,6 @@ class AbsJoint(ActionSpace):
         nq = self.num_joints
         joint_err = (pred_states[..., :nq] - gt_states[..., :nq]).abs()  # (B, Ta, nq) 弧度
         grip_err = (pred_states[..., -1] - gt_states[..., -1]).abs()
-        grip_acc = ((pred_states[..., -1] > 0.5) == (gt_states[..., -1] > 0.5)).float()
         return {
             "joint_err_rad": joint_err.mean().item(),
             "joint_err_deg": torch.rad2deg(joint_err.mean()).item(),
@@ -270,7 +264,6 @@ class AbsJoint(ActionSpace):
             "joint_err_max_rad": joint_err.amax(dim=-1).mean().item(),
             "joint_err_last_rad": joint_err[:, -1].mean().item(),
             "grip_l1": grip_err.mean().item(),
-            "grip_acc": grip_acc.mean().item(),
         }
 
 

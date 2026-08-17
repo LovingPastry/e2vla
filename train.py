@@ -143,6 +143,12 @@ class Trainer(object):
         self.cfg, save, conti = init_train_config()
         print("[INFO] Train config:")
         print(self.cfg)
+        if self.cfg.legacy_gripper_scale != 1.0:
+            raise ValueError(
+                "legacy_gripper_scale is inference-only compatibility for an old "
+                "checkpoint and must be 1.0 while training. Leaving it enabled in a "
+                "new run stamps the legacy multiplier into the new checkpoint and can "
+                "saturate continuous gripper predictions at deploy.")
 
         self.model_device = "cuda:0"
         # Built before the model: the normalizer is a constructor argument, because both
@@ -155,6 +161,13 @@ class Trainer(object):
         self.action_norm = build_action_normalizer(
             self.cfg.action_norm_stats, what="action_norm_stats",
             expect_layout=self.action_space.layout)
+        if (self.action_space.layout.startswith("abs_joint")
+                and self.action_space.layout.endswith("_raw_gripper")
+                and self.action_norm is None):
+            raise ValueError(
+                "raw-gripper joint action spaces require action_norm_stats. The raw "
+                "gripper channel is intentionally scaled only by q01/q99; run "
+                "python -m data_prepare.compute_action_stats first.")
         if self.action_norm is None:
             print("[INFO] No action normalization (action_norm_stats is unset): the head "
                   "denoises raw camera-relative actions.")

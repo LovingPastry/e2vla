@@ -119,6 +119,12 @@ def load_model(path, device, use_ema: bool = False):
     if cfg.legacy_gripper_scale == 1.0:
         print("[INFO] Legacy gripper output correction is disabled (scale=1.0)")
     else:
+        if action_space.layout.endswith("_raw_gripper"):
+            raise ValueError(
+                "legacy_gripper_scale must be 1.0 for raw-gripper checkpoints: "
+                "q01/q99 already return the dataset's raw gripper value, so an extra "
+                "multiplier would corrupt it. Update the config JSON next to the "
+                "checkpoint.")
         print("[WARN] Legacy gripper output correction is enabled: scale={:.8f}. "
               "This multiplier is applied only to inference openness after action "
               "unnormalization; do not enable it for newly trained checkpoints."

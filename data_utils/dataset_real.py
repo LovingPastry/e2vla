@@ -41,28 +41,28 @@ def load_dicted_array(data_path: str, mode: str = "r") -> Dict[str, np.memmap]:
     return data
 
 
-def compose_ee_gripper(ee_poses: np.ndarray, openness: np.ndarray) -> np.ndarray:
-    """(T, nee, 4, 4) + (T, nee) -> (T, nee, 17)，17 = 行主序展平的 4x4 + 夹爪开合度。
+def compose_ee_gripper(ee_poses: np.ndarray, gripper: np.ndarray) -> np.ndarray:
+    """(T, nee, 4, 4) + (T, nee) -> (T, nee, 17)，末维是夹爪原值。
 
     与 `h5io.compose_ee_gripper` 同构，单独写一份是为了不依赖 h5 那侧的 traj 结构。
     """
     T, nee = ee_poses.shape[:2]
-    assert openness.shape[:2] == (T, nee), \
-        "openness {} 与 ee_poses {} 的 (T, nee) 不一致".format(openness.shape, ee_poses.shape)
+    assert gripper.shape[:2] == (T, nee), \
+        "gripper {} 与 ee_poses {} 的 (T, nee) 不一致".format(gripper.shape, ee_poses.shape)
     return np.concatenate([
         ee_poses.reshape(T, nee, 16),
-        openness.reshape(T, nee, 1),
+        gripper.reshape(T, nee, 1),
     ], axis=-1).astype(np.float32)
 
 
-def compose_joint_gripper(joints: np.ndarray, openness: np.ndarray) -> np.ndarray:
+def compose_joint_gripper(joints: np.ndarray, gripper: np.ndarray) -> np.ndarray:
     """(T, nee, nq) + (T, nee) -> (T, nee, nq+1)。关节空间下 `AbsJoint` 的 state 布局。"""
     T, nee = joints.shape[:2]
-    assert openness.shape[:2] == (T, nee), \
-        "openness {} 与 joints {} 的 (T, nee) 不一致".format(openness.shape, joints.shape)
+    assert gripper.shape[:2] == (T, nee), \
+        "gripper {} 与 joints {} 的 (T, nee) 不一致".format(gripper.shape, joints.shape)
     return np.concatenate([
         joints,
-        openness.reshape(T, nee, 1),
+        gripper.reshape(T, nee, 1),
     ], axis=-1).astype(np.float32)
 
 
@@ -96,10 +96,8 @@ class RealBinDataset(H5DatasetMapBase):
     # 存的是不是 BGR。你 pkl 路径里做过 [:, :, [2,1,0]]，memmap 路径要确认转换是否已在
     # process 阶段做掉；搞反了模型照样收敛，但和预训练权重的色彩统计对不上
     IS_BGR: bool = False
-    # 夹爪开合度：优先读独立的 `norm_openness` 数组（已在 [0,1]）；没有则从 joint 的最后
-    # 一列按 [GRIPPER_MIN, GRIPPER_MAX] 线性映射到 [0,1]（0=闭合, 1=张开）
-    GRIPPER_MIN: float = 0.0
-    GRIPPER_MAX: float = 0.4314
+    # joint 最后一列的夹爪真值原样进入数据契约。这里不再构造 openness，
+    # 也不使用物理程端点做第二次缩放；训练所需的缩放统一由 q01/q99 完成。
     PROMPT_TEXT: str = "pick up the red cup and place it in the coffee machine"
     # 动作空间，必须与 TrainConfig.action_space 一致，见 models/action_space.py
     #   "joint7"  -> history/future_actions 是 (T, nee, 8)，绝对关节角 + 夹爪
@@ -139,19 +137,12 @@ class RealBinDataset(H5DatasetMapBase):
             self._cache[i] = load_dicted_array(self.h5_filelist[i])
         return self._cache[i]
 
-    def get_openness(self, traj: Dict[str, np.memmap]) -> np.ndarray:
-        """(L, nee)，[0 (闭合), 1 (张开)]。"""
-        if "norm_openness" in traj:
-            openness = np.asarray(traj["norm_openness"], dtype=np.float32)
-        else:
-            # joint 的最后一列是夹爪宽度（物理量），线性归一化
-            width = np.asarray(traj["joint"], dtype=np.float32)[:, -1]
-            rng = self.GRIPPER_MAX - self.GRIPPER_MIN
-            assert rng > 0, "GRIPPER_MAX 必须大于 GRIPPER_MIN"
-            openness = np.clip((width - self.GRIPPER_MIN) / rng, 0.0, 1.0)
-        if openness.ndim == 1:
-            openness = openness[:, None]  # (L,) -> (L, nee=1)
-        return openness
+    def get_gripper(self, traj: Dict[str, np.memmap]) -> np.ndarray:
+        """(L, nee)，与磁盘 `joint[:, -1]` 数值完全一致。"""
+        gripper = np.asarray(traj["joint"], dtype=np.float32)[:, -1]
+        if gripper.ndim == 1:
+            gripper = gripper[:, None]
+        return gripper
 
     def sample_indices(self, traj_len: int, latest: bool, debug_sample_index: Optional[int]):
         cfg = self.config
@@ -208,7 +199,7 @@ class RealBinDataset(H5DatasetMapBase):
         if ee_poses.ndim == 3:
             ee_poses = ee_poses[:, None]  # (To, 4, 4) -> (To, nee=1, 4, 4)
 
-        openness = self.get_openness(traj)  # (L, nee)
+        gripper = self.get_gripper(traj)  # (L, nee), raw dataset value
 
         if self.action_space.name.startswith("joint"):
             # (L, nq_total) -> (L, nee, nq)。多臂时 joint 需要按 ee 切分，这里按单臂处理，
@@ -220,13 +211,13 @@ class RealBinDataset(H5DatasetMapBase):
             all_joints = all_joints[:, None]  # (L, nee=1, nq)
 
             def gather_actions(ind):
-                return compose_joint_gripper(all_joints[ind], openness[ind])
+                return compose_joint_gripper(all_joints[ind], gripper[ind])
         else:
             def gather_actions(ind):
                 poses = np.asarray(all_ee_poses[ind], dtype=np.float32)
                 if poses.ndim == 3:
                     poses = poses[:, None]
-                return compose_ee_gripper(poses, openness[ind])  # (T, nee, 17)
+                return compose_ee_gripper(poses, gripper[ind])  # (T, nee, 17)
 
         history_actions = gather_actions(hist_ind)   # (nhist, nee, state_dim)
         future_actions = gather_actions(fut_ind)     # (Ta, nee, state_dim)
@@ -338,10 +329,8 @@ def check_contract(dataset: RealBinDataset, num_samples: int = 8):
 
         assert out["rgbs"].dtype == np.float32 and out["rgbs"].max() <= 1.0, \
             "rgbs 必须是已除 255 的 float32"
-        openness = out["future_actions"][..., -1]
-        assert openness.min() >= 0.0 and openness.max() <= 1.0, \
-            "夹爪开合度必须在 [0,1]，实得 [{:.3f}, {:.3f}]；检查 GRIPPER_MIN/MAX".format(
-                openness.min(), openness.max())
+        gripper = out["future_actions"][..., -1]
+        assert np.isfinite(gripper).all(), "夹爪原值包含 NaN/Inf"
         if dataset.action_space.layout in EE_POSE_LAYOUTS:
             poses = out["future_actions"][..., :16].reshape(Ta, nee, 4, 4)
             assert np.allclose(poses[..., 3, :], [0, 0, 0, 1], atol=1e-4), \
@@ -358,31 +347,16 @@ def check_contract(dataset: RealBinDataset, num_samples: int = 8):
 
 
 def stat_gripper(dataset: RealBinDataset, count: int = 50):
-    """扫一遍**原始**夹爪列，报出真实量程，并给出 GRIPPER_MIN/MAX 该填什么。
-
-    为什么值得单独有这个函数：夹爪量程填错了，全链路没有一处会报错。
-    `check_contract` 只查 `[0,1]`，而一条被压进 `[0, 0.25]` 的开合度完全满足它；训练照常
-    收敛（模型会把那条压扁的曲线学得很好，`sample/grip_l1` 甚至很漂亮）；只有到了下游
-    `(g > 0.5)` 二值化那一步，指令才变成恒定值——表现就是"夹爪一步都不动"，而那时已经
-    离数据很远了。`gripper_curve.py` 画出来的 GT 上限远小于 1 就是这个症状。
-
-    Args:
-        count: 扫多少条 episode。量程是全数据集的属性，别只看一条。
-    """
+    """扫描 joint 最后一列；这就是模型反归一化后应返回的夹爪真值。"""
     n = min(count, len(dataset))
     assert n > 0, "数据集是空的"
 
     raw = []
     joint_cols = None
     col_lo = col_hi = None
-    uses_norm_openness = False
 
     for i in range(n):
         traj = dataset.load_traj(i)
-        if "norm_openness" in traj:
-            uses_norm_openness = True
-            raw.append(np.asarray(traj["norm_openness"], dtype=np.float32).ravel())
-            continue
         joints = np.asarray(traj["joint"], dtype=np.float32)
         if joint_cols is None:
             joint_cols = joints.shape[-1]
@@ -400,9 +374,7 @@ def stat_gripper(dataset: RealBinDataset, count: int = 50):
 
     print("=" * 70)
     print("[夹爪量程] 扫了 {} / {} 条 episode，{} 帧".format(n, len(dataset), len(raw)))
-    print("  来源: {}".format(
-        "traj['norm_openness']（get_openness 原样透传，不做 clip 也不缩放）"
-        if uses_norm_openness else "traj['joint'][:, -1]"))
+    print("  来源: traj['joint'][:, -1]（原样透传）")
 
     if joint_cols is not None:
         print("  joint 共 {} 列，NUM_JOINTS = {}".format(joint_cols, dataset.NUM_JOINTS))
@@ -418,39 +390,8 @@ def stat_gripper(dataset: RealBinDataset, count: int = 50):
 
     print("  原始取值范围: [{:.4f}, {:.4f}]".format(lo, hi))
 
-    if uses_norm_openness:
-        print("  当前 get_openness 输出: [{:.4f}, {:.4f}]（原样透传）".format(lo, hi))
-        if lo < -1e-6 or hi > 1 + 1e-6:
-            print("  [ERR ] 超出 [0,1]，违反数据集契约。norm_openness 存的不是开合度，"
-                  "或者是 [-1,1] 的指令——后者需要 (x+1)/2。")
-    else:
-        rng = dataset.GRIPPER_MAX - dataset.GRIPPER_MIN
-        cur = np.clip((np.array([lo, hi]) - dataset.GRIPPER_MIN) / rng, 0.0, 1.0)
-        print("  当前 GRIPPER_MIN/MAX = {} / {}  ->  openness [{:.4f}, {:.4f}]".format(
-            dataset.GRIPPER_MIN, dataset.GRIPPER_MAX, cur[0], cur[1]))
-        if cur[1] - cur[0] < 0.8:
-            print("  [ERR ] 量程只覆盖了 {:.0f}%。下游 `(g > 0.5)` 二值化会拿到恒定指令，"
-                  "夹爪不会动。".format((cur[1] - cur[0]) * 100))
-        if lo < dataset.GRIPPER_MIN - 1e-6:
-            print("  [ERR ] 有 {:.4f} < GRIPPER_MIN，闭合端被 clip 压平，信息已经丢了"
-                  .format(lo))
-        if not wrong_column and cur[1] - cur[0] < 0.999:
-            scale = rng / max(hi - lo, 1e-9)
-            print()
-            print("  两条路，都能用（这个映射是可逆仿射，信息没丢，除非上面报了 clip）:")
-            print("   (1) 不重训。checkpoint 输出的 openness 是以 {:.4f} 为满量程定义的，"
-                  "部署侧用**同一组**".format(rng))
-            print("       常数反变换就自洽：width = openness * {:.4f} + {:.4f}。"
-                  "若下游是按 [0,1] 判阈值的，".format(rng, dataset.GRIPPER_MIN))
-            print("       把输出先仿射过去：openness_correct = openness_pred * {:.4f}"
-                  "（阈值 0.5 等价于 {:.4f}）。".format(scale, 0.5 / scale))
-            print("       代价：模型的绝对误差同比放大 {:.2f} 倍。".format(scale))
-            print("   (2) 重训。把下面这组填进去，监督目标铺满 [0,1]，该通道信噪比高"
-                  " {:.2f} 倍，".format(scale))
-            print("       loss 里的 openness 权重才名副其实。用了 --action_norm_stats "
-                  "的话统计量要重算。")
-            print("      GRIPPER_MIN: float = {:.4f}".format(lo))
-            print("      GRIPPER_MAX: float = {:.4f}".format(hi))
+    print("  模型 state 中的夹爪范围: [{:.4f}, {:.4f}]".format(lo, hi))
+    print("  q01/q99 由 compute_action_stats 直接在这一列上计算。")
 
     print("=" * 70)
     return lo, hi
