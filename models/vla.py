@@ -38,6 +38,9 @@ class VLA(nn.Module):
         # "vl" is the original vision-language one; the other three are vision-action
         # (no language, no camera parameters) -- see models/context_encoder.py.
         context_encoder: str = DEFAULT_CONTEXT_ENCODER,
+        # Inference-only compatibility adapter for checkpoints trained with an incorrect
+        # raw-width -> openness range. 1.0 leaves the historical path bit-for-bit intact.
+        legacy_gripper_scale: float = 1.0,
     ):
         super().__init__()
         self.action_space = build_action_space(action_space)
@@ -73,6 +76,7 @@ class VLA(nn.Module):
             flow_time_alpha=flow_time_alpha,
             conv_tower=conv_tower,
             context_encoder=context_encoder,
+            legacy_gripper_scale=legacy_gripper_scale,
         )
 
         self.reset_parameters()

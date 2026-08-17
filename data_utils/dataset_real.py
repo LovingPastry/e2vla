@@ -99,7 +99,7 @@ class RealBinDataset(H5DatasetMapBase):
     # 夹爪开合度：优先读独立的 `norm_openness` 数组（已在 [0,1]）；没有则从 joint 的最后
     # 一列按 [GRIPPER_MIN, GRIPPER_MAX] 线性映射到 [0,1]（0=闭合, 1=张开）
     GRIPPER_MIN: float = 0.0
-    GRIPPER_MAX: float = 1.5
+    GRIPPER_MAX: float = 0.4314
     PROMPT_TEXT: str = "pick up the red cup and place it in the coffee machine"
     # 动作空间，必须与 TrainConfig.action_space 一致，见 models/action_space.py
     #   "joint7"  -> history/future_actions 是 (T, nee, 8)，绝对关节角 + 夹爪
@@ -434,14 +434,24 @@ def stat_gripper(dataset: RealBinDataset, count: int = 50):
         if lo < dataset.GRIPPER_MIN - 1e-6:
             print("  [ERR ] 有 {:.4f} < GRIPPER_MIN，闭合端被 clip 压平，信息已经丢了"
                   .format(lo))
-        if not wrong_column:
+        if not wrong_column and cur[1] - cur[0] < 0.999:
+            scale = rng / max(hi - lo, 1e-9)
             print()
-            print("  建议改成（数据的真实上下界）:")
+            print("  两条路，都能用（这个映射是可逆仿射，信息没丢，除非上面报了 clip）:")
+            print("   (1) 不重训。checkpoint 输出的 openness 是以 {:.4f} 为满量程定义的，"
+                  "部署侧用**同一组**".format(rng))
+            print("       常数反变换就自洽：width = openness * {:.4f} + {:.4f}。"
+                  "若下游是按 [0,1] 判阈值的，".format(rng, dataset.GRIPPER_MIN))
+            print("       把输出先仿射过去：openness_correct = openness_pred * {:.4f}"
+                  "（阈值 0.5 等价于 {:.4f}）。".format(scale, 0.5 / scale))
+            print("       代价：模型的绝对误差同比放大 {:.2f} 倍。".format(scale))
+            print("   (2) 重训。把下面这组填进去，监督目标铺满 [0,1]，该通道信噪比高"
+                  " {:.2f} 倍，".format(scale))
+            print("       loss 里的 openness 权重才名副其实。用了 --action_norm_stats "
+                  "的话统计量要重算。")
             print("      GRIPPER_MIN: float = {:.4f}".format(lo))
             print("      GRIPPER_MAX: float = {:.4f}".format(hi))
 
-    print("  改完必须重训：openness 的监督目标变了。若用了 --action_norm_stats，"
-          "统计量也要重算。")
     print("=" * 70)
     return lo, hi
 

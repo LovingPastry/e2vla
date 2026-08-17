@@ -22,6 +22,7 @@
 
 import os
 import json
+import math
 from typing import List, Dict
 from dataclasses import dataclass, field, asdict, replace
 
@@ -154,6 +155,12 @@ class TrainConfig(object):
     # action_space 和 DataConfig（哪几个相机、采样间隔、预测长度）。换微调集要重算，
     # 换动作空间更要重算。解析后的统计量会拷进每个 checkpoint，所以评测时这个路径可以不存在了。
     action_norm_stats: str | None = None
+
+    # 仅用于兼容夹爪物理量程配置错误的旧 checkpoint。模型完成 q01/q99 反归一化并把
+    # gripper action 还原成 [0,1] openness 后，再将最终输出乘这个倍率并 clip 到 [0,1]。
+    # 新训练和量程正确的模型必须保持 1.0；旧 real_joint 模型若以 1.5 为满量程、真实满量程
+    # 是 0.4314，则在 checkpoint 同目录的配置 JSON 中设为 1.5 / 0.4314。
+    legacy_gripper_scale: float = 1.0
 
     # 头部在哪个空间里预测；见 models/action_space.py。
     #   "ee_cam"  -- 相机相对的 SE(3) 增量 + 夹爪（10 维）。默认值，也是已发布预训练权重
@@ -350,6 +357,11 @@ class TrainConfig(object):
                 "branch in the optimizer and never move it, which looks exactly like "
                 "training it."
                 .format(self.conv_tower_lr_scale))
+        if (not math.isfinite(self.legacy_gripper_scale)
+                or self.legacy_gripper_scale <= 0):
+            raise ValueError(
+                "legacy_gripper_scale must be finite and positive, got {}"
+                .format(self.legacy_gripper_scale))
 
     def model_kwargs(self) -> Dict:
         """本配置里 `models/vla.py:vla_*` 需要的那个子集。
@@ -374,6 +386,7 @@ class TrainConfig(object):
             # 同理，再高一层：它决定构造哪个 ContextEncoder 类。评测端无法从 checkpoint 的
             # 张量里反推出来（只能猜）。老 json 回落到 "vl"。
             context_encoder=self.context_encoder,
+            legacy_gripper_scale=self.legacy_gripper_scale,
         )
 
     def to_json(self) -> str:
@@ -637,7 +650,7 @@ CONFIGS["finetune_real_joint"] = TrainConfig(
     # 按数据集重算；json 里的 layout 戳会与 action_space 校验：
     #   python -m data_prepare.compute_action_stats --config finetune_real_joint \
     #       -o ./action_stats/real_joint7.json
-    action_norm_stats=None,
+    action_norm_stats="./action_stats/real_joint7.json",
     lora_rank=0,  # 从零训；从预训练主干出发的话可以调到 16
     bs=16,
     max_lr=1e-4,

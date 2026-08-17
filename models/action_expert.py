@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn.functional as F
 
@@ -342,6 +343,7 @@ class ActionExpert(nn.Module):
         flow_time_alpha: float = 1.5,
         conv_tower: Optional[str] = None,
         context_encoder: str = DEFAULT_CONTEXT_ENCODER,
+        legacy_gripper_scale: float = 1.0,
     ):
         super().__init__()
         if objective not in OBJECTIVES:
@@ -356,6 +358,11 @@ class ActionExpert(nn.Module):
         self.objective = objective
         self.flow_time_sampling = flow_time_sampling
         self.flow_time_alpha = float(flow_time_alpha)
+        if not math.isfinite(legacy_gripper_scale) or legacy_gripper_scale <= 0:
+            raise ValueError(
+                "legacy_gripper_scale must be finite and positive, got {}"
+                .format(legacy_gripper_scale))
+        self.legacy_gripper_scale = float(legacy_gripper_scale)
         # None == the EE-pose space, i.e. the historical behaviour.
         self.action_space = build_action_space(action_space)
         # q01/q99 normalization of the action space. None reproduces the pre-normalization
@@ -555,6 +562,20 @@ class ActionExpert(nn.Module):
             actions = actions + dt * velocity[..., :self.action_dim]
         return actions
 
+    def _apply_legacy_gripper_scale(self, states: Tensor) -> Tensor:
+        """Correct legacy inference openness after all action-space inverses.
+
+        The identity case returns the original tensor without even a multiply/clamp, so
+        checkpoints whose config omits the compatibility field keep the historical path
+        exactly. The non-identity case clones before changing the last channel.
+        """
+        if self.legacy_gripper_scale == 1.0:
+            return states
+        corrected = states.clone()
+        corrected[..., -1] = torch.clamp(
+            corrected[..., -1] * self.legacy_gripper_scale, 0.0, 1.0)
+        return corrected
+
     def forward(
         self, 
         vl_obs: Dict[str, Tensor],
@@ -668,6 +689,13 @@ class ActionExpert(nn.Module):
                 pred_actions,  # (B', Ta, action_dim)
                 self.action_norm
             )  # (B', Ta, state_dim)
+
+            # Compatibility is deliberately applied after action_norm.unnormalize() and
+            # action2states(): it fixes only the externally visible [0,1] openness
+            # semantics of legacy checkpoints, without changing the denoising space,
+            # training targets, losses, or any arm-action channel.
+            pred_future_actions = self._apply_legacy_gripper_scale(
+                pred_future_actions)
 
             # scatter B' back to (B, Nee); invalid slots get the action space's neutral
             # fill (identity pose for EE, zeros for joints)
@@ -937,4 +965,3 @@ def count_parameters():
 
 if __name__ == "__main__":
     count_parameters()
-

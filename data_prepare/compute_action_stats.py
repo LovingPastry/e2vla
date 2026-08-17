@@ -195,6 +195,40 @@ def report(actions: np.ndarray, q01: np.ndarray, q99: np.ndarray, names: List[st
     print("  " + "  ".join("{}={:.3f}".format(n, f)
                            for n, f in zip(names, outside)))
 
+    check_openness(q01[-1], q99[-1])
+
+
+def check_openness(q01: float, q99: float):
+    """Openness is the one channel whose range is known a priori -- flag it if it is off.
+
+    Every other channel's scale is an empirical property of the robot and the task, so
+    there is nothing to compare its quantiles against. Openness is different: it comes
+    from the dataset contract `[0 (close), 1 (open)]` through `states2action`'s
+    `(x - 0.5) * 2`, so a healthy channel spans very nearly [-1, +1] -- q01 near -1 when
+    the gripper fully closes, q99 near +1 when it fully opens.
+
+    A negative q99 therefore means the gripper never opened past halfway *as the dataset
+    defines openness*, which in practice means the dataset's own conversion is wrong --
+    `RealBinDataset.GRIPPER_MIN/MAX` is the usual culprit (run
+    `python -m data_utils.dataset_real` to see the raw range). Nothing downstream reports
+    this: training converges on the squashed target, the model fits it well, and only the
+    `(g > 0.5)` binarisation at deploy turns it into a constant gripper command.
+    """
+    span = q99 - q01
+    if q99 < 0.5:
+        print("\n[WARN] openness q99 = {:+.3f} (< 0.5): the gripper never opens past "
+              "halfway in the dataset's own units.".format(q99))
+        print("       Healthy is q01 ~ -1, q99 ~ +1 (openness comes from [0,1] through "
+              "(x-0.5)*2). Check the dataset's")
+        print("       raw-to-openness conversion -- for memmap data that is "
+              "RealBinDataset.GRIPPER_MIN/MAX; run `python -m data_utils.dataset_real`.")
+        print("       Normalizing with these stats hides it during training and the "
+              "gripper still comes out wrong at deploy.")
+    elif span < 1.5:
+        print("\n[WARN] openness spans only {:.3f} of the expected 2.0 ([-1, +1]). The "
+              "gripper uses {:.0f}% of its".format(span, span / 2 * 100))
+        print("       nominal range; verify the dataset's raw-to-openness conversion.")
+
 
 def main(argv=None):
     args = parse_args(argv)

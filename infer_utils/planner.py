@@ -116,6 +116,14 @@ def load_model(path, device, use_ema: bool = False):
     else:
         print("[INFO] Action normalization from {}:\n{}".format(source, action_norm))
 
+    if cfg.legacy_gripper_scale == 1.0:
+        print("[INFO] Legacy gripper output correction is disabled (scale=1.0)")
+    else:
+        print("[WARN] Legacy gripper output correction is enabled: scale={:.8f}. "
+              "This multiplier is applied only to inference openness after action "
+              "unnormalization; do not enable it for newly trained checkpoints."
+              .format(cfg.legacy_gripper_scale))
+
     model: vla.VLA = getattr(vla, "vla_{}".format(cfg.model))(
         action_norm=action_norm, action_space=action_space,
         **cfg.model_kwargs()).to(device)
@@ -520,4 +528,3 @@ class TrajPlanner(object):
                 )
         
         return future_ee_poses, future_grippers
-
