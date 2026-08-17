@@ -237,6 +237,7 @@ def _build_vla(
     flow_time_alpha: float = 1.5,
     conv_tower: Optional[str] = None,
     context_encoder: str = DEFAULT_CONTEXT_ENCODER,
+    legacy_gripper_scale: float = 1.0,
 ):
     hdim, num_heads = VLA_SIZES[size]
     return VLA(
@@ -253,6 +254,7 @@ def _build_vla(
         flow_time_alpha=flow_time_alpha,
         conv_tower=conv_tower,
         context_encoder=context_encoder,
+        legacy_gripper_scale=legacy_gripper_scale,
     )
 
 
