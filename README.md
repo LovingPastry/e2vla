@@ -98,6 +98,17 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
   -s VA_REAL_JOINT_NEW_SA_FLOW
 ```
 
+从 `ckpt_latest.pt` 断点续训：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python train.py \
+  --config va_real_joint_new_sa_flow \
+  -c VA_REAL_JOINT_NEW_SA_FLOW \
+  --max_iterations 60000
+```
+
+`-c` 后面填写已有实验目录名。`max_iterations` 是训练结束时的总步数，不是本次额外训练的步数。
+
 输出位置：
 
 ```text
