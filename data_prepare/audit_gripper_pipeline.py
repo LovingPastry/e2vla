@@ -9,6 +9,17 @@ neighboring config JSON files, then reconstructs this exact chain:
 Run from the repository root on the data/compute server. The defaults encode the known
 old training calibration (GRIPPER_MIN=0.0, GRIPPER_MAX=1.5) and the observed robot
 command interval [0.0, 0.8].
+
+Usage：
+python -m data_prepare.audit_gripper_pipeline \
+  --data-root /data/lanzc/task0_0716_process \
+  --ckpt /path/to/old_checkpoint.pt \
+  --old-gripper-min 0.0 \
+  --old-gripper-max 1.5 \
+  --robot-command-min 0.0 \
+  --robot-command-max 0.8 \
+  --output ./gripper_pipeline_audit.json
+
 """
 
 import argparse
