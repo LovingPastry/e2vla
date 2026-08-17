@@ -14,7 +14,7 @@
 
 ## 1. 新增配置
 
-先在 `data_utils/dataset_real.py` 中确认：
+先在 [data_utils/dataset_real.py](data_utils/dataset_real.py) 中确认：
 
 ```python
 ACTION_SPACE = "joint7"
@@ -23,7 +23,7 @@ NUM_JOINTS = 7
 
 数据中的 `joint` 必须有 8 列：前 7 列是弧度制关节角，最后一列是夹爪原值。
 
-在 `configs.py` 的 `CONFIGS` 区域新增配置：
+在 [configs.py](configs.py) 的 `CONFIGS` 区域新增配置：
 
 ```python
 CONFIGS["va_real_joint_new"] = make_real_joint_config(
